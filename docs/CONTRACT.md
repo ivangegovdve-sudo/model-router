@@ -22,9 +22,9 @@ Optional request header `X-Router-Max-Usd-Per-M: <float>` lowers the price ceili
 A routed response is the upstream body unchanged plus one field:
 
 ```json
-"router": {"decision_id": "20260926T030604-654a90", "seat": "venice:e2ee-qwen-2-5-7b-p",
-           "because": "cheapest of 8 qualifying: $0.05011/M measured; next akashml:openai/gpt-oss-20b at $0.05145/M measured",
-           "cost_usd": 0.00008074, "cost_basis": "billed", "attempts": 1}
+"router": {"decision_id": "20260926T031754-29e8ba", "seat": "nous:mistralai/mistral-nemo",
+           "because": "lowest expected cost of 9 qualifying: $1.08e-05 expected ($0.02608/M measured); next venice:e2ee-qwen-2-5-7b-p at $2.14e-05 expected ($0.05165/M measured)",
+           "cost_usd": 2.69e-07, "cost_basis": "billed", "attempts": 1}
 ```
 and headers `X-Router-Decision`, `X-Router-Seat` (streams carry only the headers).
 
@@ -71,6 +71,8 @@ and headers `X-Router-Decision`, `X-Router-Seat` (streams carry only the headers
  only_seat, roster_size, unknown_not_listed, free_tier_not_listed},
  considered: [Assessment]}       # QUALIFIES (ranked, winner first), then EXCLUDED, then UNKNOWN
 ```
+`because` is display text; clients must not parse it.
+
 `considered` lists every qualifier and every exclusion. Of the UNKNOWN seats (usually most of
 the roster: never measured) it lists only those whose list price undercuts the winner — they
 might have been cheaper — and counts the rest in `facts.unknown_not_listed`.
