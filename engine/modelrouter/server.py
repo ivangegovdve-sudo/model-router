@@ -52,6 +52,15 @@ def build(cfg: Config) -> FastAPI:
     app = FastAPI(title="modelrouter", version=__version__)
     app.state.router = router
 
+    @app.on_event("startup")
+    async def _threads() -> None:
+        # Starlette runs blocking handlers on anyio's default pool of 40 threads, which
+        # would silently serialise callers beyond 40 concurrent requests. io.net and Sail
+        # completed 64 concurrent generations with zero failures; the per-provider caps,
+        # not the thread pool, are what should limit concurrency.
+        import anyio.to_thread
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 256
+
     def auth(authorization: str | None = Header(default=None)) -> None:
         if cfg.no_auth:
             return
@@ -138,10 +147,13 @@ def build(cfg: Config) -> FastAPI:
         body = await request.json()
         seats = body.get("seats") or None
         cheapest = int(body.get("cheapest") or 0)
-        if not seats and not cheapest:
-            raise HTTPException(422, "give `seats` or `cheapest`")
+        if not seats and not cheapest and not (body.get("generation") and body.get("measured")):
+            raise HTTPException(422, "give `seats`, `cheapest`, or generation + measured")
         budget = body.get("budget_usd")
         budget = min(float(budget), cfg.probe_budget_usd) if budget is not None else None
+        if body.get("generation"):
+            return await run_in_threadpool(router.probe_generation, seats,
+                                           bool(body.get("measured")), budget)
         return await run_in_threadpool(router.probe, seats, cheapest, budget)
 
     @app.get("/router/decisions", dependencies=[Depends(auth)])
@@ -206,6 +218,18 @@ def build(cfg: Config) -> FastAPI:
 
     def _abstain(routed) -> JSONResponse:
         ch = routed.choice
+        busy = [a for a in ch.considered if "AT_CAPACITY" in a.because]
+        excluded = [a for a in ch.considered if a.verdict.value == "EXCLUDED"]
+        raced = "slot taken between decision and call" in ch.because
+        if raced or busy and len(busy) == len(excluded) and not any(
+                a.verdict.value == "UNKNOWN" for a in ch.considered):
+            # Only capacity stood in the way: that clears in seconds. 429 + Retry-After is
+            # what OpenAI clients already retry on, instead of treating it as a hard refusal.
+            r = _error(429, "router_at_capacity",
+                       "every eligible model's provider is at its measured concurrency cap: "
+                       + ch.because, decision_id=routed.decision_id)
+            r.headers["Retry-After"] = "1"
+            return r
         return _error(422, "router_abstained",
                       "no model can serve this request honestly: " + ch.because,
                       decision_id=routed.decision_id, unknown=list(ch.unknown))

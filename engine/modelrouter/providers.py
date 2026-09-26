@@ -143,12 +143,14 @@ class Listing:
     reasoning: bool | None = None
     text_out: bool | None = True
     windows: dict[str, tuple[float, float, float]] | None = None   # window -> (p, c, cached)
+    blocked: str = ""               # the catalogue itself says this key cannot use it
 
 
 def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
     shape = PROVIDERS[provider]["parse"]
     out: list[Listing] = []
     for m in rows:
+        blocked_why = ""
         mid = str(m.get("id") or "")
         if not mid:
             continue
@@ -179,6 +181,10 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
             reasoning = m.get("supports_reasoning")
             outs = m.get("output_modalities")
             text_out = None if outs is None else ("text" in outs)
+            if m.get("higher_tier_required") is True:
+                tier = m.get("min_access_tier")
+                blocked_why = "io.net access tier %s required; this key's tier is lower" % tier \
+                    if tier is not None else "a higher io.net access tier is required"
         elif shape == "venice":
             spec = m.get("model_spec") or {}
             pp = spec.get("pricing") or {}
@@ -201,7 +207,8 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
             ctx = int(ctx) if ctx is not None else None
         except (TypeError, ValueError):
             ctx = None
-        out.append(Listing(provider, mid, pr, co, ca, ctx, tools, reasoning, text_out))
+        out.append(Listing(provider, mid, pr, co, ca, ctx, tools, reasoning, text_out,
+                           blocked=blocked_why))
     return out
 
 
@@ -232,6 +239,7 @@ class Result:
     model: str
     content: str = ""
     reasoning: str = ""              # reasoning_content / reasoning, if emitted
+    reasoning_field: bool | None = None  # the response HAS a reasoning field (even empty)
     tool_calls: int = 0
     finish_reason: str | None = None
     prompt_tokens: int | None = None
@@ -265,6 +273,11 @@ def classify_failure(status: int, msg: str, raw: str = "",
     the credential is not suspect and must not be rotated over it."""
     if is_edge_block(status, raw or msg, headers):
         return "edge"
+    # io.net answers 402 for ONE model the key's tier cannot use ("requires a higher IO
+    # Intelligence tier"). That is the model, not the account: benching the provider over
+    # it would take every other io.net model down with it.
+    if status == 402 and re.search(r"tier", (msg or "") + (raw or ""), re.I):
+        return "model"
     if status in (401, 402):
         return "provider"
     # Money before rate: "Budget limit exceeded (monthly limit)" is an account that
@@ -289,6 +302,7 @@ def extract(provider: str, model: str, payload: dict) -> Result:
     if isinstance(content, list):  # content parts
         content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
     reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    has_field = "reasoning_content" in msg or "reasoning" in msg
     usage = payload.get("usage") or {}
     billed = usage.get("cost")
     if billed is None and isinstance(payload.get("cost"), dict):   # Venice
@@ -300,7 +314,7 @@ def extract(provider: str, model: str, payload: dict) -> Result:
         tool_calls=len(msg.get("tool_calls") or []), finish_reason=choice.get("finish_reason"),
         prompt_tokens=usage.get("prompt_tokens"), completion_tokens=usage.get("completion_tokens"),
         cached_tokens=details.get("cached_tokens"),
-        billed_usd=_f(billed), body=payload)
+        billed_usd=_f(billed), body=payload, reasoning_field=has_field)
 
 
 def _body(provider: str, model: str, req: dict, max_tokens: int | None,
@@ -443,6 +457,8 @@ def stream(provider: str, model: str, key: str, req: dict, *, max_tokens: int | 
                     if d.get("content"):
                         content.append(d["content"])
                     reasoning_chars += len(d.get("reasoning_content") or d.get("reasoning") or "")
+                    if "reasoning_content" in d or "reasoning" in d:
+                        res.reasoning_field = True
                     if d.get("tool_calls"):
                         res.tool_calls += 1
                     if ch.get("finish_reason"):

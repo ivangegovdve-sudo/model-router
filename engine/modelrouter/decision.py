@@ -61,6 +61,11 @@ class Emits(str, Enum):
 #: the floor comes from a one-word probe, and a real task reasons longer (GLM-5.3-Flash
 #: probed at 35 tokens, then came back empty on a classification prompt at 43).
 CLAMP_HEADROOM = 2
+#: Measured 2026-09-26: 53 models x {16, 64, 256, 1024} on a ONE-WORD task; none was empty
+#: at 1024. It is not universal: on a ~300-word generation nine reasoning models billed all
+#: 1024 tokens and returned nothing. So it is the escalation floor for a second attempt,
+#: and a second empty answer still fails loudly.
+SAFE_CEILING = 1024
 
 #: When a client sets no max_tokens, cost is estimated at this many completion tokens.
 DEFAULT_COMPLETION_ESTIMATE = 512
@@ -94,8 +99,11 @@ class Candidate:
     reasoning_overhead_tokens: int | None = None  # completion tokens spent before content
     floor_evidence: str = ""                    # the measurement behind min_max_tokens
     max_reasoning_tokens: int | None = None     # most reasoning seen before an answer, any task
+    has_reasoning_field: bool | None = None     # False: nowhere to strand text; budget as-is
+    decode_tps: float | None = None             # measured on a real generation, not a probe
+    blocked: str = ""                           # a model-level refusal known before calling
     probe_age_s: float | None = None
-    latency_s: float | None = None
+    latency_s: float | None = None              # a SHORT call: connection + prefill + first token
 
 
 @dataclass(frozen=True)
@@ -113,6 +121,8 @@ class Ask:
     # Only the interactive lane gates on measured latency; the others buy cheaper, slower
     # capacity (e.g. Sail's balanced / flex completion windows).
     lane: str = "interactive"
+    # The interactive gate is on PREDICTED latency for this request: short-call latency
+    # plus (completion + reasoning tokens) / decode speed measured on a real generation.
     interactive_max_latency_s: float | None = None
     # A budget below a reasoning model's measured floor bills tokens and returns nothing.
     # With allow_clamp, when NO model qualifies at the caller's budget, the cheapest
@@ -120,6 +130,9 @@ class Ask:
     # CLAMP_HEADROOM x the most reasoning observed for it -- visibly, never silently.
     allow_clamp: bool = False
     max_clamp_extra: int = 1024
+    # Seats that already came back empty on THIS request: their raised budget is at least
+    # SAFE_CEILING. Across 220 probes of 53 models nothing was silent at 1024.
+    escalate: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -216,6 +229,8 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
             c.provider_state, (": " + c.provider_detail) if c.provider_detail else ""))
     if c.available is False:
         return out(Verdict.EXCLUDED, "no longer in the provider's live catalogue")
+    if c.blocked:
+        return out(Verdict.EXCLUDED, c.blocked)
     if not ask.allow_free and is_free(c):
         return out(Verdict.EXCLUDED, "free tier: excluded by policy (free endpoints may "
                    "log prompts and run on a separate daily quota)")
@@ -239,22 +254,15 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
     if c.emits is Emits.REASONING_THEN_CONTENT and c.min_max_tokens is None:
         return out(Verdict.UNKNOWN, "reasons before answering; the budget it needs "
                    "is unknown", ("min_max_tokens",))
-    # The latency gate chooses FOR the caller; a caller who named the model has chosen.
-    if ask.lane == "interactive" and ask.interactive_max_latency_s is not None             and ask.only_seat is None:
-        if c.latency_s is None:
-            return out(Verdict.UNKNOWN, "latency never measured; the interactive lane "
-                       "needs it", ("latency_s",))
-        if c.latency_s > ask.interactive_max_latency_s:
-            return out(Verdict.EXCLUDED, "measured latency %.2fs is above the interactive "
-                       "lane's %.2fs -- a background or batch lane can use it" % (
-                           c.latency_s, ask.interactive_max_latency_s))
     if ask.max_tokens is not None and ask.max_tokens < need:
         why = "needs max_tokens >= %d before any content appears%s; request allows %d" % (
             need, " (measured: %s)" % c.floor_evidence if c.floor_evidence else "",
             ask.max_tokens)
         reasoning = max(need - 1, c.max_reasoning_tokens or 0)
-        if ask.allow_clamp and CLAMP_HEADROOM * reasoning <= ask.max_clamp_extra:
-            raised = ask.max_tokens + CLAMP_HEADROOM * reasoning
+        raised = ask.max_tokens + CLAMP_HEADROOM * reasoning
+        if c.seat in ask.escalate:
+            raised = max(raised, SAFE_CEILING)    # it already ran out once on this request
+        if ask.allow_clamp and raised - ask.max_tokens <= ask.max_clamp_extra:
             again = assess(replace(ask, max_tokens=raised, allow_clamp=False), c)
             if again.verdict is Verdict.QUALIFIES:
                 return Assessment(c.seat, Verdict.EXCLUDED, why + "; would serve with "
@@ -264,6 +272,20 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
 
     completion = ask.max_tokens if ask.max_tokens is not None else max(
         DEFAULT_COMPLETION_ESTIMATE, need)
+    # The latency gate chooses FOR the caller; a caller who named the model has chosen.
+    if ask.lane == "interactive" and ask.interactive_max_latency_s is not None \
+            and ask.only_seat is None:
+        if c.decode_tps is None or c.latency_s is None:
+            return out(Verdict.UNKNOWN, "decode speed never measured on a real generation; "
+                       "the interactive lane needs it", ("decode_tps",))
+        gen = completion + (c.reasoning_overhead_tokens or 0)
+        predicted = c.latency_s + gen / c.decode_tps
+        if predicted > ask.interactive_max_latency_s:
+            return out(Verdict.EXCLUDED, "predicted %.1fs for %d tokens (%.2fs + %d at %.0f "
+                       "tok/s measured) is above the interactive lane's %.1fs -- a background "
+                       "or batch lane can use it" % (
+                           predicted, gen, c.latency_s, gen, c.decode_tps,
+                           ask.interactive_max_latency_s))
     if c.context_length is None:
         return out(Verdict.UNKNOWN, "context length unknown", ("context_length",))
     if ask.prompt_tokens + completion > c.context_length:
@@ -276,10 +298,11 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
     if ask.ceiling_usd_per_mtok is not None and usd > ask.ceiling_usd_per_mtok:
         return out(Verdict.EXCLUDED, "$%.4g/M (%s) is above the $%.4g/M ceiling" % (
             usd, basis, ask.ceiling_usd_per_mtok), usd=usd, basis=basis)
-    return out(Verdict.QUALIFIES, "$%.4g/M (%s), emits into %s%s" % (
-        usd, basis, c.emits.value,
-        ", %.2fs measured" % c.latency_s if c.latency_s is not None else ""),
-        usd=usd, basis=basis, exp=exp)
+    shape = "no reasoning field: budget honoured as-is" if c.has_reasoning_field is False \
+        else "emits into %s" % c.emits.value
+    speed = ", %.0f tok/s measured" % c.decode_tps if c.decode_tps else ""
+    return out(Verdict.QUALIFIES, "$%.4g/M (%s), %s%s" % (usd, basis, shape, speed),
+               usd=usd, basis=basis, exp=exp)
 
 
 def decide(ask: Ask, roster: list[Candidate]) -> Choice:
@@ -347,6 +370,9 @@ def decide(ask: Ask, roster: list[Candidate]) -> Choice:
         # Name the reasons, not just the counts: the nearest misses first.
         near = [a for a in considered if a.verdict is Verdict.EXCLUDED
                 and not a.because.startswith(("provider ", "free tier"))][:3]
+        if not near:        # every exclusion was account-level: name those instead
+            near = [a for a in considered if a.verdict is Verdict.EXCLUDED
+                    and not a.because.startswith("free tier")][:3]
         if near:
             summary += "; " + "; ".join("%s: %s" % (a.seat, a.because) for a in near)
         return Choice(Outcome.ABSTAIN, "no candidate qualifies (%s)" % summary,

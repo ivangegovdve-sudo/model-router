@@ -148,21 +148,53 @@ def test_unmeasured_seats_kept_only_when_cheaper_than_winner():
     assert ch.facts["unknown_not_listed"] == 55
 
 
-def _seat(seat, p, c, emits, floor=1, oh=None, lat=0.8, **kw):
+def _seat(seat, p, c, emits, floor=1, oh=None, lat=0.8, tps=150.0, **kw):
     prov, _, model = seat.partition(":")
     return Candidate(seat=seat, provider=prov, model=model, list_prompt=p, list_completion=c,
                      emits=emits, min_max_tokens=floor, reasoning_overhead_tokens=oh,
-                     latency_s=lat, context_length=128000, supports_tools=True, **kw)
+                     latency_s=lat, decode_tps=tps, context_length=128000, supports_tools=True,
+                     **kw)
 
 
-def test_interactive_lane_excludes_slow_seats_batch_lane_takes_them():
-    fast = _seat("ionet:m", 0.20, 0.60, Emits.CONTENT, lat=0.7)
-    slow_cheap = _seat("sail:m", 0.05, 0.20, Emits.CONTENT, lat=2.3, window="asap")
-    ask = Ask(prompt_tokens=40, max_tokens=100, interactive_max_latency_s=1.2)
-    ch = decide(ask, [fast, slow_cheap])
-    assert ch.seat == "ionet:m"
-    assert any("above the interactive lane" in a.because for a in ch.considered)
-    assert decide(replace(ask, lane="batch"), [fast, slow_cheap]).seat == "sail:m"
+def test_interactive_gate_is_predicted_from_decode_speed_not_a_short_probe():
+    """2026-09-26: AkashML answered one word in 0.6s yet decoded at 24 tok/s (13.8s for 400)."""
+    ionet = _seat("ionet:gpt-oss-120b", 0.10, 0.50, Emits.CONTENT, lat=0.9, tps=260)
+    akash = _seat("akashml:gpt-oss-120b", 0.03, 0.17, Emits.CONTENT, lat=0.6, tps=24)
+    long_ask = Ask(prompt_tokens=40, max_tokens=400, interactive_max_latency_s=8.0)
+    ch = decide(long_ask, [ionet, akash])
+    assert ch.seat == "ionet:gpt-oss-120b"
+    why = {a.seat: a.because for a in ch.considered}["akashml:gpt-oss-120b"]
+    assert "predicted 17.3s for 400 tokens" in why and "24 tok/s" in why
+    # the same slow decoder is fine for a one-word answer, and for the batch lane
+    assert decide(replace(long_ask, max_tokens=8), [ionet, akash]).seat == "akashml:gpt-oss-120b"
+    assert decide(replace(long_ask, lane="batch"), [ionet, akash]).seat == "akashml:gpt-oss-120b"
+
+
+def test_unmeasured_decode_speed_is_unknown_in_the_interactive_lane_only():
+    s = _seat("p:m", 0.1, 0.1, Emits.CONTENT, tps=None)
+    ask = Ask(prompt_tokens=40, max_tokens=50, interactive_max_latency_s=8.0)
+    assert assess(ask, s).unknown == ("decode_tps",)
+    assert assess(replace(ask, lane="background"), s).verdict is Verdict.QUALIFIES
+
+
+def test_no_reasoning_field_honours_the_callers_budget_as_is():
+    s = _seat("ionet:DeepSeek-V3.2", 0.2, 0.4, Emits.CONTENT, has_reasoning_field=False)
+    ch = decide(Ask(prompt_tokens=40, max_tokens=4, allow_clamp=True), [s])
+    assert ch.max_tokens == 4 and "budget honoured as-is" in ch.considered[0].because
+
+
+def test_second_attempt_after_running_out_escalates_to_the_safe_ceiling():
+    glm = _seat("ionet:glm", 0.1, 0.4, Emits.REASONING_THEN_CONTENT, floor=36, oh=35)
+    ask = Ask(prompt_tokens=40, max_tokens=8, allow_clamp=True, only_seat="ionet:glm")
+    assert decide(ask, [glm]).max_tokens == 8 + 2 * 35
+    assert decide(replace(ask, escalate=("ionet:glm",)), [glm]).max_tokens == 1024
+
+
+def test_model_blocked_by_catalogue_is_excluded_with_its_reason():
+    s = _seat("ionet:MiniMax-M2.7", 0.1, 0.1, Emits.CONTENT,
+              blocked="io.net access tier 3 required; this key's tier is lower")
+    a = assess(Ask(prompt_tokens=10), s)
+    assert a.verdict is Verdict.EXCLUDED and "tier 3" in a.because
 
 
 def test_no_reasoning_short_answer_beats_cheaper_per_token_reasoning_model():

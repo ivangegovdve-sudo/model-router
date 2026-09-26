@@ -91,15 +91,36 @@ def cmd_probe(a) -> int:
             rung["seat"], rung["max_tokens"], rung["http"], rung["content_chars"],
             rung["reasoning_chars"], rung["cost_usd"], rung["cost_basis"], rung["detail"]),
             flush=True)
-    if not (a.seat or a.cheapest or a.refresh_days is not None):
+    if not (a.seat or a.cheapest or a.refresh_days is not None or a.generation):
         print("nothing to probe: give --seat, --cheapest N or --refresh-days D")
         return 1
+    if a.generation:
+        out = r.probe_generation(a.seat or None, measured=True if not a.seat else False,
+                                 budget_usd=a.budget,
+                                 progress=lambda row: print("  %-55s tokens=%s %.1fs %s tok/s %s"
+                                                            % (row["seat"], row["completion_tokens"],
+                                                               row["latency_s"], row["tok_per_s"],
+                                                               row["detail"]), flush=True))
+        print(json.dumps({"spent_usd": out["spent_usd"], "budget_usd": out["budget_usd"]}))
+        return 0
     out = r.probe(a.seat or None, a.cheapest, a.budget, progress=show,
                   refresh_older_than_s=a.refresh_days * 86400 if a.refresh_days is not None
                   else None)
     print(json.dumps({"spent_usd": out["spent_usd"], "budget_usd": out["budget_usd"],
                       "profiles": {p["seat"]: p.get("profile") for p in out["probed"]}},
                      indent=1))
+    return 0
+
+
+def cmd_import(a) -> int:
+    import json as _json
+    cfg = load(a.config)
+    r = _router(cfg)
+    rows = _json.load(open(a.rows, encoding="utf-8")) if a.rows else None
+    curve = _json.load(open(a.curve, encoding="utf-8")) if a.curve else None
+    if isinstance(rows, dict):          # accept {"rows": [...]} as well as a bare list
+        rows = next((v for v in rows.values() if isinstance(v, list)), [])
+    print(json.dumps(r.import_measurements(rows, curve, a.note), indent=1))
     return 0
 
 
@@ -133,8 +154,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--seat", action="append", help="provider:model (repeatable)")
     p.add_argument("--cheapest", type=int, default=0)
     p.add_argument("--budget", type=float)
+    p.add_argument("--generation", action="store_true",
+                   help="measure decode speed on a ~400-token generation (every measured "
+                        "seat without one, or the given --seat)")
     p.add_argument("--refresh-days", type=float,
                    help="re-probe measured seats last observed more than D days ago")
+    p = sub.add_parser("import-measurements")
+    p.add_argument("--rows", help="one-word sweep rows (e.g. exp4_results.json)")
+    p.add_argument("--curve", help="concurrency runs (e.g. exp5_results.json)")
+    p.add_argument("--note", default="", help="provenance, recorded with each row")
     p = sub.add_parser("explain")
     p.add_argument("prompt")
     p.add_argument("--model", default="auto")
@@ -147,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
         serve(["--config", str(a.config)] if a.config else [])
         return 0
     return {"init": cmd_init, "doctor": cmd_doctor, "probe": cmd_probe,
-            "explain": cmd_explain}[a.cmd](a)
+            "explain": cmd_explain, "import-measurements": cmd_import}[a.cmd](a)
 
 
 if __name__ == "__main__":

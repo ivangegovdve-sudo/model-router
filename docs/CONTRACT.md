@@ -19,8 +19,12 @@ is needed.
 
 Optional request header `X-Router-Max-Usd-Per-M: <float>` lowers the price ceiling for one call.
 
-**Lanes.** `model: "auto"` is the **interactive** lane: someone is waiting, so any seat whose
-measured latency exceeds `policy.interactive_max_latency_s` is excluded. `auto:background` and
+**Lanes.** `model: "auto"` is the **interactive** lane: someone is waiting, so a seat is excluded
+when its **predicted** latency for this request — measured short-call latency + (completion +
+reasoning tokens) ÷ decode speed measured on a real generation — exceeds
+`policy.interactive_max_latency_s`. A seat with no decode measurement is UNKNOWN there. (A one-word
+probe measures connection + prefill, not decode: AkashML answered one word in 0.6 s and decoded at
+24 tok/s.) `auto:background` and
 `auto:batch` (or header `X-Router-Lane`) ignore latency and buy cheaper scheduling where a provider
 sells it — Sail's `balanced` / `flex` completion windows, sent as `metadata.completion_window` and
 priced from that window's rate card. A named `provider:model` skips the latency gate (the caller
@@ -48,6 +52,7 @@ and headers `X-Router-Decision`, `X-Router-Seat` (streams carry only the headers
 | HTTP | `error.type` | meaning |
 |---|---|---|
 | 422 | `router_abstained` | no model qualifies on known facts. `message` names the reasons; `decision_id`, `unknown[]` attached |
+| 429 | `router_at_capacity` | every eligible model's provider is at its measured concurrency cap; `Retry-After: 1` |
 | 502 | `routed_call_failed` | every attempt failed or came back **empty** (HTTP 200 with no content is a failure) |
 | 401 | — | missing/wrong router token |
 
@@ -59,7 +64,7 @@ and headers `X-Router-Decision`, `X-Router-Seat` (streams carry only the headers
 | GET | `/router/setup` | `Setup` |
 | GET | `/router/roster?provider=&measured_only=` | `{providers:[ProviderState], dashboard, seats:[Candidate]}` |
 | POST | `/router/explain` | `{choice: Choice, providers:[ProviderState], dashboard}` — body is a chat request; **no model call, no cost** |
-| POST | `/router/probe` | body `{seats?:[string], cheapest?:int, budget_usd?:float}` → `{spent_usd, budget_usd, probed:[{seat, rungs:[Attempt], profile}]}` — **spends money**, capped by config |
+| POST | `/router/probe` | body `{seats?:[string], cheapest?:int, generation?:bool, measured?:bool, budget_usd?:float}` (`generation`: a ~400-token run that measures decode speed) → `{spent_usd, budget_usd, probed:[{seat, rungs:[Attempt], profile}]}` — **spends money**, capped by config |
 | GET | `/router/decisions?limit=N` | `[DecisionRow]` newest first |
 | GET | `/router/decisions/{id}` | `Decision` |
 | GET | `/router/observations/{provider:model}` | raw observations behind a seat's measured profile |
@@ -102,7 +107,7 @@ might have been cheaper — and counts the rest in `facts.unknown_not_listed`.
 the model spent the budget reasoning and returned nothing.
 
 ### Candidate (roster seat)
-`{seat, provider, model, provider_state:"OK|NO_KEY|BLOCKED|QUOTA_EXHAUSTED|UNAVAILABLE|CATALOGUE_FAILED", provider_detail, available, context_length|null, supports_tools|null, list_prompt|null, list_completion|null, price_source:"dashboard|provider-catalogue", measured_usd_per_mtok|null, emits:"content|reasoning_then_content|reasoning_only"|null, min_max_tokens|null, floor_evidence, reasoning_overhead_tokens|null, probe_age_s|null, latency_s|null}`
+`{seat, provider, model, provider_state:"OK|NO_KEY|BLOCKED|QUOTA_EXHAUSTED|UNAVAILABLE|AT_CAPACITY|CATALOGUE_FAILED", blocked, has_reasoning_field|null, decode_tps|null, window|null, provider_detail, available, context_length|null, supports_tools|null, list_prompt|null, list_completion|null, price_source:"dashboard|provider-catalogue", measured_usd_per_mtok|null, emits:"content|reasoning_then_content|reasoning_only"|null, min_max_tokens|null, floor_evidence, reasoning_overhead_tokens|null, probe_age_s|null, latency_s|null}`
 
 Prices are USD per million tokens.
 
@@ -118,7 +123,11 @@ Provider states: `BLOCKED` — the account refused (auth, money); `QUOTA_EXHAUST
 UNAVAILABLE never implicates the key; do not rotate credentials over it.
 
 ### ProviderState
-`{provider, key, state, detail, until|null, models, price_source, ratelimit:{header:value}, free_quota_until|null}`
+`{provider, key, state, detail, until|null, models, price_source, ratelimit:{header:value}, free_quota_until|null, in_flight, max_concurrency|null, concurrency_source}`
+
+`max_concurrency` is the largest concurrency the provider completed with zero failures (imported
+or configured); at the cap the provider is `AT_CAPACITY` and routes go elsewhere. Slots are reserved
+atomically at call time.
 
 ### Setup
 `{config, config_problems[], secrets_source:"gcp|env", gcp_project, gcloud_installed, keys:[{provider, source, name, present, detail}], auth, dashboard, dashboard_status, ready}`

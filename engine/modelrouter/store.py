@@ -34,7 +34,16 @@ CREATE TABLE IF NOT EXISTS decisions (
   id TEXT PRIMARY KEY, t REAL NOT NULL, requested TEXT, outcome TEXT, seat TEXT,
   because TEXT, cost_usd REAL, cost_basis TEXT, status TEXT, doc TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS dec_t ON decisions(t);
+CREATE TABLE IF NOT EXISTS provider_facts (
+  provider TEXT NOT NULL, key TEXT NOT NULL, value REAL, source TEXT, t REAL,
+  PRIMARY KEY (provider, key));
 """
+#: Sources that ran the fixed one-word task, so their reasoning spend defines a floor.
+ONE_WORD_SOURCES = ("probe", "clamp-table")
+#: A generation this long measures decode speed, not connection + prefill.
+DECODE_MIN_TOKENS = 150
+#: A call this short measures time-to-answer overhead (connection, prefill, first token).
+SHORT_MAX_TOKENS = 64
 
 
 @dataclass
@@ -50,6 +59,8 @@ class Profile:
     age_s: float | None
     floor_evidence: str = ""             # why min_max_tokens is what it is
     max_reasoning_tokens: int | None = None  # most reasoning seen before an answer, any task
+    has_reasoning_field: bool | None = None  # False: the response has no field to strand text in
+    decode_tps: float | None = None          # tokens/s on a real generation (>= 150 tokens)
 
     def public(self) -> dict:
         d = dict(self.__dict__)
@@ -65,22 +76,45 @@ class Store:
         self._db = sqlite3.connect(str(path), check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.executescript(SCHEMA)
+        cols = {r["name"] for r in self._db.execute("PRAGMA table_info(observations)")}
+        if "reasoning_field" not in cols:            # migrate stores from before 2026-09-26
+            self._db.execute("ALTER TABLE observations ADD COLUMN reasoning_field INTEGER")
+            self._db.commit()
 
     # --- observations ---------------------------------------------------------
     def observe(self, seat: str, source: str, *, max_tokens: int | None, status: int,
                 content_chars: int, reasoning_chars: int, tool_calls: int,
                 prompt_tokens: int | None, completion_tokens: int | None,
                 cached_tokens: int | None, cost_usd: float | None, cost_basis: str,
-                latency_s: float, detail: str) -> None:
+                latency_s: float, detail: str, reasoning_field: bool | None = None,
+                t: float | None = None) -> None:
         with self._lock:
             self._db.execute(
                 "INSERT INTO observations (seat,t,source,max_tokens,status,content_chars,"
                 "reasoning_chars,tool_calls,prompt_tokens,completion_tokens,cached_tokens,"
-                "cost_usd,cost_basis,latency_s,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (seat, time.time(), source, max_tokens, status, content_chars, reasoning_chars,
-                 tool_calls, prompt_tokens, completion_tokens, cached_tokens, cost_usd,
-                 cost_basis, latency_s, detail[:200]))
+                "cost_usd,cost_basis,latency_s,detail,reasoning_field) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (seat, t or time.time(), source, max_tokens, status, content_chars,
+                 reasoning_chars, tool_calls, prompt_tokens, completion_tokens, cached_tokens,
+                 cost_usd, cost_basis, latency_s, detail[:200],
+                 None if reasoning_field is None else int(reasoning_field)))
             self._db.commit()
+
+    # --- provider facts (e.g. the concurrency a provider survives) ---------------------
+    def set_provider_fact(self, provider: str, key: str, value: float, source: str) -> None:
+        with self._lock:
+            self._db.execute("INSERT OR REPLACE INTO provider_facts VALUES (?,?,?,?,?)",
+                             (provider, key, value, source, time.time()))
+            self._db.commit()
+
+    def provider_facts(self) -> dict[str, dict[str, dict]]:
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM provider_facts").fetchall()
+        out: dict[str, dict[str, dict]] = {}
+        for r in rows:
+            out.setdefault(r["provider"], {})[r["key"]] = {"value": r["value"],
+                                                          "source": r["source"], "t": r["t"]}
+        return out
 
     def observations(self, seat: str, limit: int = 50) -> list[dict]:
         with self._lock:
@@ -129,6 +163,11 @@ class Store:
 
 def derive(seat: str, obs: list) -> Profile:
     """Behavioural facts from observations. Every field is traceable to rows."""
+    # Decode-speed generations ("gen") are a different, long task: an empty answer at 1024
+    # there means THAT task needs more (nine reasoning models billed 1024 tokens and returned
+    # nothing on a 300-word essay, 2026-09-26) -- not that a one-word answer does. They feed
+    # decode speed only, never the floor or the emits verdict.
+    obs_all, obs = obs, [o for o in obs if o["source"] not in ("gen", "gen-import")]
     ok = [o for o in obs if (o["content_chars"] or 0) > 0 or (o["tool_calls"] or 0) > 0]
     empty = [o for o in obs if o not in ok]
     reasoned = any((o["reasoning_chars"] or 0) > 0 for o in obs)
@@ -154,7 +193,8 @@ def derive(seat: str, obs: list) -> Profile:
         # nothing, so the floor is one token above the largest spend seen on a probe
         # (the fixed one-word task), and above every budget that came back empty.
         # It is a LOWER bound: a long task can reason for thousands of tokens more.
-        probes = [o for o in ok if o["source"] == "probe" and o["completion_tokens"] is not None]
+        probes = [o for o in ok if o["source"] in ONE_WORD_SOURCES
+                  and o["completion_tokens"] is not None]
         pool = probes or [o for o in ok if o["completion_tokens"] is not None]
         spent = [_spent_before_answer(o) for o in pool]
         if spent:
@@ -185,11 +225,25 @@ def derive(seat: str, obs: list) -> Profile:
     usd = sum(o["cost_usd"] for o in priced)
     measured = usd / tokens * 1e6 if tokens else None
     basis = "+".join(sorted({o["cost_basis"] for o in priced})) if priced else ""
-    lat = [o["latency_s"] for o in ok if o["latency_s"]]
-    return Profile(seat, len(obs), emits, min_mt, overhead, measured, basis,
+    # Two different latencies. A short call measures connection + prefill + first token;
+    # only a real generation measures decode. A 16-token probe called AkashML "fastest"
+    # while its decode ran at 24 tok/s against io.net's 260 (2026-09-26).
+    lat = [o["latency_s"] for o in ok if o["latency_s"]
+           and (o["completion_tokens"] or 0) <= SHORT_MAX_TOKENS]
+    tps = [o["completion_tokens"] / o["latency_s"] for o in obs_all
+           if o["latency_s"] and (o["completion_tokens"] or 0) >= DECODE_MIN_TOKENS]
+    fields = [o["reasoning_field"] for o in obs if "reasoning_field" in o.keys()
+              and o["reasoning_field"] is not None]
+    has_field = (True if any(fields) else False) if fields else None
+    if has_field is False and ok:
+        # No reasoning field at all: there is nowhere for text to be stranded, so the
+        # caller's budget can be honoured as-is. Any empty reply was something else.
+        emits, min_mt, overhead, max_reasoning = Emits.CONTENT, 1, None, None
+        floor_evidence = "no reasoning field in any response: budget honoured as-is"
+    return Profile(seat, len(obs_all), emits, min_mt, overhead, measured, basis,
                    statistics.median(lat) if lat else None,
-                   time.time() - max(o["t"] for o in obs) if obs else None, floor_evidence,
-                   max_reasoning)
+                   time.time() - max(o["t"] for o in obs_all) if obs_all else None, floor_evidence,
+                   max_reasoning, has_field, statistics.median(tps) if tps else None)
 
 
 def _spent_before_answer(o) -> int:

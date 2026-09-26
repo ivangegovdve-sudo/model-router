@@ -49,6 +49,9 @@ class ProviderState:
     price_source: str = ""           # dashboard | provider-catalogue | mixed
     ratelimit: dict[str, str] = field(default_factory=dict)
     free_quota_until: float = 0.0    # OpenRouter's free-model daily quota, separate from credit
+    in_flight: int = 0               # calls this router has open to the provider right now
+    max_concurrency: int | None = None   # measured (or configured) concurrency it survives
+    concurrency_source: str = ""
 
     def public(self) -> dict:
         d = dict(self.__dict__)
@@ -149,6 +152,41 @@ class Gatherer:
         self._ctx[provider] = (time.time(), ctx)
         return ctx
 
+    # --- concurrency ---------------------------------------------------------------
+    def acquire(self, provider: str) -> None:
+        with self._lock:
+            if provider in self.states:
+                self.states[provider].in_flight += 1
+
+    def try_acquire(self, provider: str) -> bool:
+        """Reserve a slot atomically. Checking capacity when deciding and reserving when
+        calling let 17 calls through a cap of 16 under 20-way load (2026-09-26)."""
+        with self._lock:
+            st = self.states.get(provider)
+            if st is None:
+                return True
+            if st.max_concurrency and st.in_flight >= st.max_concurrency:
+                return False
+            st.in_flight += 1
+            return True
+
+    def release(self, provider: str) -> None:
+        with self._lock:
+            if provider in self.states:
+                self.states[provider].in_flight = max(0, self.states[provider].in_flight - 1)
+
+    def _caps(self) -> None:
+        """Concurrency caps: configured beats measured; measured = the largest
+        concurrency run with zero failures (AkashML dropped 34 of 64 on 2026-09-26)."""
+        facts = self.store.provider_facts()
+        for p, st in self.states.items():
+            conf = self.cfg.max_concurrency.get(p)
+            if conf:
+                st.max_concurrency, st.concurrency_source = int(conf), "config"
+            elif "max_ok_concurrency" in facts.get(p, {}):
+                f = facts[p]["max_ok_concurrency"]
+                st.max_concurrency, st.concurrency_source = int(f["value"]), f["source"]
+
     # --- feedback from ACT -----------------------------------------------------------
     def penalise(self, provider: str, model: str, scope: str, detail: str,
                  ratelimit: dict[str, str] | None = None) -> None:
@@ -177,6 +215,7 @@ class Gatherer:
     # --- the roster --------------------------------------------------------------------
     def roster(self, lane: str = "interactive") -> list[Candidate]:
         profiles = self.store.profiles()
+        self._caps()
         out: list[Candidate] = []
         with self._lock:
             for provider, st in self.states.items():
@@ -188,7 +227,7 @@ class Gatherer:
                     continue
                 if st.state in ("BLOCKED", "QUOTA_EXHAUSTED", "UNAVAILABLE")                         and time.time() >= st.until:
                     st.state, st.detail, st.until = "OK", "", 0.0
-                if st.state in ("NO_KEY", "CATALOGUE_FAILED"):
+                if st.state in ("NO_KEY", "CATALOGUE_FAILED", "AT_CAPACITY"):
                     st.state, st.detail = "OK", ""
                 try:
                     listings = self._catalogue(provider, self.keys.get(provider))
@@ -211,6 +250,12 @@ class Gatherer:
                 except Exception as exc:                        # noqa: BLE001
                     st.state, st.detail = "CATALOGUE_FAILED", type(exc).__name__
                     continue
+                if st.max_concurrency and st.in_flight >= st.max_concurrency:
+                    # Above what it was measured to survive it drops requests, which looks
+                    # like intermittent model failure upstream. Route elsewhere instead.
+                    st.state = "AT_CAPACITY"
+                    st.detail = "%d calls in flight; measured to survive %d (%s)" % (
+                        st.in_flight, st.max_concurrency, st.concurrency_source)
                 dash = self._dashboard(provider)
                 windows = self._window_prices(provider)
                 contexts = self._context_lengths(provider)
@@ -220,12 +265,20 @@ class Gatherer:
                     seat = "%s:%s" % (provider, li.model)
                     pr, co, src, available = li.prompt, li.completion, "provider-catalogue", True
                     window = None
+                    blocked = li.blocked
                     cards = windows.get(li.model) or li.windows or {}
                     for w in P.LANE_WINDOWS.get(lane, ("asap",)):
                         if w in cards:
                             pr, co, _cached = cards[w]
                             window, src = w, "provider pricing page"
                             break
+                    else:
+                        if cards and not blocked:
+                            # Priced, but not in any window this lane may buy (Sail's
+                            # Qwen3.6-35B-A3B is flex-only and answers ASAP calls with 400).
+                            pr = co = None
+                            blocked = "not sold in the %s lane's windows (offered: %s)" % (
+                                lane, ", ".join(sorted(cards)))
                     row = (dash or {}).get(li.model)
                     if row:
                         pp = row.get("pricing") or {}
@@ -249,6 +302,9 @@ class Gatherer:
                         list_prompt=pr, list_completion=co, price_source=src,
                         measured_usd_per_mtok=prof.measured_usd_per_mtok if prof else None,
                         measured_basis=prof.measured_basis if prof else "", window=window,
+                        blocked=blocked,
+                        has_reasoning_field=prof.has_reasoning_field if prof else None,
+                        decode_tps=prof.decode_tps if prof else None,
                         emits=prof.emits if prof else None,
                         min_max_tokens=prof.min_max_tokens if prof else None,
                         reasoning_overhead_tokens=prof.reasoning_overhead_tokens if prof else None,

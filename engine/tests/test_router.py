@@ -56,7 +56,7 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(P, "fetch_catalogue", lambda provider, key, timeout=30: list(CATALOGUE))
     cfg = Config(path=tmp_path / "c.toml", source="env", secrets={"akashml": "AKASH_KEY"},
                  token_secret="ROUTER_TOKEN", state_dir=tmp_path, dashboard_url="",
-                 probe_budget_usd=1.0)
+                 probe_budget_usd=1.0, interactive_max_latency_s=None)   # lane gate tested apart
     client = TestClient(build(cfg))
     client.headers["Authorization"] = "Bearer tok"
     return client, up
@@ -272,3 +272,83 @@ def test_sail_models_page_context_pairs_with_the_following_id():
 def test_window_is_sent_as_sail_metadata_only_to_windowed_providers():
     assert P._body("sail", "m", {"messages": []}, 8, "flex")["metadata"] == {"completion_window": "flex"}
     assert "metadata" not in P._body("akashml", "m", {"messages": []}, 8, "flex")
+
+
+def test_ionet_tier_402_is_the_model_not_the_account():
+    msg = "Model 'MiniMaxAI/MiniMax-M2.7' requires a higher IO Intelligence tier"
+    assert P.classify_failure(402, msg, '{"detail":"%s"}' % msg) == "model"
+    assert P.classify_failure(402, "Insufficient credits", "") == "provider"
+    rows = P.parse_catalogue("ionet", [{"id": "MiniMaxAI/MiniMax-M2.7", "input_token_price": 1e-7,
+                                        "output_token_price": 1e-7, "higher_tier_required": True,
+                                        "min_access_tier": 3}])
+    assert "tier 3" in rows[0].blocked
+
+
+def test_import_measurements_sets_floors_field_flag_decode_speed_and_caps(app):
+    client, up = app
+    router = client.app.state.router
+    rows = [
+        {"provider": "akash", "model": "Qwen/Qwen3.8-27B", "budget": 16, "latency_s": 0.6,
+         "error": None, "content_len": 0, "has_reasoning_field": True, "reasoning_len": 60,
+         "finish_reason": "length", "billed_prompt": 15, "billed_completion": 16},
+        {"provider": "akash", "model": "Qwen/Qwen3.8-27B", "budget": 64, "latency_s": 0.8,
+         "error": None, "content_len": 5, "has_reasoning_field": True, "reasoning_len": 90,
+         "finish_reason": "stop", "billed_prompt": 15, "billed_completion": 29},
+        {"provider": "akash", "model": "meta-llama/Llama-3.3-70B-Instruct", "budget": 16,
+         "latency_s": 0.5, "error": None, "content_len": 5, "has_reasoning_field": False,
+         "reasoning_len": 0, "finish_reason": "stop", "billed_prompt": 15, "billed_completion": 1},
+        {"provider": "akash", "model": "x/errors", "budget": 16, "error": "HTTP 400"},
+    ]
+    curve = [{"provider": "akash", "model": "openai/gpt-oss-20b", "concurrency": n,
+              "succeeded": n - f, "failed": f, "median_latency_s": 13.78,
+              "aggregate_tok_per_s": 23.95} for n, f in ((1, 0), (4, 0), (16, 0), (64, 34))]
+    out = router.import_measurements(rows, curve, "test")
+    assert out == {"observations": 3, "skipped_errors": 1, "decode_runs": 1,
+                   "concurrency_caps": {"akashml": 16}}
+    prof = router.store.profiles()
+    assert prof["akashml:Qwen/Qwen3.8-27B"].min_max_tokens == 29       # 28 spent, empty at 16
+    assert prof["akashml:meta-llama/Llama-3.3-70B-Instruct"].has_reasoning_field is False
+    assert round(prof["akashml:openai/gpt-oss-20b"].decode_tps) == 24
+    st = {p["provider"]: p for p in client.get("/router/roster").json()["providers"]}["akashml"]
+    assert st["max_concurrency"] == 16 and "0 failures at n=16" in st["concurrency_source"]
+
+
+def test_provider_at_its_measured_concurrency_cap_is_routed_around(app):
+    client, up = app
+    router = client.app.state.router
+    router.store.set_provider_fact("akashml", "max_ok_concurrency", 1, "test")
+    router.gather.acquire("akashml")
+    try:
+        st = {p["provider"]: p for p in client.get("/router/roster").json()["providers"]}
+        assert st["akashml"]["state"] == "AT_CAPACITY"
+    finally:
+        router.gather.release("akashml")
+    st = {p["provider"]: p for p in client.get("/router/roster").json()["providers"]}
+    assert st["akashml"]["state"] == "OK"
+
+
+def test_empty_long_generation_does_not_raise_the_short_task_floor(tmp_path):
+    s = Store(tmp_path / "s.db")
+    s.observe("ionet:ds", "probe", max_tokens=256, status=200, content_chars=5, reasoning_chars=60,
+              tool_calls=0, prompt_tokens=20, completion_tokens=18, cached_tokens=0, cost_usd=None,
+              cost_basis="unknown", latency_s=1.0, detail="", reasoning_field=True)
+    s.observe("ionet:ds", "gen", max_tokens=1024, status=200, content_chars=0, reasoning_chars=4000,
+              tool_calls=0, prompt_tokens=30, completion_tokens=1024, cached_tokens=0,
+              cost_usd=None, cost_basis="unknown", latency_s=4.1, detail="", reasoning_field=True)
+    p = s.profiles()["ionet:ds"]
+    assert p.min_max_tokens == 18                 # not 1025
+    assert round(p.decode_tps) == 250             # but decode speed still counts
+
+
+def test_named_seat_at_capacity_is_429_with_retry_after_and_names_the_cap(app):
+    client, up = app
+    router = client.app.state.router
+    client.post("/router/probe", json={"cheapest": 3})
+    router.store.set_provider_fact("akashml", "max_ok_concurrency", 1, "test cap")
+    router.gather.acquire("akashml")
+    try:
+        r = chat(client, model="akashml:meta-llama/Llama-3.3-70B-Instruct", max_tokens=16)
+    finally:
+        router.gather.release("akashml")
+    assert r.status_code == 429 and r.headers["Retry-After"] == "1"
+    assert "AT_CAPACITY" in r.json()["error"]["message"] and "test cap" in r.json()["error"]["message"]

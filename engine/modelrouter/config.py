@@ -27,6 +27,7 @@ gcp_project = ""            # e.g. "my-project"
 secret = ""
 [providers.akashml]
 secret = ""
+# max_concurrency = 16    # optional; otherwise the measured cap (import-measurements) applies
 [providers.venice]
 secret = ""
 [providers.nous]
@@ -50,7 +51,9 @@ ceiling_usd_per_mtok = 5.0
 # Lanes. `model: "auto"` is the interactive lane: someone is waiting, so a seat whose
 # measured latency is above this is excluded. `auto:background` and `auto:batch` ignore
 # latency and buy cheaper windows where a provider sells them (Sail balanced / flex).
-interactive_max_latency_s = 1.2
+# Predicted from each model's measured short-call latency + decode speed on a real
+# generation (`modelrouter probe --generation`), for THIS request's token count.
+interactive_max_latency_s = 8.0
 # When no model answers within a caller's small max_tokens, raise it for the cheapest
 # reasoning model (recorded in the decision) instead of refusing. Never silent.
 clamp_max_tokens = true
@@ -76,7 +79,8 @@ class Config:
     ceiling_usd_per_mtok: float | None = 5.0
     probe_budget_usd: float = 0.02
     allow_free: bool = False
-    interactive_max_latency_s: float | None = 1.2
+    interactive_max_latency_s: float | None = 8.0
+    max_concurrency: dict[str, int] = field(default_factory=dict)   # provider -> cap
     clamp_max_tokens: bool = True
     dashboard_url: str = ""
     state_dir: Path = field(default_factory=lambda: Path.home() / ".modelrouter")
@@ -106,6 +110,8 @@ def load(path: Path | None = None) -> Config:
             continue
         if (spec or {}).get("secret"):
             cfg.secrets[name] = spec["secret"]
+        if (spec or {}).get("max_concurrency"):
+            cfg.max_concurrency[name] = int(spec["max_concurrency"])
     srv = d.get("server", {})
     cfg.bind = srv.get("bind", cfg.bind)
     cfg.port = int(srv.get("port", cfg.port))

@@ -24,6 +24,10 @@ from .store import Store
 log = logging.getLogger("modelrouter")
 MAX_ATTEMPTS = 2
 PROBE_PROMPT = [{"role": "user", "content": "Reply with exactly one word: Ready"}]
+#: A generation long enough to measure decode, not connection + prefill (~400 tokens).
+GEN_PROMPT = [{"role": "user", "content": "Write about 300 words on the history of the "
+               "printing press. Plain prose, no headings."}]
+GEN_MAX_TOKENS = 1024                 # the measured universal safe ceiling
 PROBE_LADDER = (32, 256, 1024, 2048)
 PROBE_CONFIRMATIONS = 2    # extra samples at the budget where a reasoning model answered
 
@@ -106,7 +110,8 @@ class Router:
                                tool_calls=res.tool_calls, prompt_tokens=res.prompt_tokens,
                                completion_tokens=res.completion_tokens,
                                cached_tokens=res.cached_tokens, cost_usd=usd, cost_basis=basis,
-                               latency_s=res.latency_s, detail=res.detail)
+                               latency_s=res.latency_s, detail=res.detail,
+                               reasoning_field=res.reasoning_field)
         self.gather.note_ratelimit(res.provider, res.ratelimit)
         if not res.ok and res.status != 200:
             self.gather.penalise(res.provider, res.model, res.scope, res.detail, res.ratelimit)
@@ -152,8 +157,20 @@ class Router:
                 break
             provider, _, model = choice.seat.partition(":")
             window = self._window(roster, choice.seat)
-            res = P.call(provider, model, self.keys.get(provider), req,
-                         max_tokens=choice.max_tokens, window=window)
+            if not self.gather.try_acquire(provider):
+                # Lost the race for the provider's last slot: rule the seat out and decide
+                # again rather than exceed the concurrency it was measured to survive.
+                why = "provider AT_CAPACITY: slot taken between decision and call"
+                ask = replace(ask, failed=ask.failed + ((choice.seat, why),))
+                choice = replace(choice, outcome=Outcome.ABSTAIN, seat=None,
+                                 because="%s -- %s" % (choice.seat, why))
+                decisions[-1] = choice.public()     # if no attempt follows, this stands
+                continue
+            try:
+                res = P.call(provider, model, self.keys.get(provider), req,
+                             max_tokens=choice.max_tokens, window=window)
+            finally:
+                self.gather.release(provider)
             usd, basis = self._observe(choice.seat, "traffic", choice.max_tokens, res, window)
             attempts.append(self._attempt(choice.seat, choice.max_tokens, res, usd, basis, window))
             if res.ok:
@@ -166,6 +183,8 @@ class Router:
                 break                  # the client named this model: no substitute
             if not ran_out:
                 ask = replace(ask, failed=ask.failed + ((choice.seat, res.detail),))
+            else:
+                ask = replace(ask, escalate=ask.escalate + (choice.seat,))
         assert choice is not None
         answered = bool(res and res.ok)
         status = "ANSWERED" if answered else ("ABSTAINED" if choice.abstained and not attempts
@@ -212,7 +231,17 @@ class Router:
             return routed, None
         provider, _, model = choice.seat.partition(":")
 
+        if not self.gather.try_acquire(provider):
+            doc["status"] = "ABSTAINED"
+            doc["choice"] = replace(choice, outcome=Outcome.ABSTAIN, seat=None,
+                                    because="provider AT_CAPACITY: slot taken between decision "
+                                    "and call").public()
+            self.store.record({**doc, "id": did})
+            return Routed(did, replace(choice, outcome=Outcome.ABSTAIN, because=doc["choice"]
+                                       ["because"]), None, "ABSTAINED", doc), None
+
         def done(res: P.Result) -> None:
+            self.gather.release(provider)
             usd, basis = self._observe(choice.seat, "traffic", choice.max_tokens, res, window)
             doc["attempts"] = [self._attempt(choice.seat, choice.max_tokens, res, usd, basis,
                                              window)]
@@ -310,3 +339,100 @@ class Router:
             if p:
                 r["profile"] = p.public()
         return {"spent_usd": round(spent, 8), "budget_usd": budget, "probed": report}
+
+    def probe_generation(self, seats: list[str] | None = None, measured: bool = False,
+                         budget_usd: float | None = None,
+                         progress: Callable[[dict], None] | None = None) -> dict:
+        """Measure decode speed on a real ~400-token generation -- the number the
+        interactive lane gates on. With `measured`, every seat that has behaviour facts
+        but no decode speed yet. Spends real money, capped by budget_usd."""
+        budget = self.cfg.probe_budget_usd if budget_usd is None else budget_usd
+        roster = {c.seat: c for c in self.gather.roster()}
+        targets = list(seats or [])
+        if measured:
+            targets += sorted(c.seat for c in roster.values()
+                              if c.emits is not None and c.decode_tps is None
+                              and c.provider_state == "OK" and not c.blocked
+                              and (self.cfg.allow_free or not is_free(c))
+                              and c.seat not in targets)
+        spent, report = 0.0, []
+        for seat in targets:
+            c = roster.get(seat)
+            if not c or c.provider_state != "OK":
+                report.append({"seat": seat, "skipped": "not routable now"})
+                continue
+            if spent >= budget:
+                report.append({"seat": seat, "skipped": "probe budget spent"})
+                continue
+            self.gather.acquire(c.provider)
+            try:
+                res = P.call(c.provider, c.model, self.keys.get(c.provider),
+                             {"messages": GEN_PROMPT, "temperature": 0},
+                             max_tokens=GEN_MAX_TOKENS, timeout=180)
+            finally:
+                self.gather.release(c.provider)
+            usd, basis = self._observe(seat, "gen", GEN_MAX_TOKENS, res)
+            if usd is None:
+                usd = ((res.prompt_tokens or 0) + (res.completion_tokens or GEN_MAX_TOKENS)) \
+                    * (self.cfg.ceiling_usd_per_mtok or 5.0) / 1e6
+            spent += usd
+            row = self._attempt(seat, GEN_MAX_TOKENS, res, usd, basis)
+            row["tok_per_s"] = round(res.completion_tokens / res.latency_s, 1) \
+                if res.completion_tokens and res.latency_s else None
+            report.append(row)
+            if progress:
+                progress(row)
+        return {"spent_usd": round(spent, 8), "budget_usd": budget, "measured": report}
+
+    def import_measurements(self, rows: list[dict] | None = None,
+                            curve: list[dict] | None = None, source_note: str = "") -> dict:
+        """Import measurements taken outside the router as observations -- the same facts
+        a probe would record, so floors, emits and decode speed derive the same way.
+
+        rows   one-word sweeps: {provider, model, budget, latency_s, error, content_len,
+               has_reasoning_field, reasoning_len, finish_reason, billed_prompt,
+               billed_completion}  -> source "clamp-table"
+        curve  concurrency runs: {provider, model, concurrency, succeeded, failed,
+               median_latency_s, per_request_tok_per_s | aggregate_tok_per_s}
+               -> a decode-speed observation from the n=1 run, and the provider's
+               max_ok_concurrency (largest concurrency with zero failures)
+        """
+        alias = {"akash": "akashml", "io.net": "ionet", "io": "ionet"}
+        n_rows = n_skipped = 0
+        for r in rows or []:
+            provider = alias.get(r["provider"], r["provider"])
+            seat = "%s:%s" % (provider, r["model"])
+            if r.get("error"):
+                n_skipped += 1          # a refusal is not a behaviour fact about the model
+                continue
+            self.store.observe(
+                seat, "clamp-table", max_tokens=r.get("budget"), status=200,
+                content_chars=int(r.get("content_len") or 0),
+                reasoning_chars=int(r.get("reasoning_len") or 0), tool_calls=0,
+                prompt_tokens=r.get("billed_prompt"), completion_tokens=r.get("billed_completion"),
+                cached_tokens=None, cost_usd=None, cost_basis="unknown",
+                latency_s=float(r.get("latency_s") or 0), detail="imported " + source_note,
+                reasoning_field=r.get("has_reasoning_field"))
+            n_rows += 1
+        caps: dict[str, int] = {}
+        n_gen = 0
+        for r in curve or []:
+            provider = alias.get(r["provider"], r["provider"])
+            if int(r.get("failed") or 0) == 0:
+                caps[provider] = max(caps.get(provider, 0), int(r["concurrency"]))
+            if int(r["concurrency"]) == 1 and r.get("succeeded"):
+                tps = r.get("per_request_tok_per_s") or r.get("aggregate_tok_per_s")
+                lat = r.get("median_latency_s")
+                if tps and lat:
+                    self.store.observe(
+                        "%s:%s" % (provider, r["model"]), "gen-import", max_tokens=None,
+                        status=200, content_chars=1, reasoning_chars=0, tool_calls=0,
+                        prompt_tokens=None, completion_tokens=int(round(tps * lat)),
+                        cached_tokens=None, cost_usd=None, cost_basis="unknown",
+                        latency_s=float(lat), detail="imported concurrency n=1 " + source_note)
+                    n_gen += 1
+        for provider, cap in caps.items():
+            self.store.set_provider_fact(provider, "max_ok_concurrency", cap,
+                                         "measured: 0 failures at n=%d %s" % (cap, source_note))
+        return {"observations": n_rows, "skipped_errors": n_skipped, "decode_runs": n_gen,
+                "concurrency_caps": caps}
