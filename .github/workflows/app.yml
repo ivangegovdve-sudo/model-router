@@ -1,0 +1,69 @@
+name: app
+
+on:
+  push:
+    paths:
+      - "app/**"
+      - "docs/fixtures/**"
+      - ".github/workflows/app.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: app-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: APK + tests (ubuntu)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: android-actions/setup-android@v3
+      - name: Tests (parse every fixture, check the hard rendering rules)
+        run: ./gradlew --no-daemon :shared:desktopTest
+      - name: Build APK
+        run: ./gradlew --no-daemon :androidApp:assembleRelease :androidApp:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: modelrouter-apk
+          path: app/androidApp/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: app/shared/build/reports/tests/
+          if-no-files-found: ignore
+
+  windows:
+    name: MSI (windows-latest)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Package MSI
+        shell: bash
+        # The shared module also targets Android; point it at the runner's preinstalled SDK.
+        run: |
+          echo "sdk.dir=$(cygpath -m "$ANDROID_HOME")" > local.properties
+          ./gradlew --no-daemon :desktopApp:packageMsi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: modelrouter-msi
+          path: app/desktopApp/build/compose/binaries/main/msi/*.msi
+          if-no-files-found: error

@@ -1,0 +1,90 @@
+[
+    {
+        "id": "20260926T031201-8228da",
+        "t": 1790381521.444667,
+        "requested": "auto",
+        "outcome": "ABSTAIN",
+        "seat": null,
+        "because": "no candidate qualifies (857 never measured, 98 EXCLUDED, 12 request uses tools; tool support unknown; akashml:Qwen/Qwen3.6-35B-A3B: needs max_tokens >= 256 before any content appears; request allows 16; akashml:Qwen/Qwen3.8-27B: needs max_tokens >= 32 before any content appears; request allows 16; akashml:meta-llama/Llama-3.3-70B-Instruct: $0.1897/M (measured) is above the $0.1/M ceiling)",
+        "cost_usd": null,
+        "cost_basis": null,
+        "status": "ABSTAINED"
+    },
+    {
+        "id": "20260926T031159-c4ee0e",
+        "t": 1790381519.68551,
+        "requested": "auto",
+        "outcome": "ROUTE",
+        "seat": "venice:e2ee-qwen-2-5-7b-p",
+        "because": "cheapest of 8 qualifying: $0.0512/M measured; next akashml:openai/gpt-oss-20b at $0.05145/M measured",
+        "cost_usd": 6.63e-06,
+        "cost_basis": "billed",
+        "status": "ANSWERED"
+    },
+    {
+        "id": "20260926T031021-0f0896",
+        "t": 1790381421.798941,
+        "requested": "auto",
+        "outcome": "ROUTE",
+        "seat": "venice:e2ee-qwen-2-5-7b-p",
+        "because": "cheapest of 1 qualifying: $0.05142/M measured",
+        "cost_usd": 7.665e-05,
+        "cost_basis": "billed",
+        "status": "ANSWERED"
+    },
+    {
+        "id": "20260926T031020-b9d538",
+        "t": 1790381420.2031841,
+        "requested": "auto",
+        "outcome": "ROUTE",
+        "seat": "venice:e2ee-qwen-2-5-7b-p",
+        "because": "cheapest of 8 qualifying: $0.05104/M measured; next akashml:openai/gpt-oss-20b at $0.05145/M measured",
+        "cost_usd": 8.126e-05,
+        "cost_basis": "billed",
+        "status": "ANSWERED"
+    },
+    {
+        "id": "20260926T030608-e687ce",
+        "t": 1790381168.9876697,
+        "requested": "auto",
+        "outcome": "ABSTAIN",
+        "seat": null,
+        "because": "no candidate qualifies (857 never measured, 98 EXCLUDED, 12 request uses tools; tool support unknown; akashml:Qwen/Qwen3.6-35B-A3B: needs max_tokens >= 256 before any content appears; request allows 16; akashml:Qwen/Qwen3.8-27B: needs max_tokens >= 32 before any content appears; request allows 16; akashml:meta-llama/Llama-3.3-70B-Instruct: $0.1897/M (measured) is above the $0.1/M ceiling)",
+        "cost_usd": null,
+        "cost_basis": null,
+        "status": "ABSTAINED"
+    },
+    {
+        "id": "20260926T030604-654a90",
+        "t": 1790381164.1003084,
+        "requested": "auto",
+        "outcome": "ROUTE",
+        "seat": "venice:e2ee-qwen-2-5-7b-p",
+        "because": "cheapest of 8 qualifying: $0.05011/M measured; next akashml:openai/gpt-oss-20b at $0.05145/M measured",
+        "cost_usd": 8.074e-05,
+        "cost_basis": "billed",
+        "status": "ANSWERED"
+    },
+    {
+        "id": "20260926T030012-9fb482",
+        "t": 1790380812.820288,
+        "requested": "akashml:zai-org/GLM-5.3",
+        "outcome": "ABSTAIN",
+        "seat": null,
+        "because": "no candidate qualifies (1 EXCLUDED)",
+        "cost_usd": null,
+        "cost_basis": null,
+        "status": "ABSTAINED"
+    },
+    {
+        "id": "20260926T030008-b3ea1b",
+        "t": 1790380808.261323,
+        "requested": "auto",
+        "outcome": "ROUTE",
+        "seat": "akashml:openai/gpt-oss-20b",
+        "because": "cheapest of 6 qualifying: $0.04682/M measured; next akashml:openai/gpt-oss-120b at $0.08402/M measured",
+        "cost_usd": 9.479999999999999e-06,
+        "cost_basis": "computed",
+        "status": "ANSWERED"
+    }
+]

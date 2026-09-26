@@ -1,0 +1,31 @@
+name: engine
+
+on:
+  push:
+    paths: ["engine/**", ".github/workflows/engine.yml"]
+  pull_request:
+    paths: ["engine/**", ".github/workflows/engine.yml"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[test,mcp]"
+      - run: python -m pytest -q
+      - name: CLI refuses honestly with no config
+        shell: bash
+        run: |
+          set +e
+          MODELROUTER_CONFIG=$RUNNER_TEMP/none.toml modelrouter doctor; code=$?
+          test "$code" = "2"
