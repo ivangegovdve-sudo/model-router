@@ -122,6 +122,9 @@ class Candidate:
     billed_prompt: Decimal | None = None        # $/M actually charged, solved from its bills
     billed_completion: Decimal | None = None
     billed_evidence: str = ""
+    # Set when this provider has billed ABOVE its advertised price on some model: its
+    # advertised prices are then claims, not prices, until this model's own bills solve.
+    advertised_unreliable: str = ""
     window: str | None = None                   # provider scheduling window priced for this lane
     # Behaviour, from probes.
     emits: Emits | None = None
@@ -377,6 +380,9 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
             and c.price_age_s > ask.max_price_age_s and "billed" not in c.measured_basis:
         return out(Verdict.UNKNOWN, "price read %.1fh ago: stale, not fact" % (
             c.price_age_s / 3600), ("price",))
+    if c.advertised_unreliable and (c.billed_prompt is None or c.billed_completion is None):
+        return out(Verdict.UNKNOWN, "price unknown until billed: " + c.advertised_unreliable,
+                   ("billed_rates",))
     exp, usd, basis = _cost(ask, c, answer)
     if usd is None:
         return out(Verdict.UNKNOWN, "price unknown (null is not zero)", ("price",))

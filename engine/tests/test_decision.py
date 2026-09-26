@@ -342,3 +342,29 @@ def test_kimi_k3_with_nous_billed_rates_sail_flex_wins_every_split():
         assert ch.seat == "sail:moonshotai/Kimi-K3"
     why = {a.seat: a.price_basis for a in ch.considered}["nous:moonshotai/kimi-k3"]
     assert "billed rates 3/15 per M (solved from 4 billed calls)" in why
+
+
+def test_a_provider_caught_overbilling_has_no_price_for_unbilled_models():
+    """Never route to Nous on its advertised promo once its bills are known to be list."""
+    why = "nous bills above its advertised price (moonshotai/kimi-k3: advertised 1.0301/9.043, billed 3/15 per M)"
+    unbilled = _seat("nous:deepseek/deepseek-v4.1-flash", "0.035", "0.29", Emits.CONTENT,
+                     advertised_unreliable=why)
+    billed = _seat("nous:moonshotai/kimi-k3", "1.0301", "9.043", Emits.CONTENT,
+                   billed_prompt=D("3"), billed_completion=D("15"), advertised_unreliable=why)
+    a = assess(Ask(prompt_tokens=100, max_tokens=50), unbilled)
+    assert a.verdict is Verdict.UNKNOWN and "price unknown until billed" in a.because
+    assert assess(Ask(prompt_tokens=100, max_tokens=50), billed).verdict is Verdict.QUALIFIES
+
+
+def test_kimi_k3_regression_advertised_vs_billed_changes_the_answer():
+    """The same 20:1 job: on Nous's advertised rates it goes to Nous; on Nous's bills, to Sail."""
+    sail = _seat("sail:moonshotai/Kimi-K3", "1.25", "6.25", Emits.CONTENT, window="flex")
+    advertised = _seat("nous:moonshotai/kimi-k3", "1.0301", "9.043", Emits.CONTENT)
+    billed = replace(advertised, billed_prompt=D("3"), billed_completion=D("15"))
+    job = Ask(prompt_tokens=20000, max_tokens=1000, answer_tokens=1000, lane="batch")
+    assert decide(job, [sail, advertised]).seat == "nous:moonshotai/kimi-k3"
+    ch = decide(job, [sail, billed])
+    assert ch.seat == "sail:moonshotai/Kimi-K3"
+    cost = {a.seat: a.expected_usd for a in ch.considered}
+    assert cost["sail:moonshotai/Kimi-K3"] == D("0.03125")          # 20000*1.25 + 1000*6.25
+    assert cost["nous:moonshotai/kimi-k3"] == D("0.075")            # 20000*3 + 1000*15

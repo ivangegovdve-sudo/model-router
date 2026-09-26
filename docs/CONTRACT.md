@@ -134,6 +134,10 @@ UNAVAILABLE never implicates the key; do not rotate credentials over it.
 
 `correlated_with` lists providers that share this one's upstream (both directions).
 
+`advertised_unreliable` (on seats) is set once a provider has billed above its advertised price on
+any model (>10% on either leg, from solved billed rates). Its models without their own solved bills
+are then priced UNKNOWN — an advertised price from that provider is a claim, not a price.
+
 `max_concurrency` is the largest concurrency the provider completed with zero failures (imported
 or configured); at the cap the provider is `AT_CAPACITY` and routes go elsewhere. Slots are reserved
 atomically at call time.

@@ -273,6 +273,7 @@ class Gatherer:
         profiles = self.store.profiles()
         self._caps()
         facts = self.store.provider_facts()
+        overbilled = self._overbilled(profiles)
         out: list[Candidate] = []
         with self._lock:
             for provider, st in self.states.items():
@@ -374,6 +375,7 @@ class Gatherer:
                         billed_prompt=prof.billed_prompt if prof else None,
                         billed_completion=prof.billed_completion if prof else None,
                         billed_evidence=prof.billed_evidence if prof else "",
+                        advertised_unreliable=overbilled.get(provider, ""),
                         decode_tps=prof.decode_tps if prof else None,
                         emits=prof.emits if prof else None,
                         min_max_tokens=prof.min_max_tokens if prof else None,
@@ -413,6 +415,31 @@ class Gatherer:
                        replace(c, provider_state="MIRROR",
                                provider_detail=self.states[c.provider].detail)
                        for c in out]
+        return out
+
+    def _overbilled(self, profiles: dict) -> dict[str, str]:
+        """Providers caught billing above what they advertise, with the evidence. One such
+        model makes every unbilled model's advertised price a claim, not a price: Nous
+        advertised Kimi-K3 at $1.03/$9.04 and billed $3/$15 (2026-09-26)."""
+        out: dict[str, str] = {}
+        for provider, (_, listings) in self._cat.items():
+            cards = {li.model: li for li in listings}
+            for seat, prof in profiles.items():
+                if not seat.startswith(provider + ":") or prof.billed_prompt is None:
+                    continue
+                li = cards.get(seat.split(":", 1)[1])
+                if li is None or li.prompt is None or li.completion is None:
+                    continue
+                over = max(prof.billed_prompt / money(li.prompt) if li.prompt else 1,
+                           prof.billed_completion / money(li.completion) if li.completion else 1)
+                if over > Decimal("1.10"):
+                    out[provider] = ("%s bills above its advertised price (%s: advertised %s/%s, "
+                                     "billed %s/%s per M)" % (
+                                         provider, li.model, money(li.prompt).normalize(),
+                                         money(li.completion).normalize(),
+                                         prof.billed_prompt.normalize(),
+                                         prof.billed_completion.normalize()))
+                    break
         return out
 
     @staticmethod
