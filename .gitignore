@@ -8,3 +8,4 @@ app/build/
 app/*/build/
 app/local.properties
 *.log
+engine/build/
