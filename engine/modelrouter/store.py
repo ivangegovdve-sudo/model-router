@@ -49,6 +49,7 @@ class Profile:
     latency_s: float | None
     age_s: float | None
     floor_evidence: str = ""             # why min_max_tokens is what it is
+    max_reasoning_tokens: int | None = None  # most reasoning seen before an answer, any task
 
     def public(self) -> dict:
         d = dict(self.__dict__)
@@ -172,9 +173,11 @@ def derive(seat: str, obs: list) -> Profile:
         min_mt = None
 
     overhead = None
+    spent_all: list[int] = []
     if emits is Emits.REASONING_THEN_CONTENT:
         spent_all = [_spent_before_answer(o) for o in ok if o["completion_tokens"] is not None]
         overhead = int(statistics.median(spent_all)) if spent_all else None
+    max_reasoning = max(spent_all) if emits is Emits.REASONING_THEN_CONTENT and spent_all else None
 
     priced = [o for o in obs if o["cost_usd"] is not None and o["prompt_tokens"] is not None
               and o["completion_tokens"] is not None]
@@ -185,7 +188,8 @@ def derive(seat: str, obs: list) -> Profile:
     lat = [o["latency_s"] for o in ok if o["latency_s"]]
     return Profile(seat, len(obs), emits, min_mt, overhead, measured, basis,
                    statistics.median(lat) if lat else None,
-                   time.time() - max(o["t"] for o in obs) if obs else None, floor_evidence)
+                   time.time() - max(o["t"] for o in obs) if obs else None, floor_evidence,
+                   max_reasoning)
 
 
 def _spent_before_answer(o) -> int:

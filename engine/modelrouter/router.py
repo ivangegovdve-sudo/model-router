@@ -36,7 +36,23 @@ def estimate_tokens(req: dict) -> int:
     return max(1, n // 4)
 
 
-def ask_from(req: dict, ceiling: float | None, allow_free: bool = False) -> Ask:
+LANES = ("interactive", "background", "batch")
+
+
+def lane_of(req: dict, header: str | None = None) -> str:
+    """`auto` is interactive; `auto:background` / `auto:batch` (or X-Router-Lane) are not.
+    An unknown lane is an error, not a silent default."""
+    model = str(req.get("model") or "auto")
+    lane = (header or (model.split(":", 1)[1] if model.startswith("auto:") else "")
+            or "interactive").strip().lower()
+    if lane not in LANES:
+        raise ValueError("unknown lane %r -- use one of %s" % (lane, ", ".join(LANES)))
+    return lane
+
+
+def ask_from(req: dict, ceiling: float | None, allow_free: bool = False, *,
+             lane: str = "interactive", interactive_max_latency_s: float | None = None,
+             allow_clamp: bool = False) -> Ask:
     model = str(req.get("model") or "auto")
     mt = req.get("max_completion_tokens", req.get("max_tokens"))
     return Ask(prompt_tokens=estimate_tokens(req),
@@ -44,7 +60,9 @@ def ask_from(req: dict, ceiling: float | None, allow_free: bool = False) -> Ask:
                needs_tools=bool(req.get("tools")),
                ceiling_usd_per_mtok=ceiling,
                only_seat=None if model == "auto" or model.startswith("auto:") else model,
-               allow_free=allow_free)
+               allow_free=allow_free, lane=lane,
+               interactive_max_latency_s=interactive_max_latency_s,
+               allow_clamp=allow_clamp)
 
 
 @dataclass
@@ -62,8 +80,25 @@ class Router:
         self.gather = Gatherer(cfg, keys, store)
 
     # --- helpers -------------------------------------------------------------------------
-    def _observe(self, seat: str, source: str, max_tokens: int | None, res: P.Result) -> tuple:
-        usd, basis = call_cost(self.gather.listing(seat), res)
+    def _ask(self, req: dict, ceiling: float | None, lane: str) -> Ask:
+        return ask_from(req, ceiling if ceiling is not None else self.cfg.ceiling_usd_per_mtok,
+                        self.cfg.allow_free, lane=lane,
+                        interactive_max_latency_s=self.cfg.interactive_max_latency_s,
+                        allow_clamp=self.cfg.clamp_max_tokens)
+
+    @staticmethod
+    def _window(roster: list, seat: str | None) -> str | None:
+        for c in roster:
+            if c.seat == seat:
+                return c.window
+        return None
+
+    def _observe(self, seat: str, source: str, max_tokens: int | None, res: P.Result,
+                 window: str | None = None) -> tuple:
+        usd, basis = call_cost(self.gather.listing(seat, window), res)
+        if window not in (None, "asap"):
+            # A call scheduled in a slow window says nothing about interactive latency.
+            res.latency_s = 0.0
         if res.status == 200:
             self.store.observe(seat, source, max_tokens=max_tokens, status=res.status,
                                content_chars=len(res.content.strip()),
@@ -78,8 +113,10 @@ class Router:
         return usd, basis
 
     @staticmethod
-    def _attempt(seat: str, max_tokens: int | None, res: P.Result, usd, basis) -> dict:
-        return {"seat": seat, "max_tokens": max_tokens, "http": res.status, "ok": res.ok,
+    def _attempt(seat: str, max_tokens: int | None, res: P.Result, usd, basis,
+                 window: str | None = None) -> dict:
+        return {"seat": seat, "window": window, "max_tokens": max_tokens, "http": res.status,
+                "ok": res.ok,
                 "detail": res.detail, "finish_reason": res.finish_reason,
                 "content_chars": len(res.content.strip()),
                 "reasoning_chars": len(res.reasoning.strip()), "tool_calls": res.tool_calls,
@@ -91,38 +128,44 @@ class Router:
         return [s.public() for s in self.gather.states.values()]
 
     # --- DECIDE only -------------------------------------------------------------------
-    def explain(self, req: dict, ceiling: float | None = None) -> dict:
-        ask = ask_from(req, ceiling if ceiling is not None else self.cfg.ceiling_usd_per_mtok,
-                     self.cfg.allow_free)
-        roster = self.gather.roster()
+    def explain(self, req: dict, ceiling: float | None = None, lane: str = "interactive") -> dict:
+        ask = self._ask(req, ceiling, lane)
+        roster = self.gather.roster(lane)
         ch = decide(ask, roster)
         return {"choice": ch.public(), "providers": self.providers_public(),
                 "dashboard": self.gather.dashboard_status}
 
     # --- GATHER -> DECIDE -> ACT -------------------------------------------------------
-    def route(self, req: dict, *, client: str = "", ceiling: float | None = None) -> Routed:
+    def route(self, req: dict, *, client: str = "", ceiling: float | None = None,
+              lane: str = "interactive") -> Routed:
         t0 = time.time()
-        ask = ask_from(req, ceiling if ceiling is not None else self.cfg.ceiling_usd_per_mtok,
-                     self.cfg.allow_free)
+        ask = self._ask(req, ceiling, lane)
         attempts: list[dict] = []
         decisions: list[dict] = []
         res: P.Result | None = None
         choice: Choice | None = None
         for _ in range(MAX_ATTEMPTS):
-            choice = decide(ask, self.gather.roster())
+            roster = self.gather.roster(lane)
+            choice = decide(ask, roster)
             decisions.append(choice.public())
             if choice.abstained:
                 break
             provider, _, model = choice.seat.partition(":")
+            window = self._window(roster, choice.seat)
             res = P.call(provider, model, self.keys.get(provider), req,
-                         max_tokens=choice.max_tokens)
-            usd, basis = self._observe(choice.seat, "traffic", choice.max_tokens, res)
-            attempts.append(self._attempt(choice.seat, choice.max_tokens, res, usd, basis))
+                         max_tokens=choice.max_tokens, window=window)
+            usd, basis = self._observe(choice.seat, "traffic", choice.max_tokens, res, window)
+            attempts.append(self._attempt(choice.seat, choice.max_tokens, res, usd, basis, window))
             if res.ok:
                 break
-            if ask.only_seat:
+            # Empty because the budget ran out while it reasoned: the observation just
+            # recorded raises this model's floor, so deciding again may raise the budget
+            # for the SAME model. Any other failure rules the seat out for this request.
+            ran_out = res.status == 200 and res.finish_reason == "length" and res.reasoning.strip()
+            if ask.only_seat and not ran_out:
                 break                  # the client named this model: no substitute
-            ask = replace(ask, failed=ask.failed + ((choice.seat, res.detail),))
+            if not ran_out:
+                ask = replace(ask, failed=ask.failed + ((choice.seat, res.detail),))
         assert choice is not None
         answered = bool(res and res.ok)
         status = "ANSWERED" if answered else ("ABSTAINED" if choice.abstained and not attempts
@@ -132,7 +175,7 @@ class Router:
             "requested": str(req.get("model") or "auto"), "client": client,
             "ask": {"prompt_tokens": ask.prompt_tokens, "max_tokens": ask.max_tokens,
                     "needs_tools": ask.needs_tools, "ceiling_usd_per_mtok": ask.ceiling_usd_per_mtok,
-                    "stream": False},
+                    "stream": False, "lane": lane},
             "choice": decisions[-1], "earlier_decisions": decisions[:-1], "attempts": attempts,
             "providers": self.providers_public(), "dashboard": self.gather.dashboard_status,
             "status": status, "elapsed_s": round(time.time() - t0, 3),
@@ -144,18 +187,20 @@ class Router:
         did = self.store.record(doc)
         return Routed(did, choice, res, status, doc)
 
-    def route_stream(self, req: dict, *, client: str = "", ceiling: float | None = None
-                     ) -> tuple[Routed, Iterator[bytes] | None]:
+    def route_stream(self, req: dict, *, client: str = "", ceiling: float | None = None,
+                     lane: str = "interactive") -> tuple[Routed, Iterator[bytes] | None]:
         """Decide now; stream the chosen model. A stream cannot be retried once bytes
         have gone to the client, so it is one attempt, recorded when it ends."""
         t0 = time.time()
-        ask = ask_from(req, ceiling if ceiling is not None else self.cfg.ceiling_usd_per_mtok,
-                     self.cfg.allow_free)
-        choice = decide(ask, self.gather.roster())
+        ask = self._ask(req, ceiling, lane)
+        roster = self.gather.roster(lane)
+        choice = decide(ask, roster)
+        window = self._window(roster, choice.seat)
         doc = {"requested": str(req.get("model") or "auto"), "client": client,
                "ask": {"prompt_tokens": ask.prompt_tokens, "max_tokens": ask.max_tokens,
                        "needs_tools": ask.needs_tools,
-                       "ceiling_usd_per_mtok": ask.ceiling_usd_per_mtok, "stream": True},
+                       "ceiling_usd_per_mtok": ask.ceiling_usd_per_mtok, "stream": True,
+                       "lane": lane},
                "choice": choice.public(), "earlier_decisions": [], "attempts": [],
                "providers": self.providers_public(), "dashboard": self.gather.dashboard_status,
                "status": "ABSTAINED" if choice.abstained else "STREAMING",
@@ -168,8 +213,9 @@ class Router:
         provider, _, model = choice.seat.partition(":")
 
         def done(res: P.Result) -> None:
-            usd, basis = self._observe(choice.seat, "traffic", choice.max_tokens, res)
-            doc["attempts"] = [self._attempt(choice.seat, choice.max_tokens, res, usd, basis)]
+            usd, basis = self._observe(choice.seat, "traffic", choice.max_tokens, res, window)
+            doc["attempts"] = [self._attempt(choice.seat, choice.max_tokens, res, usd, basis,
+                                             window)]
             doc["status"] = "ANSWERED" if res.ok else "FAILED"
             doc["elapsed_s"] = round(time.time() - t0, 3)
             doc["result"] = {"cost_usd": usd, "cost_basis": basis, "calls": 1,
@@ -178,7 +224,7 @@ class Router:
             self.store.record(doc)
 
         return routed, P.stream(provider, model, self.keys.get(provider), req,
-                                max_tokens=choice.max_tokens, on_done=done)
+                                max_tokens=choice.max_tokens, on_done=done, window=window)
 
     # --- probing: buying facts -----------------------------------------------------------
     def probe(self, seats: list[str] | None = None, cheapest: int = 0,

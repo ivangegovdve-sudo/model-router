@@ -28,8 +28,11 @@ PROVIDERS: dict[str, dict[str, Any]] = {
                "parse": "venice"},
     "nous": {"base": "https://inference-api.nousresearch.com/v1", "catalogue": "/models",
              "parse": "openrouter"},
+    # Sail's /models lists ids only. Its prices -- one rate card per completion
+    # window -- are published on its docs pricing page, read live like a catalogue.
     "sail": {"base": "https://api.sailresearch.com/v1", "catalogue": "/models",
-             "parse": "bare"},                  # publishes no prices: UNKNOWN
+             "parse": "bare", "prices": "https://docs.sailresearch.com/pricing.md",
+             "specs": "https://docs.sailresearch.com/models.md", "windows": True},
     "ionet": {"base": "https://api.intelligence.io.solutions/api/v1", "catalogue": "/models",
               "parse": "ionet"},
 }
@@ -62,6 +65,70 @@ def _per_m(v) -> float | None:
     return None if x is None else x * 1e6
 
 
+#: Lane -> the scheduling windows it may buy, most preferred first. Sail names them
+#: asap (low latency), balanced (wider scheduling), flex (best effort).
+LANE_WINDOWS = {"interactive": ("asap",), "background": ("balanced", "asap"),
+                "batch": ("flex", "balanced", "asap")}
+_WINDOW_LABEL = {"default (asap)": "asap", "asap": "asap", "balanced": "balanced",
+                 "flex": "flex"}
+_PRICE_ARIA = re.compile(
+    r'aria-label="[^"]*?\s(Default \(ASAP\)|ASAP|Balanced|Flex) pricing: input \$([\d.]+), '
+    r'cached \$([\d.]+), output \$([\d.]+) per 1M tokens\.?"', re.I)
+
+
+def parse_window_prices(page: str) -> dict[str, dict[str, tuple[float, float, float]]]:
+    """Sail pricing page -> {model_id: {window: (prompt, completion, cached)}} in $/M.
+
+    Keyed by the page's own `data-model` ids, so nothing here names a model. A model
+    or window the page does not price is simply absent: UNKNOWN, never zero."""
+    out: dict[str, dict[str, tuple[float, float, float]]] = {}
+    for chunk in page.split("<tbody")[1:]:
+        m = re.search(r'data-model="([^"]+)"', chunk[:400])
+        if not m:
+            continue
+        for w, inp, cached, outp in _PRICE_ARIA.findall(chunk):
+            win = _WINDOW_LABEL.get(w.lower())
+            if win:
+                out.setdefault(m.group(1), {})[win] = (float(inp), float(outp), float(cached))
+    return out
+
+
+_CTX = re.compile(r'cap-expand-key">Context</span>\s*<span className="cap-expand-val">\s*'
+                  r'([\d.]+)\s*([KkMm]?)\s*</span>')
+_CODE_ID = re.compile(r"<code>([^<\s]+/[^<\s]+)</code>")
+
+
+def parse_context_lengths(page: str) -> dict[str, int]:
+    """Sail models page -> {model_id: context tokens}. Each model's "Context" value
+    precedes its `<code>org/model</code>` id in the page; pair each with the next id."""
+    out: dict[str, int] = {}
+    for m in _CTX.finditer(page):
+        ident = _CODE_ID.search(page, m.end())
+        if not ident or ident.group(1) in out:
+            continue
+        n = float(m.group(1)) * {"k": 1_000, "m": 1_000_000}.get(m.group(2).lower(), 1)
+        out[ident.group(1)] = int(n)
+    return out
+
+
+def fetch_context_lengths(provider: str, timeout: float = 30) -> dict[str, int]:
+    url = PROVIDERS[provider].get("specs")
+    if not url:
+        return {}
+    r = httpx.get(url, timeout=timeout, headers={"User-Agent": UA})
+    r.raise_for_status()
+    return parse_context_lengths(r.text)
+
+
+def fetch_window_prices(provider: str, timeout: float = 30) -> dict:
+    url = PROVIDERS[provider].get("prices")
+    if not url:
+        return {}
+    r = httpx.get(url, timeout=timeout, headers={"User-Agent": UA})
+    r.raise_for_status()
+    return parse_window_prices(r.text)
+
+
 @dataclass
 class Listing:
     """One model as its provider's catalogue describes it."""
@@ -75,6 +142,7 @@ class Listing:
     supports_tools: bool | None = None
     reasoning: bool | None = None
     text_out: bool | None = True
+    windows: dict[str, tuple[float, float, float]] | None = None   # window -> (p, c, cached)
 
 
 def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
@@ -235,12 +303,16 @@ def extract(provider: str, model: str, payload: dict) -> Result:
         billed_usd=_f(billed), body=payload)
 
 
-def _body(provider: str, model: str, req: dict, max_tokens: int | None) -> dict:
+def _body(provider: str, model: str, req: dict, max_tokens: int | None,
+          window: str | None = None) -> dict:
     body = {k: v for k, v in req.items() if k not in ("model", "max_tokens",
                                                       "max_completion_tokens")}
     body["model"] = model
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
+    if window and PROVIDERS.get(provider, {}).get("windows"):
+        # The lane travels with the call: priced at this window, so scheduled in it.
+        body["metadata"] = {**(body.get("metadata") or {}), "completion_window": window}
     if provider == "openrouter":
         body["usage"] = {"include": True}      # ask for the billed cost
     elif provider == "venice" and "venice_parameters" not in body:
@@ -282,7 +354,7 @@ def _describe(status: int, msg: str, scope: str) -> str:
 
 
 def call(provider: str, model: str, key: str, req: dict, *, max_tokens: int | None,
-         timeout: float = 180) -> Result:
+         timeout: float = 180, window: str | None = None) -> Result:
     t0 = time.time()
 
     def fail(status: int, detail: str, scope: str = "model", rl=None) -> Result:
@@ -294,7 +366,7 @@ def call(provider: str, model: str, key: str, req: dict, *, max_tokens: int | No
         return fail(0, "unknown provider", "provider")
     if not key:
         return fail(0, "no key", "provider")
-    body = _body(provider, model, req, max_tokens)
+    body = _body(provider, model, req, max_tokens, window)
     body.pop("stream", None)
     body.pop("stream_options", None)
     try:
@@ -327,14 +399,15 @@ def call(provider: str, model: str, key: str, req: dict, *, max_tokens: int | No
 
 
 def stream(provider: str, model: str, key: str, req: dict, *, max_tokens: int | None,
-           on_done: Callable[[Result], None], timeout: float = 180) -> Iterator[bytes]:
+           on_done: Callable[[Result], None], timeout: float = 180,
+           window: str | None = None) -> Iterator[bytes]:
     """Forward an SSE stream verbatim while tallying what it carried.
 
     Usage arrives in the last chunk when requested; content and reasoning deltas are
     counted separately so an all-reasoning stream is recorded as empty.
     """
     t0 = time.time()
-    body = _body(provider, model, req, max_tokens)
+    body = _body(provider, model, req, max_tokens, window)
     body["stream"] = True
     body["stream_options"] = {"include_usage": True}
     res = Result(False, 0, provider, model)

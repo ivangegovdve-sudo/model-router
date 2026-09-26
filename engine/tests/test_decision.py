@@ -1,4 +1,6 @@
 """The decision layer, on the facts measured on AkashML on 2026-09-25."""
+from dataclasses import replace
+
 from modelrouter.decision import Ask, Candidate, Emits, Outcome, Verdict, assess, decide
 
 
@@ -44,7 +46,7 @@ def test_price_table_alone_would_pick_the_empty_model():
 def test_large_budget_lets_the_cheap_reasoning_model_win_on_measured_cost():
     ch = decide(Ask(prompt_tokens=40, max_tokens=1024), akash())
     assert ch.seat == "akashml:openai/gpt-oss-20b"
-    assert "measured" in ch.because
+    assert "rate card" in ch.because     # computed cost = the model's own rate card, split
 
 
 def test_never_measured_is_unknown_not_qualified_and_abstain_names_it():
@@ -144,3 +146,59 @@ def test_unmeasured_seats_kept_only_when_cheaper_than_winner():
     unk = [a for a in ch.considered if a.verdict is Verdict.UNKNOWN]
     assert len(unk) == 25 and all(a.seat.startswith("p:u") for a in unk)
     assert ch.facts["unknown_not_listed"] == 55
+
+
+def _seat(seat, p, c, emits, floor=1, oh=None, lat=0.8, **kw):
+    prov, _, model = seat.partition(":")
+    return Candidate(seat=seat, provider=prov, model=model, list_prompt=p, list_completion=c,
+                     emits=emits, min_max_tokens=floor, reasoning_overhead_tokens=oh,
+                     latency_s=lat, context_length=128000, supports_tools=True, **kw)
+
+
+def test_interactive_lane_excludes_slow_seats_batch_lane_takes_them():
+    fast = _seat("ionet:m", 0.20, 0.60, Emits.CONTENT, lat=0.7)
+    slow_cheap = _seat("sail:m", 0.05, 0.20, Emits.CONTENT, lat=2.3, window="asap")
+    ask = Ask(prompt_tokens=40, max_tokens=100, interactive_max_latency_s=1.2)
+    ch = decide(ask, [fast, slow_cheap])
+    assert ch.seat == "ionet:m"
+    assert any("above the interactive lane" in a.because for a in ch.considered)
+    assert decide(replace(ask, lane="batch"), [fast, slow_cheap]).seat == "sail:m"
+
+
+def test_no_reasoning_short_answer_beats_cheaper_per_token_reasoning_model():
+    """Gemma-4-12B shape: 2 tokens, no reasoning tax, wins a short answer on its own merits."""
+    gemma = _seat("sail:google/gemma-4-12B-it", 0.30, 2.00, Emits.CONTENT)
+    glm = _seat("sail:zai-org/GLM-5.3-Flash", 0.11, 0.35, Emits.REASONING_THEN_CONTENT,
+                floor=37, oh=36)
+    ch = decide(Ask(prompt_tokens=40, max_tokens=4), [gemma, glm])
+    assert ch.seat == "sail:google/gemma-4-12B-it"
+
+
+def test_small_budget_prefers_rerouting_to_a_no_reasoning_model_over_clamping():
+    ask = Ask(prompt_tokens=40, max_tokens=16, allow_clamp=True)
+    ch = decide(ask, akash())
+    assert ch.seat == "akashml:meta-llama/Llama-3.3-70B-Instruct" and ch.max_tokens == 16
+
+
+def test_clamps_visibly_when_no_model_answers_within_the_budget():
+    ask = Ask(prompt_tokens=40, max_tokens=16, allow_clamp=True,
+              only_seat="akashml:openai/gpt-oss-20b")
+    ch = decide(ask, akash())
+    assert ch.outcome is Outcome.ROUTE
+    assert ch.max_tokens == 16 + 2 * 255              # caller's room + 2x the reasoning seen
+    assert "raised to 526" in ch.because and ch.facts["max_tokens_raised_from"] == 16
+    # never silent: without clamping the same request is refused
+    assert decide(replace(ask, allow_clamp=False), akash()).outcome is Outcome.ABSTAIN
+
+
+def test_billed_provider_keeps_its_measured_price():
+    billed = _seat("venice:x", 0.01, 0.01, Emits.CONTENT, measured_usd_per_mtok=0.5,
+                   measured_basis="billed")
+    a = assess(Ask(prompt_tokens=40, max_tokens=10), billed)
+    assert a.price_basis == "measured, billed" and a.usd_per_mtok == 0.5
+
+
+def test_named_model_skips_the_lane_latency_gate():
+    slow = _seat("sail:m", 0.05, 0.20, Emits.CONTENT, lat=2.4)
+    ask = Ask(prompt_tokens=40, max_tokens=50, interactive_max_latency_s=1.2, only_seat="sail:m")
+    assert decide(ask, [slow]).seat == "sail:m"

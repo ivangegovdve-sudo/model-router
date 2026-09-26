@@ -29,7 +29,7 @@ Stdlib only. No I/O. Deterministic: the same facts always give the same Choice.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -57,6 +57,11 @@ class Emits(str, Enum):
     REASONING_ONLY = "reasoning_only"                # never produced content at any probed budget
 
 
+#: A raised budget gives this multiple of the most reasoning ever observed for the model:
+#: the floor comes from a one-word probe, and a real task reasons longer (GLM-5.3-Flash
+#: probed at 35 tokens, then came back empty on a classification prompt at 43).
+CLAMP_HEADROOM = 2
+
 #: When a client sets no max_tokens, cost is estimated at this many completion tokens.
 DEFAULT_COMPLETION_ESTIMATE = 512
 
@@ -80,12 +85,15 @@ class Candidate:
     list_prompt: float | None = None            # headline, from the catalogue
     list_completion: float | None = None
     price_source: str = ""                      # dashboard | provider-catalogue
-    measured_usd_per_mtok: float | None = None  # billed / tokens, from this model's own calls
+    measured_usd_per_mtok: float | None = None  # cost / tokens, from this model's own calls
+    measured_basis: str = ""                    # billed | computed | billed+computed
+    window: str | None = None                   # provider scheduling window priced for this lane
     # Behaviour, from probes.
     emits: Emits | None = None
     min_max_tokens: int | None = None           # smallest budget that produced content
     reasoning_overhead_tokens: int | None = None  # completion tokens spent before content
     floor_evidence: str = ""                    # the measurement behind min_max_tokens
+    max_reasoning_tokens: int | None = None     # most reasoning seen before an answer, any task
     probe_age_s: float | None = None
     latency_s: float | None = None
 
@@ -101,6 +109,17 @@ class Ask:
     only_seat: str | None = None                # client named a model: judge only that one
     failed: tuple[tuple[str, str], ...] = ()    # (seat, why) already tried for THIS request
     allow_free: bool = False                    # free tiers may log prompts; separate quotas
+    # LANE: interactive (someone is waiting) | background | batch (nobody is waiting).
+    # Only the interactive lane gates on measured latency; the others buy cheaper, slower
+    # capacity (e.g. Sail's balanced / flex completion windows).
+    lane: str = "interactive"
+    interactive_max_latency_s: float | None = None
+    # A budget below a reasoning model's measured floor bills tokens and returns nothing.
+    # With allow_clamp, when NO model qualifies at the caller's budget, the cheapest
+    # reasoning model is used with the budget raised to the caller's budget plus
+    # CLAMP_HEADROOM x the most reasoning observed for it -- visibly, never silently.
+    allow_clamp: bool = False
+    max_clamp_extra: int = 1024
 
 
 @dataclass(frozen=True)
@@ -112,6 +131,7 @@ class Assessment:
     usd_per_mtok: float | None = None           # the price used to rank it
     price_basis: str = ""                       # measured | list | ""
     expected_usd: float | None = None           # for THIS request
+    clamp_to: int | None = None                 # would qualify with max_tokens raised to this
 
 
 @dataclass(frozen=True)
@@ -158,17 +178,27 @@ def is_free(c: Candidate) -> bool:
     return c.model.endswith(":free") or (c.list_prompt == 0 and c.list_completion == 0)
 
 
-def _price(c: Candidate) -> tuple[float | None, str]:
-    """The price a candidate is ranked on: its own measured price when there is one.
+def _cost(ask: Ask, c: Candidate, completion: int) -> tuple[float | None, float | None, str]:
+    """(expected USD for this request, effective $/M, basis).
 
-    The list price is a blend weighted 2:1 prompt:completion. Both halves must be
-    known -- half a price is not a price.
+    - A provider that BILLS per call: its measured price (it catches what a rate card
+      does not, e.g. Venice's injected system prompt).
+    - Otherwise this model's own rate card for the lane's window, split into prompt and
+      completion, with the measured reasoning tokens charged at the completion rate --
+      so a no-reasoning model's short answer is priced as the short answer it is.
+    - Half a price is not a price: both legs must be known.
     """
-    if c.measured_usd_per_mtok is not None:
-        return c.measured_usd_per_mtok, "measured"
+    oh = c.reasoning_overhead_tokens or 0
+    tokens = ask.prompt_tokens + completion + oh
+    if c.measured_usd_per_mtok is not None and "billed" in c.measured_basis:
+        return c.measured_usd_per_mtok * tokens / 1e6, c.measured_usd_per_mtok, "measured, billed"
     if c.list_prompt is not None and c.list_completion is not None:
-        return (2 * c.list_prompt + c.list_completion) / 3, "list"
-    return None, ""
+        exp = (ask.prompt_tokens * c.list_prompt + (completion + oh) * c.list_completion) / 1e6
+        basis = "rate card" + (" " + c.window if c.window else "")
+        return exp, exp / tokens * 1e6, basis
+    if c.measured_usd_per_mtok is not None:
+        return c.measured_usd_per_mtok * tokens / 1e6, c.measured_usd_per_mtok, "measured"
+    return None, None, ""
 
 
 def assess(ask: Ask, c: Candidate) -> Assessment:
@@ -209,11 +239,28 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
     if c.emits is Emits.REASONING_THEN_CONTENT and c.min_max_tokens is None:
         return out(Verdict.UNKNOWN, "reasons before answering; the budget it needs "
                    "is unknown", ("min_max_tokens",))
+    # The latency gate chooses FOR the caller; a caller who named the model has chosen.
+    if ask.lane == "interactive" and ask.interactive_max_latency_s is not None             and ask.only_seat is None:
+        if c.latency_s is None:
+            return out(Verdict.UNKNOWN, "latency never measured; the interactive lane "
+                       "needs it", ("latency_s",))
+        if c.latency_s > ask.interactive_max_latency_s:
+            return out(Verdict.EXCLUDED, "measured latency %.2fs is above the interactive "
+                       "lane's %.2fs -- a background or batch lane can use it" % (
+                           c.latency_s, ask.interactive_max_latency_s))
     if ask.max_tokens is not None and ask.max_tokens < need:
-        return out(Verdict.EXCLUDED, "needs max_tokens >= %d before any content "
-                   "appears%s; request allows %d" % (
-                       need, " (measured: %s)" % c.floor_evidence if c.floor_evidence else "",
-                       ask.max_tokens))
+        why = "needs max_tokens >= %d before any content appears%s; request allows %d" % (
+            need, " (measured: %s)" % c.floor_evidence if c.floor_evidence else "",
+            ask.max_tokens)
+        reasoning = max(need - 1, c.max_reasoning_tokens or 0)
+        if ask.allow_clamp and CLAMP_HEADROOM * reasoning <= ask.max_clamp_extra:
+            raised = ask.max_tokens + CLAMP_HEADROOM * reasoning
+            again = assess(replace(ask, max_tokens=raised, allow_clamp=False), c)
+            if again.verdict is Verdict.QUALIFIES:
+                return Assessment(c.seat, Verdict.EXCLUDED, why + "; would serve with "
+                                  "max_tokens raised to %d" % raised, (), again.usd_per_mtok,
+                                  again.price_basis, again.expected_usd, raised)
+        return out(Verdict.EXCLUDED, why)
 
     completion = ask.max_tokens if ask.max_tokens is not None else max(
         DEFAULT_COMPLETION_ESTIMATE, need)
@@ -223,17 +270,16 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
         return out(Verdict.EXCLUDED, "needs %d tokens of context; model has %d" % (
             ask.prompt_tokens + completion, c.context_length))
 
-    usd, basis = _price(c)
+    exp, usd, basis = _cost(ask, c, completion)
     if usd is None:
         return out(Verdict.UNKNOWN, "price unknown (null is not zero)", ("price",))
     if ask.ceiling_usd_per_mtok is not None and usd > ask.ceiling_usd_per_mtok:
         return out(Verdict.EXCLUDED, "$%.4g/M (%s) is above the $%.4g/M ceiling" % (
             usd, basis, ask.ceiling_usd_per_mtok), usd=usd, basis=basis)
-
-    tokens = ask.prompt_tokens + completion + (c.reasoning_overhead_tokens or 0)
-    exp = usd * tokens / 1e6
-    return out(Verdict.QUALIFIES, "$%.4g/M (%s), emits into %s" % (usd, basis, c.emits.value),
-               usd=usd, basis=basis, exp=exp)
+    return out(Verdict.QUALIFIES, "$%.4g/M (%s), emits into %s%s" % (
+        usd, basis, c.emits.value,
+        ", %.2fs measured" % c.latency_s if c.latency_s is not None else ""),
+        usd=usd, basis=basis, exp=exp)
 
 
 def decide(ask: Ask, roster: list[Candidate]) -> Choice:
@@ -245,7 +291,8 @@ def decide(ask: Ask, roster: list[Candidate]) -> Choice:
     pool = [c for c in roster if ask.only_seat in (None, c.seat)]
     facts = {"prompt_tokens": ask.prompt_tokens, "max_tokens": ask.max_tokens,
              "needs_tools": ask.needs_tools, "ceiling_usd_per_mtok": ask.ceiling_usd_per_mtok,
-             "only_seat": ask.only_seat, "roster_size": len(roster)}
+             "only_seat": ask.only_seat, "roster_size": len(roster), "lane": ask.lane,
+             "interactive_max_latency_s": ask.interactive_max_latency_s}
     if ask.only_seat and not pool:
         return Choice(Outcome.ABSTAIN, "requested model %s is not in the live roster"
                       % ask.only_seat, facts=facts)
@@ -269,6 +316,26 @@ def decide(ask: Ask, roster: list[Candidate]) -> Choice:
     kept = [a for a in unk if _list_blend(by_seat[a.seat]) < bar][:UNKNOWN_KEPT]
     facts["unknown_not_listed"] = len(unk) - len(kept)
     considered = tuple(ok + excluded + kept)
+
+    clampable = sorted((a for a in judged if a.clamp_to is not None and a.expected_usd is not None),
+                       key=lambda a: (a.expected_usd, by_seat[a.seat].latency_s or float("inf"),
+                                      a.seat))
+    if not ok and clampable:
+        # Nothing answers at the caller's budget. Passing it through to a reasoning model
+        # would bill tokens and return nothing; raise it -- on the record -- instead.
+        win = clampable[0]
+        chosen = replace(win, verdict=Verdict.QUALIFIES, because="qualifies with max_tokens "
+                         "raised %d -> %d; %s" % (ask.max_tokens, win.clamp_to, win.because))
+        considered = tuple([chosen] + [a for a in considered if a.seat != win.seat])
+        facts["max_tokens_raised_from"] = ask.max_tokens
+        because = ("no model answers within max_tokens=%d; raised to %d for %s, the cheapest "
+                   "that can: below its measured floor it bills tokens and returns nothing "
+                   "(%s). $%.3g expected (%s)" % (
+                       ask.max_tokens, win.clamp_to, win.seat,
+                       by_seat[win.seat].floor_evidence or "measured",
+                       win.expected_usd, win.price_basis))
+        return Choice(Outcome.ROUTE, because, seat=win.seat, max_tokens=win.clamp_to,
+                      expected_usd=win.expected_usd, considered=considered, facts=facts)
 
     if not ok:
         counts: dict[str, int] = {}
@@ -297,7 +364,7 @@ def decide(ask: Ask, roster: list[Candidate]) -> Choice:
     because = "lowest expected cost of %d qualifying: %s" % (len(ok), cost(win))
     if runner:
         because += "; next %s at %s" % (runner.seat, cost(runner))
-    # The client's budget is forwarded untouched. Raising it would change what the
-    # call costs behind the client's back; a budget too small was excluded above.
+    # The client's budget is forwarded untouched here: some model answers within it,
+    # so no reasoning model is handed a budget it would spend on thinking alone.
     return Choice(Outcome.ROUTE, because, seat=win.seat, max_tokens=ask.max_tokens,
                   expected_usd=win.expected_usd, considered=considered, facts=facts)

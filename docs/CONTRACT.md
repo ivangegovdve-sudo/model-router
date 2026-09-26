@@ -19,6 +19,21 @@ is needed.
 
 Optional request header `X-Router-Max-Usd-Per-M: <float>` lowers the price ceiling for one call.
 
+**Lanes.** `model: "auto"` is the **interactive** lane: someone is waiting, so any seat whose
+measured latency exceeds `policy.interactive_max_latency_s` is excluded. `auto:background` and
+`auto:batch` (or header `X-Router-Lane`) ignore latency and buy cheaper scheduling where a provider
+sells it — Sail's `balanced` / `flex` completion windows, sent as `metadata.completion_window` and
+priced from that window's rate card. A named `provider:model` skips the latency gate (the caller
+chose). An unknown lane is HTTP 400.
+
+**max_tokens is a correctness parameter.** A reasoning model given less than its measured floor
+bills tokens and returns nothing, so the router never passes such a budget through. It prefers a
+model that answers within the caller's budget; if none does, it raises the budget for the cheapest
+reasoning model to `caller's budget + 2 × the most reasoning observed for it` (capped by
+`max_clamp_extra`), records `facts.max_tokens_raised_from`, and says so in `because`. If that still
+comes back empty (a real task can reason far longer than the probe), the observation raises the
+floor and the router decides once more, which may raise it again for the same model.
+
 A routed response is the upstream body unchanged plus one field:
 
 ```json
@@ -81,7 +96,7 @@ might have been cheaper — and counts the rest in `facts.unknown_not_listed`.
 `{seat, verdict:"QUALIFIES|EXCLUDED|UNKNOWN", because, unknown:[fact], usd_per_mtok|null, price_basis:"measured|list|", expected_usd|null}`
 
 ### Attempt
-`{seat, max_tokens|null, http, ok, detail, finish_reason, content_chars, reasoning_chars, tool_calls, prompt_tokens, completion_tokens, cached_tokens, cost_usd|null, cost_basis, latency_s, scope:"model|provider|quota|edge|transport"|null}`
+`{seat, window|null, max_tokens|null, http, ok, detail, finish_reason, content_chars, reasoning_chars, tool_calls, prompt_tokens, completion_tokens, cached_tokens, cost_usd|null, cost_basis, latency_s, scope:"model|provider|quota|edge|transport"|null}`
 
 `reasoning_chars > 0` with `content_chars == 0` is the measured failure this product exists for:
 the model spent the budget reasoning and returned nothing.

@@ -47,6 +47,13 @@ no_auth = false
 [policy]
 # Refuse any model whose price (measured, else list) is above this, in USD per million tokens.
 ceiling_usd_per_mtok = 5.0
+# Lanes. `model: "auto"` is the interactive lane: someone is waiting, so a seat whose
+# measured latency is above this is excluded. `auto:background` and `auto:batch` ignore
+# latency and buy cheaper windows where a provider sells them (Sail balanced / flex).
+interactive_max_latency_s = 1.2
+# When no model answers within a caller's small max_tokens, raise it for the cheapest
+# reasoning model (recorded in the decision) instead of refusing. Never silent.
+clamp_max_tokens = true
 # Free tiers (":free", or $0 list price) may log prompts and have their own daily quota.
 allow_free = false
 # Probing spends real money to learn how a model behaves. Hard cap per probe run.
@@ -69,6 +76,8 @@ class Config:
     ceiling_usd_per_mtok: float | None = 5.0
     probe_budget_usd: float = 0.02
     allow_free: bool = False
+    interactive_max_latency_s: float | None = 1.2
+    clamp_max_tokens: bool = True
     dashboard_url: str = ""
     state_dir: Path = field(default_factory=lambda: Path.home() / ".modelrouter")
     problems: list[str] = field(default_factory=list)
@@ -107,6 +116,9 @@ def load(path: Path | None = None) -> Config:
     cfg.ceiling_usd_per_mtok = float(c) if c not in (None, "", 0) else None
     cfg.probe_budget_usd = float(pol.get("probe_budget_usd", cfg.probe_budget_usd))
     cfg.allow_free = bool(pol.get("allow_free", False))
+    lat = pol.get("interactive_max_latency_s", cfg.interactive_max_latency_s)
+    cfg.interactive_max_latency_s = float(lat) if lat not in (None, "", 0) else None
+    cfg.clamp_max_tokens = bool(pol.get("clamp_max_tokens", True))
     cfg.dashboard_url = (pol.get("dashboard_url", "") or "").rstrip("/")
     if cfg.source not in ("gcp", "env"):
         cfg.problems.append('secrets.source must be "gcp" or "env"')

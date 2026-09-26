@@ -62,6 +62,8 @@ class Gatherer:
         self.cfg, self.keys, self.store = cfg, keys, store
         self._cat: dict[str, tuple[float, list[P.Listing]]] = {}
         self._dash: dict[str, tuple[float, dict[str, dict] | None]] = {}
+        self._win: dict[str, tuple[float, dict]] = {}
+        self._ctx: dict[str, tuple[float, dict]] = {}
         self.states: dict[str, ProviderState] = {p: ProviderState(p) for p in cfg.secrets}
         # provider -> ok | not carried | unreachable (...) ; the whole map is shown as-is
         self.dashboard_status: dict[str, str] | str = (
@@ -117,6 +119,36 @@ class Gatherer:
         self._dash[provider] = (time.time(), out)
         return out
 
+    def _window_prices(self, provider: str) -> dict:
+        """Per-window rate cards for providers that publish them (Sail). A failed read
+        leaves them UNKNOWN for this run -- never a stale copy, never zero."""
+        if not P.PROVIDERS[provider].get("prices"):
+            return {}
+        hit = self._win.get(provider)
+        if hit and time.time() - hit[0] < CATALOGUE_TTL_S:
+            return hit[1]
+        try:
+            prices = P.fetch_window_prices(provider)
+            self.states[provider].price_source = "provider pricing page"
+        except Exception as exc:                                # noqa: BLE001
+            prices = {}
+            self.states[provider].detail = "pricing page unreadable (%s)" % type(exc).__name__
+        self._win[provider] = (time.time(), prices)
+        return prices
+
+    def _context_lengths(self, provider: str) -> dict:
+        if not P.PROVIDERS[provider].get("specs"):
+            return {}
+        hit = self._ctx.get(provider)
+        if hit and time.time() - hit[0] < CATALOGUE_TTL_S:
+            return hit[1]
+        try:
+            ctx = P.fetch_context_lengths(provider)
+        except Exception:                                       # noqa: BLE001
+            ctx = {}                                            # stays UNKNOWN this run
+        self._ctx[provider] = (time.time(), ctx)
+        return ctx
+
     # --- feedback from ACT -----------------------------------------------------------
     def penalise(self, provider: str, model: str, scope: str, detail: str,
                  ratelimit: dict[str, str] | None = None) -> None:
@@ -143,7 +175,7 @@ class Gatherer:
             self.states[provider].ratelimit = ratelimit
 
     # --- the roster --------------------------------------------------------------------
-    def roster(self) -> list[Candidate]:
+    def roster(self, lane: str = "interactive") -> list[Candidate]:
         profiles = self.store.profiles()
         out: list[Candidate] = []
         with self._lock:
@@ -180,11 +212,20 @@ class Gatherer:
                     st.state, st.detail = "CATALOGUE_FAILED", type(exc).__name__
                     continue
                 dash = self._dashboard(provider)
+                windows = self._window_prices(provider)
+                contexts = self._context_lengths(provider)
                 st.models = len(listings)
                 sources = set()
                 for li in listings:
                     seat = "%s:%s" % (provider, li.model)
                     pr, co, src, available = li.prompt, li.completion, "provider-catalogue", True
+                    window = None
+                    cards = windows.get(li.model) or li.windows or {}
+                    for w in P.LANE_WINDOWS.get(lane, ("asap",)):
+                        if w in cards:
+                            pr, co, _cached = cards[w]
+                            window, src = w, "provider pricing page"
+                            break
                     row = (dash or {}).get(li.model)
                     if row:
                         pp = row.get("pricing") or {}
@@ -203,23 +244,32 @@ class Gatherer:
                     out.append(Candidate(
                         seat=seat, provider=provider, model=li.model,
                         provider_state=state, provider_detail=detail, available=available,
-                        context_length=li.context_length, supports_tools=li.supports_tools,
+                        context_length=li.context_length or contexts.get(li.model),
+                        supports_tools=li.supports_tools,
                         list_prompt=pr, list_completion=co, price_source=src,
                         measured_usd_per_mtok=prof.measured_usd_per_mtok if prof else None,
+                        measured_basis=prof.measured_basis if prof else "", window=window,
                         emits=prof.emits if prof else None,
                         min_max_tokens=prof.min_max_tokens if prof else None,
                         reasoning_overhead_tokens=prof.reasoning_overhead_tokens if prof else None,
                         floor_evidence=prof.floor_evidence if prof else "",
+                        max_reasoning_tokens=prof.max_reasoning_tokens if prof else None,
                         probe_age_s=prof.age_s if prof else None,
                         latency_s=prof.latency_s if prof else None))
                 st.price_source = "mixed" if len(sources) > 1 else (next(iter(sources), ""))
         return out
 
-    def listing(self, seat: str) -> P.Listing | None:
+    def listing(self, seat: str, window: str | None = None) -> P.Listing | None:
+        """The seat's rate card -- for a windowed provider, the card of the window the
+        call was actually scheduled in, so its computed cost is the one it incurred."""
         provider, _, model = seat.partition(":")
         hit = self._cat.get(provider)
         for li in (hit[1] if hit else []):
             if li.model == model:
+                card = (self._win.get(provider, (0, {}))[1].get(model) or {}).get(window or "asap")
+                if card:
+                    return P.Listing(provider, model, card[0], card[1], card[2],
+                                     li.context_length, li.supports_tools, li.reasoning)
                 return li
         return None
 

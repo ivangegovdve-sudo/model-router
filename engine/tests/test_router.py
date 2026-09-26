@@ -27,7 +27,7 @@ class Upstream:
         self.calls = []
         self.fail_llama = False
 
-    def __call__(self, provider, model, key, req, *, max_tokens, timeout=180):
+    def __call__(self, provider, model, key, req, *, max_tokens, timeout=180, window=None):
         assert key == SECRET
         self.calls.append((model, max_tokens))
         need = {"openai/gpt-oss-20b": 200, "Qwen/Qwen3.8-27B": 900}.get(model, 0)
@@ -43,6 +43,7 @@ class Upstream:
                    "usage": {"prompt_tokens": 40, "completion_tokens": ct}}
         r = P.extract(provider, model, payload)
         r.detail = "ok" if r.ok else "HTTP 200 but empty content"
+        r.latency_s = 0.5
         return r
 
 
@@ -107,22 +108,52 @@ def test_failed_call_is_redecided_not_pinned_fallback(app):
     up.fail_llama = True
     up.calls.clear()
     r = chat(client, max_tokens=16)
-    # Llama failed; the others need more budget than 16, so the redecision abstains
-    # and the client gets a loud error -- not an empty 200, not an expensive fallback.
+    # Llama failed. Nothing else answers within 16, so the redecision raises the budget
+    # for the cheapest reasoning model -- on the record -- rather than passing 16 through.
+    assert r.status_code == 200, r.text
+    assert up.calls == [("meta-llama/Llama-3.3-70B-Instruct", 16), ("openai/gpt-oss-20b", 416)]
+    d = client.get("/router/decisions/" + r.json()["router"]["decision_id"]).json()
+    assert d["status"] == "ANSWERED" and len(d["earlier_decisions"]) == 1
+    assert d["choice"]["facts"]["max_tokens_raised_from"] == 16
+
+
+def test_failed_call_with_clamping_off_fails_loudly(app, monkeypatch):
+    client, up = app
+    client.app.state.router.cfg.clamp_max_tokens = False
+    client.post("/router/probe", json={"cheapest": 3})
+    up.fail_llama = True
+    r = chat(client, max_tokens=16)
     assert r.status_code == 502
-    assert [m for m, _ in up.calls] == ["meta-llama/Llama-3.3-70B-Instruct"]
     d = client.get("/router/decisions/" + r.json()["error"]["decision_id"]).json()
-    assert d["status"] == "FAILED" and len(d["earlier_decisions"]) == 1
-    assert d["choice"]["outcome"] == "ABSTAIN"
+    assert d["status"] == "FAILED" and d["choice"]["outcome"] == "ABSTAIN"
 
 
-def test_named_model_refused_when_budget_too_small(app):
+def test_named_reasoning_model_small_budget_is_clamped_visibly_never_passed_through(app):
     client, up = app
     client.post("/router/probe", json={"cheapest": 3})
-    r = chat(client, model="akashml:Qwen/Qwen3.8-27B", max_tokens=16)
-    assert r.status_code == 422
-    assert "max_tokens >= 901" in json.dumps(
-        client.get("/router/decisions/" + r.json()["error"]["decision_id"]).json())
+    up.calls.clear()
+    r = chat(client, model="akashml:openai/gpt-oss-20b", max_tokens=16)
+    assert r.status_code == 200, r.text
+    assert up.calls == [("openai/gpt-oss-20b", 16 + 2 * 200)]   # caller's 16 + 2x reasoning seen
+    assert r.json()["choices"][0]["message"]["content"] == "Ready"
+    d = client.get("/router/decisions/" + r.json()["router"]["decision_id"]).json()
+    assert d["choice"]["facts"]["max_tokens_raised_from"] == 16
+    assert "raised to 416" in d["choice"]["because"]
+
+
+def test_clamp_beyond_the_cap_is_refused_not_silently_expensive(app):
+    client, up = app
+    client.post("/router/probe", json={"cheapest": 3})
+    up.calls.clear()
+    r = chat(client, model="akashml:Qwen/Qwen3.8-27B", max_tokens=16)   # 2x900 > 1024 cap
+    assert r.status_code == 422 and up.calls == []
+    assert "max_tokens >= 901" in r.json()["error"]["message"]
+
+
+def test_unknown_lane_is_an_error_not_a_default(app):
+    client, up = app
+    r = chat(client, model="auto:whenever", max_tokens=16)
+    assert r.status_code == 400 and "unknown lane" in r.text
 
 
 def test_auth_required_and_secret_never_in_any_response(app):
@@ -218,3 +249,26 @@ def test_ionet_catalogue_parses_per_token_prices():
     li = rows[0]
     assert li.prompt == pytest.approx(0.295) and li.completion == pytest.approx(1.15)
     assert li.context_length == 262124 and li.supports_tools is True
+
+
+def test_sail_pricing_page_parses_per_window_and_keys_by_page_id():
+    page = ('<tbody className="pricing-model-group" data-model="google/gemma-4-12B-it">'
+            '<tr aria-label="Gemma 4 12B IT Default (ASAP) pricing: input $0.30, cached $0.15, '
+            'output $2.00 per 1M tokens."></tr><tr aria-label="Gemma 4 12B IT Flex pricing: '
+            'input $0.05, cached $0.02, output $1.00 per 1M tokens."></tr></tbody>')
+    w = P.parse_window_prices(page)
+    assert w == {"google/gemma-4-12B-it": {"asap": (0.30, 2.00, 0.15), "flex": (0.05, 1.00, 0.02)}}
+
+
+def test_sail_models_page_context_pairs_with_the_following_id():
+    page = ('<span className="cap-expand-key">Context</span>\n<span className="cap-expand-val">16K</span>'
+            ' ... <code>google/gemma-4-12B-it</code> <code>none</code>'
+            '<span className="cap-expand-key">Context</span><span className="cap-expand-val">1M</span>'
+            '<code>zai-org/GLM-5.3</code>')
+    assert P.parse_context_lengths(page) == {"google/gemma-4-12B-it": 16000,
+                                             "zai-org/GLM-5.3": 1000000}
+
+
+def test_window_is_sent_as_sail_metadata_only_to_windowed_providers():
+    assert P._body("sail", "m", {"messages": []}, 8, "flex")["metadata"] == {"completion_window": "flex"}
+    assert "metadata" not in P._body("akashml", "m", {"messages": []}, 8, "flex")

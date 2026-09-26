@@ -29,7 +29,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import __version__
 from .config import Config, load
-from .router import Router
+from .router import LANES, Router, lane_of
 from .secrets import Keyring
 from .store import Store
 
@@ -101,7 +101,8 @@ def build(cfg: Config) -> FastAPI:
     @app.get("/v1/models", dependencies=[Depends(auth)])
     def models():
         seats = router.gather.roster()
-        data = [{"id": "auto", "object": "model", "owned_by": "modelrouter"}]
+        data = [{"id": "auto" if lane == "interactive" else "auto:" + lane, "object": "model",
+                 "owned_by": "modelrouter"} for lane in LANES]
         data += [{"id": c.seat, "object": "model", "owned_by": c.provider} for c in seats
                  if c.provider_state == "OK" and c.available is not False]
         return {"object": "list", "data": data}
@@ -123,9 +124,14 @@ def build(cfg: Config) -> FastAPI:
 
     @app.post("/router/explain", dependencies=[Depends(auth)])
     async def explain(request: Request,
-                      x_router_max_usd_per_m: str | None = Header(default=None)):
+                      x_router_max_usd_per_m: str | None = Header(default=None),
+                      x_router_lane: str | None = Header(default=None)):
         req = await request.json()
-        return await run_in_threadpool(router.explain, req, ceiling(x_router_max_usd_per_m))
+        try:
+            lane = lane_of(req, x_router_lane)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return await run_in_threadpool(router.explain, req, ceiling(x_router_max_usd_per_m), lane)
 
     @app.post("/router/probe", dependencies=[Depends(auth)])
     async def probe(request: Request):
@@ -155,7 +161,8 @@ def build(cfg: Config) -> FastAPI:
 
     @app.post("/v1/chat/completions", dependencies=[Depends(auth)])
     async def chat(request: Request, user_agent: str | None = Header(default=None),
-                   x_router_max_usd_per_m: str | None = Header(default=None)):
+                   x_router_max_usd_per_m: str | None = Header(default=None),
+                   x_router_lane: str | None = Header(default=None)):
         try:
             req = await request.json()
         except ValueError:
@@ -164,16 +171,21 @@ def build(cfg: Config) -> FastAPI:
             return _error(400, "invalid_request", "`messages` must be a non-empty list")
         lim = ceiling(x_router_max_usd_per_m)
         client = (user_agent or "")[:80]
+        try:
+            lane = lane_of(req, x_router_lane)
+        except ValueError as exc:
+            return _error(400, "invalid_request", str(exc))
         if req.get("stream"):
             routed, it = await run_in_threadpool(
-                lambda: router.route_stream(req, client=client, ceiling=lim))
+                lambda: router.route_stream(req, client=client, ceiling=lim, lane=lane))
             if it is None:
                 return _abstain(routed)
             return StreamingResponse(it, media_type="text/event-stream",
                                      headers={"X-Router-Decision": routed.decision_id,
                                               "X-Router-Seat": routed.choice.seat or "",
                                               "Cache-Control": "no-cache"})
-        routed = await run_in_threadpool(lambda: router.route(req, client=client, ceiling=lim))
+        routed = await run_in_threadpool(lambda: router.route(req, client=client, ceiling=lim,
+                                                                 lane=lane))
         if routed.status == "ABSTAINED":
             return _abstain(routed)
         res = routed.result

@@ -47,6 +47,15 @@ ACT      forward the call; an empty answer is a failure, never a success
   GLM-5.3-Flash spent 36–90 tokens to say one word, DeepSeek-V4.1-Flash 18. The router gates each
   model on its own measured spend (resampled, maximum taken), never on a global threshold, and
   refuses a request whose budget is below it.
+- **Lanes: someone waiting vs nobody waiting.** `auto` is interactive and excludes seats whose
+  measured latency is above `interactive_max_latency_s` (default 1.2 s). `auto:background` /
+  `auto:batch` buy Sail's `balanced` / `flex` windows; one gemma-4-12B answer measured $0.0000127
+  asap, $0.0000061 balanced, $0.0000035 flex.
+- **A small budget is never passed to a reasoning model.** The router prefers a no-reasoning model
+  that fits; otherwise it raises the budget (caller's + 2× the most reasoning observed), on the record.
+- **Nothing pinned, including prices.** Sail's `/models` lists ids only, so its per-window prices
+  and context lengths are read live from its docs pricing and models pages each run; if a page
+  cannot be read, those facts are UNKNOWN for that run.
 - **A CDN refusal is not a bad key.** Every call carries a real User-Agent; a Cloudflare
   `403 error code: 1010` marks the provider UNAVAILABLE and says the credential is not suspect.
 - **Account-level refusals bench the provider once** (budget, auth: 15 min; rate/quota: 10 min;
@@ -113,6 +122,8 @@ Full contract: [`docs/CONTRACT.md`](docs/CONTRACT.md).
 | key | default | meaning |
 |---|---|---|
 | `ceiling_usd_per_mtok` | 5.0 | refuse any model priced above this (measured, else list) |
+| `interactive_max_latency_s` | 1.2 | the interactive lane (`auto`) excludes seats measured slower |
+| `clamp_max_tokens` | true | raise a too-small budget for a reasoning model instead of refusing |
 | `allow_free` | false | free tiers may log prompts and run on their own daily quota |
 | `probe_budget_usd` | 0.02 | hard cap per probe run |
 | `dashboard_url` | open-dashboard | price source for providers it carries; else each provider's own catalogue |
