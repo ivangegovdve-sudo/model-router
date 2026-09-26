@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.egg-info/
+*.sqlite3
+.pytest_cache/
+app/.gradle/
+app/build/
+app/*/build/
+app/local.properties
+*.log
