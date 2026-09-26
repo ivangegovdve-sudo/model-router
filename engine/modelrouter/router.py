@@ -25,6 +25,7 @@ log = logging.getLogger("modelrouter")
 MAX_ATTEMPTS = 2
 PROBE_PROMPT = [{"role": "user", "content": "Reply with exactly one word: Ready"}]
 PROBE_LADDER = (32, 256, 1024, 2048)
+PROBE_CONFIRMATIONS = 2    # extra samples at the budget where a reasoning model answered
 
 
 def estimate_tokens(req: dict) -> int:
@@ -221,7 +222,10 @@ class Router:
                 report.append({"seat": seat, "skipped": "provider " + c.provider_state})
                 continue
             rungs = []
-            for mt in PROBE_LADDER:
+            queue = list(PROBE_LADDER)
+            confirming = False
+            while queue:
+                mt = queue.pop(0)
                 if spent >= budget:
                     rungs.append({"max_tokens": mt, "skipped": "probe budget spent"})
                     break
@@ -240,8 +244,19 @@ class Router:
                 rungs.append(rung)
                 if progress:
                     progress(rung)
-                if res.ok or res.status != 200:
-                    break          # content found, or the call itself was refused
+                if res.status != 200:
+                    break          # the call itself was refused
+                if res.ok and not confirming:
+                    if res.reasoning.strip():
+                        # One sample understates a reasoning model's floor: the same
+                        # model and prompt spent 35 and 90 tokens on io.net an hour
+                        # apart. Resample at this budget; the floor takes the maximum.
+                        queue = [mt] * PROBE_CONFIRMATIONS
+                        confirming = True
+                    else:
+                        break
+                elif confirming and not queue:
+                    break
             report.append({"seat": seat, "rungs": rungs})
         profiles = self.store.profiles()
         for r in report:

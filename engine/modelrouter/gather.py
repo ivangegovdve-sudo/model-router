@@ -32,13 +32,17 @@ CATALOGUE_TTL_S = 600
 DASHBOARD_TTL_S = 1800
 BLOCK_S = 900          # an account-level refusal benches the provider this long
 QUOTA_S = 600          # a quota refusal, unless the provider says when it resets
+UNAVAILABLE_S = 300    # unreachable / CDN bot check: retry soon, never blame the key
 
 
 @dataclass
 class ProviderState:
     provider: str
     key: str = "UNREAD"              # KeyStatus.detail
-    state: str = "OK"                # OK | NO_KEY | BLOCKED | QUOTA_EXHAUSTED | CATALOGUE_FAILED
+    # OK | NO_KEY | BLOCKED (the account: auth, money) | QUOTA_EXHAUSTED (a rate window)
+    # | UNAVAILABLE (cannot be reached, or a CDN refused how we called: the key is NOT suspect)
+    # | CATALOGUE_FAILED
+    state: str = "OK"
     detail: str = ""
     until: float = 0.0
     models: int = 0
@@ -124,6 +128,8 @@ class Gatherer:
             st.ratelimit = ratelimit
         if scope == "provider":
             st.state, st.detail, st.until = "BLOCKED", detail, now + BLOCK_S
+        elif scope in ("edge", "transport"):
+            st.state, st.detail, st.until = "UNAVAILABLE", detail, now + UNAVAILABLE_S
         elif scope == "quota":
             if provider == "openrouter" and model.endswith(":free"):
                 # The free-model daily quota is its own limit; paid models still work.
@@ -148,17 +154,27 @@ class Gatherer:
                     st.state, st.detail, st.models = "NO_KEY", "%s %s: %s" % (
                         ks.source, ks.name or "(unset)", ks.detail), 0
                     continue
-                if st.state in ("BLOCKED", "QUOTA_EXHAUSTED") and time.time() >= st.until:
+                if st.state in ("BLOCKED", "QUOTA_EXHAUSTED", "UNAVAILABLE")                         and time.time() >= st.until:
                     st.state, st.detail, st.until = "OK", "", 0.0
                 if st.state in ("NO_KEY", "CATALOGUE_FAILED"):
                     st.state, st.detail = "OK", ""
                 try:
                     listings = self._catalogue(provider, self.keys.get(provider))
-                except httpx.HTTPStatusError as exc:
-                    code = exc.response.status_code
-                    st.state = "BLOCKED" if code in (401, 402, 403) else "CATALOGUE_FAILED"
-                    st.detail = "catalogue HTTP %d" % code
-                    st.until = time.time() + BLOCK_S
+                except P.CatalogueError as exc:
+                    if exc.scope in ("edge", "transport"):
+                        st.state, st.until = "UNAVAILABLE", time.time() + UNAVAILABLE_S
+                        st.detail = ("catalogue HTTP %d: CDN bot check, not a credential "
+                                     "failure" % exc.status)
+                    elif exc.scope == "provider" or exc.status in (401, 402, 403):
+                        st.state, st.until = "BLOCKED", time.time() + BLOCK_S
+                        st.detail = "catalogue HTTP %d %s" % (exc.status, exc.msg)
+                    else:
+                        st.state = "CATALOGUE_FAILED"
+                        st.detail = "catalogue HTTP %d %s" % (exc.status, exc.msg)
+                    continue
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    st.state, st.until = "UNAVAILABLE", time.time() + UNAVAILABLE_S
+                    st.detail = "unreachable (%s)" % type(exc).__name__
                     continue
                 except Exception as exc:                        # noqa: BLE001
                     st.state, st.detail = "CATALOGUE_FAILED", type(exc).__name__
@@ -193,6 +209,7 @@ class Gatherer:
                         emits=prof.emits if prof else None,
                         min_max_tokens=prof.min_max_tokens if prof else None,
                         reasoning_overhead_tokens=prof.reasoning_overhead_tokens if prof else None,
+                        floor_evidence=prof.floor_evidence if prof else "",
                         probe_age_s=prof.age_s if prof else None,
                         latency_s=prof.latency_s if prof else None))
                 st.price_source = "mixed" if len(sources) > 1 else (next(iter(sources), ""))

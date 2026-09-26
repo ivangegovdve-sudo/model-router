@@ -48,6 +48,7 @@ class Profile:
     measured_basis: str                  # billed | computed | billed+computed | ""
     latency_s: float | None
     age_s: float | None
+    floor_evidence: str = ""             # why min_max_tokens is what it is
 
     def public(self) -> dict:
         d = dict(self.__dict__)
@@ -142,21 +143,38 @@ def derive(seat: str, obs: list) -> Profile:
         emits = None
 
     min_mt: int | None
+    floor_evidence = ""
     if emits is Emits.CONTENT:
         min_mt = 1
     elif emits is Emits.REASONING_THEN_CONTENT:
-        # Smallest budget that produced content above every budget that did not.
-        # A budget-less call that produced content proves nothing about the floor.
-        above = [o["max_tokens"] for o in ok if o["max_tokens"] and o["max_tokens"] > largest_empty]
-        min_mt = min(above) if above else None
+        # The floor is what THIS model was measured to spend before its answer began,
+        # not a rung of the probe ladder: GLM-5.3-Flash spent 91 tokens on one word,
+        # DeepSeek-V4.1-Flash 18. A budget at or below the reasoning spend returns
+        # nothing, so the floor is one token above the largest spend seen on a probe
+        # (the fixed one-word task), and above every budget that came back empty.
+        # It is a LOWER bound: a long task can reason for thousands of tokens more.
+        probes = [o for o in ok if o["source"] == "probe" and o["completion_tokens"] is not None]
+        pool = probes or [o for o in ok if o["completion_tokens"] is not None]
+        spent = [_spent_before_answer(o) for o in pool]
+        if spent:
+            min_mt = max(max(spent) + 1, largest_empty + 1)
+            floor_evidence = "%d reasoning tokens before its answer (%s)" % (
+                max(spent), "probe" if probes else "traffic")
+            if largest_empty:
+                floor_evidence += "; empty at max_tokens=%d" % largest_empty
+        else:
+            # No token counts: fall back to the smallest budget that produced content.
+            above = [o["max_tokens"] for o in ok if o["max_tokens"] and o["max_tokens"] > largest_empty]
+            min_mt = min(above) if above else None
+            if min_mt:
+                floor_evidence = "content first appeared at max_tokens=%d" % min_mt
     else:
         min_mt = None
 
     overhead = None
     if emits is Emits.REASONING_THEN_CONTENT:
-        spent = [max(0, (o["completion_tokens"] or 0) - (o["content_chars"] or 0) // 4)
-                 for o in ok if o["completion_tokens"] is not None]
-        overhead = int(statistics.median(spent)) if spent else None
+        spent_all = [_spent_before_answer(o) for o in ok if o["completion_tokens"] is not None]
+        overhead = int(statistics.median(spent_all)) if spent_all else None
 
     priced = [o for o in obs if o["cost_usd"] is not None and o["prompt_tokens"] is not None
               and o["completion_tokens"] is not None]
@@ -167,4 +185,12 @@ def derive(seat: str, obs: list) -> Profile:
     lat = [o["latency_s"] for o in ok if o["latency_s"]]
     return Profile(seat, len(obs), emits, min_mt, overhead, measured, basis,
                    statistics.median(lat) if lat else None,
-                   time.time() - max(o["t"] for o in obs) if obs else None)
+                   time.time() - max(o["t"] for o in obs) if obs else None, floor_evidence)
+
+
+def _spent_before_answer(o) -> int:
+    """Completion tokens not accounted for by the answer: ~4 characters a token,
+    rounded DOWN (min 1) so the floor errs high -- 'ready' is one token, not two."""
+    chars = o["content_chars"] or 0
+    answer = max(1, chars // 4) if chars else 0
+    return max(0, (o["completion_tokens"] or 0) - answer)

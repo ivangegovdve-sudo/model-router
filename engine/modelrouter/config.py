@@ -33,6 +33,8 @@ secret = ""
 secret = ""
 [providers.sail]
 secret = ""
+[providers.ionet]
+secret = ""
 
 [server]
 bind = "127.0.0.1"

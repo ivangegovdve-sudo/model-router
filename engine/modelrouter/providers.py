@@ -30,8 +30,15 @@ PROVIDERS: dict[str, dict[str, Any]] = {
              "parse": "openrouter"},
     "sail": {"base": "https://api.sailresearch.com/v1", "catalogue": "/models",
              "parse": "bare"},                  # publishes no prices: UNKNOWN
+    "ionet": {"base": "https://api.intelligence.io.solutions/api/v1", "catalogue": "/models",
+              "parse": "ionet"},
 }
+# Every provider call carries a real User-Agent. io.net sits behind Cloudflare, which
+# answers a request with no recognisable client (Python urllib's default) with
+# "403 error code: 1010" -- a bot check that looks exactly like a rejected key.
 UA = "modelrouter/0.1 (+https://github.com/ivangegovdve-sudo/model-router)"
+_EDGE = re.compile(r"error code:\s*10\d\d|cloudflare|attention required|cf-ray|"
+                   r"just a moment", re.I)
 _ACCOUNT = re.compile(r"budget|credit|balance|insufficient|payment|billing|unauthori|"
                       r"invalid api key|no auth|forbidden", re.I)
 _QUOTA = re.compile(r"quota|rate.?limit|per.?day|too many|limit exceeded", re.I)
@@ -97,6 +104,13 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
                 outs = m.get("output_modalities")
             ctx = m.get("context_length")
             text_out = None if outs is None else ("text" in outs)
+        elif shape == "ionet":
+            pr, co, ca = _per_m(m.get("input_token_price")), _per_m(m.get("output_token_price")),                 _per_m(m.get("cache_read_token_price"))
+            ctx = m.get("context_window") or m.get("max_model_len")
+            tools = m.get("supports_tools")
+            reasoning = m.get("supports_reasoning")
+            outs = m.get("output_modalities")
+            text_out = None if outs is None else ("text" in outs)
         elif shape == "venice":
             spec = m.get("model_spec") or {}
             pp = spec.get("pricing") or {}
@@ -123,11 +137,20 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
     return out
 
 
+class CatalogueError(Exception):
+    def __init__(self, status: int, scope: str, msg: str):
+        super().__init__("HTTP %d" % status)
+        self.status, self.scope, self.msg = status, scope, msg
+
+
 def fetch_catalogue(provider: str, key: str, timeout: float = 30) -> list[Listing]:
     spec = PROVIDERS[provider]
     r = httpx.get(spec["base"] + spec["catalogue"], timeout=timeout,
                   headers={"Authorization": "Bearer " + key, "User-Agent": UA})
-    r.raise_for_status()
+    if r.status_code != 200:
+        msg, raw = _error(r, key)
+        raise CatalogueError(r.status_code, classify_failure(r.status_code, msg, raw, r.headers),
+                             msg)
     d = r.json()
     rows = (d.get("data") if isinstance(d, dict) else d) or []
     return parse_catalogue(provider, rows)
@@ -158,7 +181,22 @@ class Result:
         return self.status == 200 and not self.content.strip() and not self.tool_calls
 
 
-def classify_failure(status: int, msg: str) -> str:
+def is_edge_block(status: int, body: str, headers: httpx.Headers | None = None) -> bool:
+    """A CDN/bot-check refusal: it says nothing about the key."""
+    if status not in (403, 429, 503, 520, 521, 522, 523, 524, 525, 526):
+        return False
+    if _EDGE.search(body or ""):
+        return True
+    return bool(headers) and "cf-ray" in headers and         "text/html" in (headers.get("content-type") or "")
+
+
+def classify_failure(status: int, msg: str, raw: str = "",
+                     headers: httpx.Headers | None = None) -> str:
+    """model: try another model | provider: the account cannot be used (auth, money)
+    | quota: a rate window | edge: a CDN refused HOW we called, not WHO we are --
+    the credential is not suspect and must not be rotated over it."""
+    if is_edge_block(status, raw or msg, headers):
+        return "edge"
     if status in (401, 402):
         return "provider"
     # Money before rate: "Budget limit exceeded (monthly limit)" is an account that
@@ -219,13 +257,28 @@ def _headers(key: str) -> dict:
             "X-Title": "modelrouter"}
 
 
-def _error(r: httpx.Response, key: str) -> str:
+def _error(r: httpx.Response, key: str) -> tuple[str, str]:
+    """(message for display, raw body head for classification) -- both scrubbed."""
+    raw = ""
     try:
-        err = r.json().get("error") or {}
+        raw = r.text[:600]
+    except Exception:
+        pass
+    try:
+        d = r.json()
+        err = d.get("error") or d.get("detail") or {}
         msg = str(err.get("message", err) if isinstance(err, dict) else err)
     except Exception:
-        msg = ""
-    return msg.replace(key, "***")[:160] if key else msg[:160]
+        msg = raw.strip().splitlines()[0] if raw.strip() else ""
+    if key:
+        msg, raw = msg.replace(key, "***"), raw.replace(key, "***")
+    return msg[:160], raw
+
+
+def _describe(status: int, msg: str, scope: str) -> str:
+    if scope == "edge":
+        return "HTTP %d %s -- CDN bot check, not a credential failure" % (status, msg)
+    return "HTTP %d %s" % (status, msg)
 
 
 def call(provider: str, model: str, key: str, req: dict, *, max_tokens: int | None,
@@ -247,15 +300,18 @@ def call(provider: str, model: str, key: str, req: dict, *, max_tokens: int | No
     try:
         r = httpx.post(spec["base"] + "/chat/completions", json=body, timeout=timeout,
                        headers=_headers(key))
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        # The provider could not be reached at all: UNAVAILABLE, not a bad key.
+        return fail(0, "unreachable (%s)" % type(exc).__name__, "transport")
     except httpx.TimeoutException:
         return fail(0, "timeout after %.0fs" % (time.time() - t0))
     except Exception as exc:                                    # noqa: BLE001
         return fail(0, type(exc).__name__)          # never str(exc): it can echo headers
     rl = _ratelimit(r.headers)
     if r.status_code != 200:
-        msg = _error(r, key)
-        return fail(r.status_code, "HTTP %d %s" % (r.status_code, msg),
-                    classify_failure(r.status_code, msg), rl)
+        msg, raw = _error(r, key)
+        scope = classify_failure(r.status_code, msg, raw, r.headers)
+        return fail(r.status_code, _describe(r.status_code, msg, scope), scope, rl)
     try:
         res = extract(provider, model, r.json())
     except Exception:
@@ -291,9 +347,9 @@ def stream(provider: str, model: str, key: str, req: dict, *, max_tokens: int | 
             res.ratelimit = _ratelimit(r.headers)
             if r.status_code != 200:
                 r.read()
-                msg = _error(r, key)
-                res.detail = "HTTP %d %s" % (r.status_code, msg)
-                res.scope = classify_failure(r.status_code, msg)
+                msg, raw = _error(r, key)
+                res.scope = classify_failure(r.status_code, msg, raw, r.headers)
+                res.detail = _describe(r.status_code, msg, res.scope)
                 err = {"error": {"message": "upstream %s refused: %s" % (provider, res.detail),
                                  "type": "upstream_error"}}
                 yield ("data: %s\n\n" % json.dumps(err)).encode()

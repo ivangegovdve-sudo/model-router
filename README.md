@@ -42,6 +42,13 @@ ACT      forward the call; an empty answer is a failure, never a success
 - **One retry, by re-deciding.** If the chosen model fails or comes back empty, that fact is
   recorded and the decision is taken again over the updated roster. If that abstains or fails,
   the client gets HTTP 502 with the decision id.
+- **`max_tokens` is a correctness parameter, gated per model.** On reasoning-first providers
+  (AkashML, io.net) most models spend part of the budget reasoning before any answer: io.net's
+  GLM-5.3-Flash spent 36–90 tokens to say one word, DeepSeek-V4.1-Flash 18. The router gates each
+  model on its own measured spend (resampled, maximum taken), never on a global threshold, and
+  refuses a request whose budget is below it.
+- **A CDN refusal is not a bad key.** Every call carries a real User-Agent; a Cloudflare
+  `403 error code: 1010` marks the provider UNAVAILABLE and says the credential is not suspect.
 - **Account-level refusals bench the provider once** (budget, auth: 15 min; rate/quota: 10 min;
   OpenRouter's free-model daily quota only benches free models).
 
@@ -58,7 +65,7 @@ modelrouter init
 
 `init` writes `~/.modelrouter/config.toml` (or `$MODELROUTER_CONFIG`). Choose
 `source = "gcp"` (set `gcp_project`) or `"env"`, and give each provider you use the name of the
-secret or variable holding its key. Supported: `openrouter`, `akashml`, `venice`, `nous`, `sail`.
+secret or variable holding its key. Supported: `openrouter`, `akashml`, `venice`, `nous`, `sail`, `ionet` (io.net Intelligence).
 
 ```
 modelrouter doctor

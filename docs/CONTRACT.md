@@ -81,15 +81,26 @@ might have been cheaper — and counts the rest in `facts.unknown_not_listed`.
 `{seat, verdict:"QUALIFIES|EXCLUDED|UNKNOWN", because, unknown:[fact], usd_per_mtok|null, price_basis:"measured|list|", expected_usd|null}`
 
 ### Attempt
-`{seat, max_tokens|null, http, ok, detail, finish_reason, content_chars, reasoning_chars, tool_calls, prompt_tokens, completion_tokens, cached_tokens, cost_usd|null, cost_basis, latency_s, scope}`
+`{seat, max_tokens|null, http, ok, detail, finish_reason, content_chars, reasoning_chars, tool_calls, prompt_tokens, completion_tokens, cached_tokens, cost_usd|null, cost_basis, latency_s, scope:"model|provider|quota|edge|transport"|null}`
 
 `reasoning_chars > 0` with `content_chars == 0` is the measured failure this product exists for:
 the model spent the budget reasoning and returned nothing.
 
 ### Candidate (roster seat)
-`{seat, provider, model, provider_state:"OK|NO_KEY|BLOCKED|QUOTA_EXHAUSTED|CATALOGUE_FAILED", provider_detail, available, context_length|null, supports_tools|null, list_prompt|null, list_completion|null, price_source:"dashboard|provider-catalogue", measured_usd_per_mtok|null, emits:"content|reasoning_then_content|reasoning_only"|null, min_max_tokens|null, reasoning_overhead_tokens|null, probe_age_s|null, latency_s|null}`
+`{seat, provider, model, provider_state:"OK|NO_KEY|BLOCKED|QUOTA_EXHAUSTED|UNAVAILABLE|CATALOGUE_FAILED", provider_detail, available, context_length|null, supports_tools|null, list_prompt|null, list_completion|null, price_source:"dashboard|provider-catalogue", measured_usd_per_mtok|null, emits:"content|reasoning_then_content|reasoning_only"|null, min_max_tokens|null, floor_evidence, reasoning_overhead_tokens|null, probe_age_s|null, latency_s|null}`
 
 Prices are USD per million tokens.
+
+`min_max_tokens` is a **per-model hard gate from measurement**: one token above the most
+reasoning this model was observed to spend before its answer on the probe task, and above every
+budget that came back empty. `floor_evidence` states the measurement. A request whose
+`max_tokens` is below it is EXCLUDED (that call would bill tokens and return nothing). It is a
+lower bound — a long task can reason for far longer — so an empty answer above the floor is
+recorded, raises the floor, and triggers a re-decision.
+
+Provider states: `BLOCKED` — the account refused (auth, money); `QUOTA_EXHAUSTED` — a rate window;
+`UNAVAILABLE` — unreachable, or a CDN refused *how* we called (e.g. Cloudflare `403 error code: 1010`).
+UNAVAILABLE never implicates the key; do not rotate credentials over it.
 
 ### ProviderState
 `{provider, key, state, detail, until|null, models, price_source, ratelimit:{header:value}, free_quota_until|null}`

@@ -85,6 +85,7 @@ class Candidate:
     emits: Emits | None = None
     min_max_tokens: int | None = None           # smallest budget that produced content
     reasoning_overhead_tokens: int | None = None  # completion tokens spent before content
+    floor_evidence: str = ""                    # the measurement behind min_max_tokens
     probe_age_s: float | None = None
     latency_s: float | None = None
 
@@ -210,7 +211,9 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
                    "is unknown", ("min_max_tokens",))
     if ask.max_tokens is not None and ask.max_tokens < need:
         return out(Verdict.EXCLUDED, "needs max_tokens >= %d before any content "
-                   "appears; request allows %d" % (need, ask.max_tokens))
+                   "appears%s; request allows %d" % (
+                       need, " (measured: %s)" % c.floor_evidence if c.floor_evidence else "",
+                       ask.max_tokens))
 
     completion = ask.max_tokens if ask.max_tokens is not None else max(
         DEFAULT_COMPLETION_ESTIMATE, need)

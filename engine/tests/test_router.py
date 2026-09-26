@@ -37,7 +37,7 @@ class Upstream:
         if budget < need:
             content, reasoning, ct = "", "thinking " * 20, budget
         else:
-            content, reasoning, ct = "Ready", ("thinking " * 20 if need else ""), need + 2
+            content, reasoning, ct = "Ready", ("thinking " * 20 if need else ""), need + 1
         payload = {"choices": [{"message": {"content": content, "reasoning_content": reasoning},
                                 "finish_reason": "length" if not content else "stop"}],
                    "usage": {"prompt_tokens": 40, "completion_tokens": ct}}
@@ -79,7 +79,7 @@ def test_probe_then_route_small_budget_avoids_empty_reasoning_models(app):
     p = client.post("/router/probe", json={"cheapest": 3}).json()
     prof = {x["seat"]: x["profile"] for x in p["probed"]}
     assert prof["akashml:openai/gpt-oss-20b"]["emits"] == "reasoning_then_content"
-    assert prof["akashml:openai/gpt-oss-20b"]["min_max_tokens"] == 256
+    assert prof["akashml:openai/gpt-oss-20b"]["min_max_tokens"] == 201   # measured spend, not the 256 rung
     assert prof["akashml:meta-llama/Llama-3.3-70B-Instruct"]["emits"] == "content"
     up.calls.clear()
     r = chat(client, max_tokens=16)
@@ -90,7 +90,8 @@ def test_probe_then_route_small_budget_avoids_empty_reasoning_models(app):
     assert body["router"]["cost_basis"] == "computed"
     d = client.get("/router/decisions/" + body["router"]["decision_id"]).json()
     v = {c["seat"]: c for c in d["choice"]["considered"]}
-    assert "max_tokens >= 256" in v["akashml:openai/gpt-oss-20b"]["because"]
+    assert "max_tokens >= 201" in v["akashml:openai/gpt-oss-20b"]["because"]
+    assert "200 reasoning tokens before its answer (probe)" in v["akashml:openai/gpt-oss-20b"]["because"]
 
 
 def test_large_budget_routes_to_cheap_reasoning_model(app):
@@ -120,7 +121,7 @@ def test_named_model_refused_when_budget_too_small(app):
     client.post("/router/probe", json={"cheapest": 3})
     r = chat(client, model="akashml:Qwen/Qwen3.8-27B", max_tokens=16)
     assert r.status_code == 422
-    assert "max_tokens >= 1024" in json.dumps(
+    assert "max_tokens >= 901" in json.dumps(
         client.get("/router/decisions/" + r.json()["error"]["decision_id"]).json())
 
 
@@ -173,3 +174,47 @@ def test_catalogue_parsers_keep_unknown_prices_unknown():
     assert rows[0].prompt is None
     assert P.parse_catalogue("sail", [{"id": "s/t"}])[0].prompt is None
     assert P.parse_catalogue("openrouter", [{"id": "x/text-embedding-3"}]) == []
+
+
+def test_floor_is_per_model_measured_spend_not_a_global_threshold(tmp_path):
+    """io.net 2026-09-26: GLM-5.3-Flash spent 91 tokens on one word, DeepSeek-V4.1-Flash 18."""
+    s = Store(tmp_path / "s.db")
+    def obs(seat, mt, content, ct):
+        s.observe(seat, "probe", max_tokens=mt, status=200, content_chars=content,
+                  reasoning_chars=200 if ct else 0, tool_calls=0, prompt_tokens=20,
+                  completion_tokens=ct, cached_tokens=0, cost_usd=1e-6, cost_basis="computed",
+                  latency_s=1.0, detail="")
+    obs("ionet:glm", 16, 0, 16); obs("ionet:glm", 256, 5, 91)
+    obs("ionet:ds", 16, 0, 16); obs("ionet:ds", 256, 5, 18)
+    p = s.profiles()
+    assert p["ionet:glm"].min_max_tokens == 91          # 90 spent before 'ready'
+    assert p["ionet:ds"].min_max_tokens == 18           # 16 was empty; 17 spent
+    assert "empty at max_tokens=16" in p["ionet:ds"].floor_evidence
+
+
+def test_cloudflare_1010_is_an_edge_block_not_a_bad_key():
+    import httpx
+    assert P.classify_failure(403, "error code: 1010", "error code: 1010") == "edge"
+    html = httpx.Headers({"cf-ray": "x", "content-type": "text/html"})
+    assert P.classify_failure(403, "", "<html>Attention Required!</html>", html) == "edge"
+    assert P.classify_failure(401, "Invalid API Key", '{"detail":"Invalid API Key"}') == "provider"
+
+
+def test_edge_block_marks_provider_unavailable_not_blocked(app, monkeypatch):
+    client, up = app
+    def refuse(provider, key, timeout=30):
+        raise P.CatalogueError(403, "edge", "error code: 1010")
+    monkeypatch.setattr(P, "fetch_catalogue", refuse)
+    r = client.get("/router/roster").json()
+    st = r["providers"][0]
+    assert st["state"] == "UNAVAILABLE" and "not a credential failure" in st["detail"]
+
+
+def test_ionet_catalogue_parses_per_token_prices():
+    rows = P.parse_catalogue("ionet", [{"id": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "input_token_price": 2.95e-07, "output_token_price": 1.15e-06,
+        "cache_read_token_price": 1.475e-07, "context_window": 262124,
+        "supports_tools": True, "supports_reasoning": True, "output_modalities": ["text"]}])
+    li = rows[0]
+    assert li.prompt == pytest.approx(0.295) and li.completion == pytest.approx(1.15)
+    assert li.context_length == 262124 and li.supports_tools is True
