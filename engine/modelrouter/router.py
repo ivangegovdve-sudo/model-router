@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from decimal import Decimal
 from dataclasses import dataclass, replace
 from typing import Callable, Iterator
 
@@ -23,6 +24,9 @@ from .store import Store
 
 log = logging.getLogger("modelrouter")
 MAX_ATTEMPTS = 2
+#: How long a provider keeps a prompt prefix cached is its own business; five minutes is the
+#: common floor. Past it the router assumes the cache is cold.
+WARM_TTL_S = 300
 PROBE_PROMPT = [{"role": "user", "content": "Reply with exactly one word: Ready"}]
 #: A generation long enough to measure decode, not connection + prefill (~400 tokens).
 GEN_PROMPT = [{"role": "user", "content": "Write about 300 words on the history of the "
@@ -82,13 +86,32 @@ class Router:
     def __init__(self, cfg: Config, keys: Keyring, store: Store):
         self.cfg, self.keys, self.store = cfg, keys, store
         self.gather = Gatherer(cfg, keys, store)
+        self._sessions: dict[str, tuple[str, int, float]] = {}   # session -> (seat, tokens, t)
+
+    def _warm(self, session: str | None) -> tuple[tuple[str, int], ...]:
+        if not session:
+            return ()
+        hit = self._sessions.get(session)
+        if not hit or time.time() - hit[2] > WARM_TTL_S:
+            return ()
+        return ((hit[0], hit[1]),)
+
+    def _remember(self, session: str | None, seat: str, prompt_tokens: int) -> None:
+        if session:
+            self._sessions[session] = (seat, prompt_tokens, time.time())
+            if len(self._sessions) > 10000:          # bound memory: drop the oldest half
+                for k, _ in sorted(self._sessions.items(), key=lambda kv: kv[1][2])[:5000]:
+                    self._sessions.pop(k, None)
 
     # --- helpers -------------------------------------------------------------------------
-    def _ask(self, req: dict, ceiling: float | None, lane: str) -> Ask:
-        return ask_from(req, ceiling if ceiling is not None else self.cfg.ceiling_usd_per_mtok,
-                        self.cfg.allow_free, lane=lane,
-                        interactive_max_latency_s=self.cfg.interactive_max_latency_s,
-                        allow_clamp=self.cfg.clamp_max_tokens)
+    def _ask(self, req: dict, ceiling: float | None, lane: str, session: str | None = None,
+             answer_tokens: int | None = None) -> Ask:
+        a = ask_from(req, ceiling if ceiling is not None else self.cfg.ceiling_usd_per_mtok,
+                     self.cfg.allow_free, lane=lane,
+                     interactive_max_latency_s=self.cfg.interactive_max_latency_s,
+                     allow_clamp=self.cfg.clamp_max_tokens)
+        return replace(a, warm=self._warm(session), max_price_age_s=self.cfg.max_price_age_s,
+                       answer_tokens=answer_tokens)
 
     @staticmethod
     def _window(roster: list, seat: str | None) -> str | None:
@@ -126,32 +149,43 @@ class Router:
                 "content_chars": len(res.content.strip()),
                 "reasoning_chars": len(res.reasoning.strip()), "tool_calls": res.tool_calls,
                 "prompt_tokens": res.prompt_tokens, "completion_tokens": res.completion_tokens,
-                "cached_tokens": res.cached_tokens, "cost_usd": usd, "cost_basis": basis,
+                "cached_tokens": res.cached_tokens,
+                # float for display; the exact Decimal string is what sums are made from
+                "cost_usd": None if usd is None else float(usd),
+                "cost_usd_exact": None if usd is None else str(usd), "cost_basis": basis,
                 "latency_s": round(res.latency_s, 3), "scope": None if res.ok else res.scope}
 
     def providers_public(self) -> list[dict]:
         return [s.public() for s in self.gather.states.values()]
 
     # --- DECIDE only -------------------------------------------------------------------
-    def explain(self, req: dict, ceiling: float | None = None, lane: str = "interactive") -> dict:
-        ask = self._ask(req, ceiling, lane)
+    def explain(self, req: dict, ceiling: float | None = None, lane: str = "interactive",
+                session: str | None = None,
+                answer_tokens: int | None = None) -> dict:
+        t0 = time.perf_counter()
+        ask = self._ask(req, ceiling, lane, session, answer_tokens)
         roster = self.gather.roster(lane)
         ch = decide(ask, roster)
         return {"choice": ch.public(), "providers": self.providers_public(),
-                "dashboard": self.gather.dashboard_status}
+                "dashboard": self.gather.dashboard_status,
+                "decide_ms": round((time.perf_counter() - t0) * 1000, 2)}
 
     # --- GATHER -> DECIDE -> ACT -------------------------------------------------------
     def route(self, req: dict, *, client: str = "", ceiling: float | None = None,
-              lane: str = "interactive") -> Routed:
+              lane: str = "interactive", session: str | None = None,
+              answer_tokens: int | None = None) -> Routed:
         t0 = time.time()
-        ask = self._ask(req, ceiling, lane)
+        ask = self._ask(req, ceiling, lane, session, answer_tokens)
+        decide_ms: list[float] = []
         attempts: list[dict] = []
         decisions: list[dict] = []
         res: P.Result | None = None
         choice: Choice | None = None
         for _ in range(MAX_ATTEMPTS):
+            d0 = time.perf_counter()
             roster = self.gather.roster(lane)
             choice = decide(ask, roster)
+            decide_ms.append(round((time.perf_counter() - d0) * 1000, 2))
             decisions.append(choice.public())
             if choice.abstained:
                 break
@@ -189,7 +223,9 @@ class Router:
         answered = bool(res and res.ok)
         status = "ANSWERED" if answered else ("ABSTAINED" if choice.abstained and not attempts
                                               else "FAILED")
-        total = [a["cost_usd"] for a in attempts]
+        total = [None if a["cost_usd_exact"] is None else Decimal(a["cost_usd_exact"])
+                 for a in attempts]
+        spent = sum((x for x in total if x is not None), Decimal(0)) if total else None
         doc = {
             "requested": str(req.get("model") or "auto"), "client": client,
             "ask": {"prompt_tokens": ask.prompt_tokens, "max_tokens": ask.max_tokens,
@@ -198,22 +234,29 @@ class Router:
             "choice": decisions[-1], "earlier_decisions": decisions[:-1], "attempts": attempts,
             "providers": self.providers_public(), "dashboard": self.gather.dashboard_status,
             "status": status, "elapsed_s": round(time.time() - t0, 3),
-            "result": {"cost_usd": sum(x for x in total if x is not None) if total else None,
+            "decide_ms": decide_ms, "session_warm": [s for s, _ in ask.warm],
+            "result": {"cost_usd": None if spent is None else float(spent),
+                       "cost_usd_exact": None if spent is None else str(spent),
                        "cost_basis": "/".join(sorted({a["cost_basis"] for a in attempts})) or None,
                        "calls": len(attempts),
                        "calls_unknown_cost": sum(1 for x in total if x is None)},
         }
         did = self.store.record(doc)
+        if answered and choice.seat:
+            self._remember(session, choice.seat, ask.prompt_tokens)
         return Routed(did, choice, res, status, doc)
 
     def route_stream(self, req: dict, *, client: str = "", ceiling: float | None = None,
-                     lane: str = "interactive") -> tuple[Routed, Iterator[bytes] | None]:
+                     lane: str = "interactive", session: str | None = None,
+                     answer_tokens: int | None = None) -> tuple[Routed, Iterator[bytes] | None]:
         """Decide now; stream the chosen model. A stream cannot be retried once bytes
         have gone to the client, so it is one attempt, recorded when it ends."""
         t0 = time.time()
-        ask = self._ask(req, ceiling, lane)
+        ask = self._ask(req, ceiling, lane, session, answer_tokens)
+        d0 = time.perf_counter()
         roster = self.gather.roster(lane)
         choice = decide(ask, roster)
+        decide_ms = round((time.perf_counter() - d0) * 1000, 2)
         window = self._window(roster, choice.seat)
         doc = {"requested": str(req.get("model") or "auto"), "client": client,
                "ask": {"prompt_tokens": ask.prompt_tokens, "max_tokens": ask.max_tokens,
@@ -223,6 +266,7 @@ class Router:
                "choice": choice.public(), "earlier_decisions": [], "attempts": [],
                "providers": self.providers_public(), "dashboard": self.gather.dashboard_status,
                "status": "ABSTAINED" if choice.abstained else "STREAMING",
+               "decide_ms": [decide_ms],
                "result": {"cost_usd": None, "cost_basis": None, "calls": 0,
                           "calls_unknown_cost": 0}}
         did = self.store.record(doc)
@@ -246,8 +290,12 @@ class Router:
             doc["attempts"] = [self._attempt(choice.seat, choice.max_tokens, res, usd, basis,
                                              window)]
             doc["status"] = "ANSWERED" if res.ok else "FAILED"
+            if res.ok:
+                self._remember(session, choice.seat, ask.prompt_tokens)
             doc["elapsed_s"] = round(time.time() - t0, 3)
-            doc["result"] = {"cost_usd": usd, "cost_basis": basis, "calls": 1,
+            doc["result"] = {"cost_usd": None if usd is None else float(usd),
+                             "cost_usd_exact": None if usd is None else str(usd),
+                             "cost_basis": basis, "calls": 1,
                              "calls_unknown_cost": 1 if usd is None else 0}
             doc["id"] = did
             self.store.record(doc)
@@ -269,7 +317,7 @@ class Router:
         whose newest observation is older than that, before their profile expires and
         routes start abstaining on them.
         """
-        budget = self.cfg.probe_budget_usd if budget_usd is None else budget_usd
+        budget = Decimal(str(self.cfg.probe_budget_usd if budget_usd is None else budget_usd))
         roster = {c.seat: c for c in self.gather.roster()}
         targets: list[str] = list(seats or [])
         if refresh_older_than_s is not None:
@@ -287,7 +335,7 @@ class Router:
             for cs in by_p.values():
                 cs.sort(key=lambda c: (2 * c.list_prompt + c.list_completion, c.seat))
                 targets += [c.seat for c in cs[:cheapest] if c.seat not in targets]
-        spent, report = 0.0, []
+        spent, report = Decimal(0), []
         for seat in targets:
             c = roster.get(seat)
             if not c:
@@ -313,7 +361,7 @@ class Router:
                     # policy allows, so a provider that publishes no prices cannot
                     # probe for free.
                     toks = (res.prompt_tokens or 0) + (res.completion_tokens or mt)
-                    usd = toks * (self.cfg.ceiling_usd_per_mtok or 5.0) / 1e6
+                    usd = toks * Decimal(str(self.cfg.ceiling_usd_per_mtok or 5.0)) / Decimal(1_000_000)
                 spent += usd
                 rung = self._attempt(seat, mt, res, usd, basis)
                 rungs.append(rung)
@@ -338,7 +386,7 @@ class Router:
             p = profiles.get(r["seat"])
             if p:
                 r["profile"] = p.public()
-        return {"spent_usd": round(spent, 8), "budget_usd": budget, "probed": report}
+        return {"spent_usd": float(spent), "budget_usd": float(budget), "probed": report}
 
     def probe_generation(self, seats: list[str] | None = None, measured: bool = False,
                          budget_usd: float | None = None,
@@ -346,7 +394,7 @@ class Router:
         """Measure decode speed on a real ~400-token generation -- the number the
         interactive lane gates on. With `measured`, every seat that has behaviour facts
         but no decode speed yet. Spends real money, capped by budget_usd."""
-        budget = self.cfg.probe_budget_usd if budget_usd is None else budget_usd
+        budget = Decimal(str(self.cfg.probe_budget_usd if budget_usd is None else budget_usd))
         roster = {c.seat: c for c in self.gather.roster()}
         targets = list(seats or [])
         if measured:
@@ -355,7 +403,7 @@ class Router:
                               and c.provider_state == "OK" and not c.blocked
                               and (self.cfg.allow_free or not is_free(c))
                               and c.seat not in targets)
-        spent, report = 0.0, []
+        spent, report = Decimal(0), []
         for seat in targets:
             c = roster.get(seat)
             if not c or c.provider_state != "OK":
@@ -374,7 +422,7 @@ class Router:
             usd, basis = self._observe(seat, "gen", GEN_MAX_TOKENS, res)
             if usd is None:
                 usd = ((res.prompt_tokens or 0) + (res.completion_tokens or GEN_MAX_TOKENS)) \
-                    * (self.cfg.ceiling_usd_per_mtok or 5.0) / 1e6
+                    * Decimal(str(self.cfg.ceiling_usd_per_mtok or 5.0)) / Decimal(1_000_000)
             spent += usd
             row = self._attempt(seat, GEN_MAX_TOKENS, res, usd, basis)
             row["tok_per_s"] = round(res.completion_tokens / res.latency_s, 1) \
@@ -382,7 +430,7 @@ class Router:
             report.append(row)
             if progress:
                 progress(row)
-        return {"spent_usd": round(spent, 8), "budget_usd": budget, "measured": report}
+        return {"spent_usd": float(spent), "budget_usd": float(budget), "measured": report}
 
     def import_measurements(self, rows: list[dict] | None = None,
                             curve: list[dict] | None = None, source_note: str = "") -> dict:
@@ -431,6 +479,18 @@ class Router:
                         cached_tokens=None, cost_usd=None, cost_basis="unknown",
                         latency_s=float(lat), detail="imported concurrency n=1 " + source_note)
                     n_gen += 1
+        base: dict[str, float] = {}
+        for r in curve or []:
+            if int(r["concurrency"]) == 1 and r.get("median_latency_s"):
+                base[alias.get(r["provider"], r["provider"])] = float(r["median_latency_s"])
+        for r in curve or []:
+            provider = alias.get(r["provider"], r["provider"])
+            n, lat = int(r["concurrency"]), r.get("median_latency_s")
+            if n > 1 and lat and base.get(provider) and int(r.get("failed") or 0) == 0:
+                self.store.set_provider_fact(provider, "latency_ratio_n%d" % n,
+                                             round(float(lat) / base[provider], 3),
+                                             "measured: median %.2fs at n=%d vs %.2fs at n=1 %s"
+                                             % (lat, n, base[provider], source_note))
         for provider, cap in caps.items():
             self.store.set_provider_fact(provider, "max_ok_concurrency", cap,
                                          "measured: 0 failures at n=%d %s" % (cap, source_note))

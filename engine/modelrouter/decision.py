@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field, replace
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 
@@ -67,6 +68,29 @@ CLAMP_HEADROOM = 2
 #: and a second empty answer still fails loudly.
 SAFE_CEILING = 1024
 
+Money = Decimal
+_M = Decimal(1_000_000)
+
+
+def money(x) -> Decimal | None:
+    """Prices arrive as decimal STRINGS (7+ places); float would drift over volume.
+    Everything monetary in this module is Decimal. None stays None -- UNKNOWN."""
+    if x is None:
+        return None
+    return x if isinstance(x, Decimal) else Decimal(str(x))
+
+
+def _plain(v):
+    """Decimal -> float for the JSON record (display); exact values are kept elsewhere."""
+    if isinstance(v, Decimal):
+        return float(v)
+    if isinstance(v, dict):
+        return {k: _plain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_plain(x) for x in v]
+    return v
+
+
 #: When a client sets no max_tokens, cost is estimated at this many completion tokens.
 DEFAULT_COMPLETION_ESTIMATE = 512
 
@@ -87,10 +111,12 @@ class Candidate:
     context_length: int | None = None
     supports_tools: bool | None = None
     # Prices in USD per million tokens.
-    list_prompt: float | None = None            # headline, from the catalogue
-    list_completion: float | None = None
+    list_prompt: Decimal | None = None          # $/M, this model's own rate card (window)
+    list_completion: Decimal | None = None
+    list_cached: Decimal | None = None          # $/M for a cache-read prompt token
+    price_age_s: float | None = None            # how long ago the price was read
     price_source: str = ""                      # dashboard | provider-catalogue
-    measured_usd_per_mtok: float | None = None  # cost / tokens, from this model's own calls
+    measured_usd_per_mtok: Decimal | None = None  # cost / tokens, from this model's own calls
     measured_basis: str = ""                    # billed | computed | billed+computed
     window: str | None = None                   # provider scheduling window priced for this lane
     # Behaviour, from probes.
@@ -102,6 +128,8 @@ class Candidate:
     has_reasoning_field: bool | None = None     # False: nowhere to strand text; budget as-is
     decode_tps: float | None = None             # measured on a real generation, not a probe
     blocked: str = ""                           # a model-level refusal known before calling
+    load_factor: float = 1.0                    # latency multiplier at the provider's current load
+    in_flight: int = 0
     probe_age_s: float | None = None
     latency_s: float | None = None              # a SHORT call: connection + prefill + first token
 
@@ -113,7 +141,7 @@ class Ask:
     prompt_tokens: int                          # estimated
     max_tokens: int | None = None               # as the client set it; None = unset
     needs_tools: bool = False
-    ceiling_usd_per_mtok: float | None = None   # refuse anything dearer than this
+    ceiling_usd_per_mtok: Decimal | None = None  # refuse anything dearer than this
     only_seat: str | None = None                # client named a model: judge only that one
     failed: tuple[tuple[str, str], ...] = ()    # (seat, why) already tried for THIS request
     allow_free: bool = False                    # free tiers may log prompts; separate quotas
@@ -133,6 +161,16 @@ class Ask:
     # Seats that already came back empty on THIS request: their raised budget is at least
     # SAFE_CEILING. Across 220 probes of 53 models nothing was silent at 1024.
     escalate: tuple[str, ...] = ()
+    # Prompt-cache warmth: (seat, cached prompt tokens) for the seat this conversation used
+    # last. Hopping providers throws the cache away, so a warm seat is priced with its
+    # cache-read rate -- stickiness falls out of the cost, it is not a rule.
+    warm: tuple[tuple[str, int], ...] = ()
+    # A price read longer ago than this is UNKNOWN, not fact (Sail's is scraped).
+    max_price_age_s: float | None = None
+    # Expected ANSWER length. Cost per answer = rate x tokens actually burned, and the
+    # burned answer is usually far below the cap: a one-word reply is 2 tokens under a cap
+    # of 250. Unset, the cap is used -- an upper bound that over-weights output price.
+    answer_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -141,9 +179,9 @@ class Assessment:
     verdict: Verdict
     because: str
     unknown: tuple[str, ...] = ()
-    usd_per_mtok: float | None = None           # the price used to rank it
+    usd_per_mtok: Decimal | None = None         # the price used to rank it
     price_basis: str = ""                       # measured | list | ""
-    expected_usd: float | None = None           # for THIS request
+    expected_usd: Decimal | None = None         # for THIS request
     clamp_to: int | None = None                 # would qualify with max_tokens raised to this
 
 
@@ -155,7 +193,7 @@ class Choice:
     because: str
     seat: str | None = None
     max_tokens: int | None = None               # what will be sent upstream
-    expected_usd: float | None = None
+    expected_usd: Decimal | None = None
     considered: tuple[Assessment, ...] = ()
     unknown: tuple[str, ...] = ()
     facts: dict[str, Any] = field(default_factory=dict)
@@ -172,7 +210,9 @@ class Choice:
             {**asdict(a), "verdict": a.verdict.value, "unknown": list(a.unknown)}
             for a in self.considered
         ]
-        return d
+        if self.expected_usd is not None:
+            d["expected_usd_exact"] = str(self.expected_usd)
+        return _plain(d)
 
     def to_json(self) -> str:
         return json.dumps(self.public(), sort_keys=True)
@@ -181,17 +221,17 @@ class Choice:
 UNKNOWN_KEPT = 25
 
 
-def _list_blend(c: Candidate) -> float:
+def _list_blend(c: Candidate) -> Decimal:
     if c.list_prompt is None or c.list_completion is None:
-        return float("inf")
-    return (2 * c.list_prompt + c.list_completion) / 3
+        return Decimal("Infinity")
+    return (2 * money(c.list_prompt) + money(c.list_completion)) / 3
 
 
 def is_free(c: Candidate) -> bool:
     return c.model.endswith(":free") or (c.list_prompt == 0 and c.list_completion == 0)
 
 
-def _cost(ask: Ask, c: Candidate, completion: int) -> tuple[float | None, float | None, str]:
+def _cost(ask: Ask, c: Candidate, completion: int) -> tuple[Decimal | None, Decimal | None, str]:
     """(expected USD for this request, effective $/M, basis).
 
     - A provider that BILLS per call: its measured price (it catches what a rate card
@@ -203,14 +243,22 @@ def _cost(ask: Ask, c: Candidate, completion: int) -> tuple[float | None, float 
     """
     oh = c.reasoning_overhead_tokens or 0
     tokens = ask.prompt_tokens + completion + oh
-    if c.measured_usd_per_mtok is not None and "billed" in c.measured_basis:
-        return c.measured_usd_per_mtok * tokens / 1e6, c.measured_usd_per_mtok, "measured, billed"
-    if c.list_prompt is not None and c.list_completion is not None:
-        exp = (ask.prompt_tokens * c.list_prompt + (completion + oh) * c.list_completion) / 1e6
+    measured = money(c.measured_usd_per_mtok)
+    if measured is not None and "billed" in c.measured_basis:
+        return measured * tokens / _M, measured, "measured, billed"
+    p, co = money(c.list_prompt), money(c.list_completion)
+    if p is not None and co is not None:
+        warm = min(dict(ask.warm).get(c.seat, 0), ask.prompt_tokens)
+        cached = money(c.list_cached)
+        if not warm or cached is None:
+            warm, cached = 0, p
+        exp = ((ask.prompt_tokens - warm) * p + warm * cached + (completion + oh) * co) / _M
         basis = "rate card" + (" " + c.window if c.window else "")
-        return exp, exp / tokens * 1e6, basis
-    if c.measured_usd_per_mtok is not None:
-        return c.measured_usd_per_mtok * tokens / 1e6, c.measured_usd_per_mtok, "measured"
+        if warm:
+            basis += ", %d prompt tokens warm in its cache" % warm
+        return exp, exp / tokens * _M, basis
+    if measured is not None:
+        return measured * tokens / _M, measured, "measured"
     return None, None, ""
 
 
@@ -218,7 +266,7 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
     """Judge one candidate against one request. Order matters: account-level facts
     first, because nothing about a model helps if its provider will refuse the call."""
     def out(verdict: Verdict, because: str, unknown: tuple[str, ...] = (),
-            usd: float | None = None, basis: str = "", exp: float | None = None) -> Assessment:
+            usd: Decimal | None = None, basis: str = "", exp: Decimal | None = None) -> Assessment:
         return Assessment(c.seat, verdict, because, unknown, usd, basis, exp)
 
     for seat, why in ask.failed:
@@ -271,20 +319,25 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
         return out(Verdict.EXCLUDED, why)
 
     completion = ask.max_tokens if ask.max_tokens is not None else max(
-        DEFAULT_COMPLETION_ESTIMATE, need)
+        DEFAULT_COMPLETION_ESTIMATE, need)           # the budget: bounds context
+    answer = min(ask.answer_tokens, completion) if ask.answer_tokens else completion
     # The latency gate chooses FOR the caller; a caller who named the model has chosen.
     if ask.lane == "interactive" and ask.interactive_max_latency_s is not None \
             and ask.only_seat is None:
         if c.decode_tps is None or c.latency_s is None:
             return out(Verdict.UNKNOWN, "decode speed never measured on a real generation; "
                        "the interactive lane needs it", ("decode_tps",))
-        gen = completion + (c.reasoning_overhead_tokens or 0)
-        predicted = c.latency_s + gen / c.decode_tps
+        gen = answer + (c.reasoning_overhead_tokens or 0)
+        # Latency under load is its own variable: the provider's measured curve says how
+        # much slower it gets with the calls this router already has open to it.
+        predicted = (c.latency_s + gen / c.decode_tps) * c.load_factor
         if predicted > ask.interactive_max_latency_s:
             return out(Verdict.EXCLUDED, "predicted %.1fs for %d tokens (%.2fs + %d at %.0f "
-                       "tok/s measured) is above the interactive lane's %.1fs -- a background "
+                       "tok/s measured%s) is above the interactive lane's %.1fs -- a background "
                        "or batch lane can use it" % (
                            predicted, gen, c.latency_s, gen, c.decode_tps,
+                           ", x%.2f at %d in flight" % (c.load_factor, c.in_flight)
+                           if c.load_factor != 1.0 else "",
                            ask.interactive_max_latency_s))
     if c.context_length is None:
         return out(Verdict.UNKNOWN, "context length unknown", ("context_length",))
@@ -292,12 +345,17 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
         return out(Verdict.EXCLUDED, "needs %d tokens of context; model has %d" % (
             ask.prompt_tokens + completion, c.context_length))
 
-    exp, usd, basis = _cost(ask, c, completion)
+    if ask.max_price_age_s is not None and c.price_age_s is not None \
+            and c.price_age_s > ask.max_price_age_s and "billed" not in c.measured_basis:
+        return out(Verdict.UNKNOWN, "price read %.1fh ago: stale, not fact" % (
+            c.price_age_s / 3600), ("price",))
+    exp, usd, basis = _cost(ask, c, answer)
     if usd is None:
         return out(Verdict.UNKNOWN, "price unknown (null is not zero)", ("price",))
-    if ask.ceiling_usd_per_mtok is not None and usd > ask.ceiling_usd_per_mtok:
+    ceiling = money(ask.ceiling_usd_per_mtok)
+    if ceiling is not None and usd > ceiling:
         return out(Verdict.EXCLUDED, "$%.4g/M (%s) is above the $%.4g/M ceiling" % (
-            usd, basis, ask.ceiling_usd_per_mtok), usd=usd, basis=basis)
+            usd, basis, ceiling), usd=usd, basis=basis)
     shape = "no reasoning field: budget honoured as-is" if c.has_reasoning_field is False \
         else "emits into %s" % c.emits.value
     speed = ", %.0f tok/s measured" % c.decode_tps if c.decode_tps else ""
@@ -315,7 +373,10 @@ def decide(ask: Ask, roster: list[Candidate]) -> Choice:
     facts = {"prompt_tokens": ask.prompt_tokens, "max_tokens": ask.max_tokens,
              "needs_tools": ask.needs_tools, "ceiling_usd_per_mtok": ask.ceiling_usd_per_mtok,
              "only_seat": ask.only_seat, "roster_size": len(roster), "lane": ask.lane,
-             "interactive_max_latency_s": ask.interactive_max_latency_s}
+             "interactive_max_latency_s": ask.interactive_max_latency_s,
+             "answer_tokens": ask.answer_tokens or ask.max_tokens or DEFAULT_COMPLETION_ESTIMATE,
+             "answer_tokens_basis": "declared" if ask.answer_tokens else (
+                 "cap (max_tokens): an upper bound" if ask.max_tokens else "default estimate")}
     if ask.only_seat and not pool:
         return Choice(Outcome.ABSTAIN, "requested model %s is not in the live roster"
                       % ask.only_seat, facts=facts)
@@ -394,3 +455,25 @@ def decide(ask: Ask, roster: list[Candidate]) -> Choice:
     # so no reasoning model is handed a budget it would spend on thinking alone.
     return Choice(Outcome.ROUTE, because, seat=win.seat, max_tokens=ask.max_tokens,
                   expected_usd=win.expected_usd, considered=considered, facts=facts)
+
+
+def decide_ensemble(ask: Ask, roster: list[Candidate], k: int = 3) -> list[Assessment]:
+    """HOOK -- not wired to any route. Capability is jagged, not nested: where a task is
+    verifiable, k cheap models from DIFFERENT families plus a verifier may beat one model
+    at any price, and 64-way concurrency costs ~1.3-1.6x the wall clock of one call on
+    io.net / Sail (2026-09-26). The experiment that decides whether it pays has not run,
+    so this only answers "which k would it be": the cheapest qualifier per model family,
+    in expected-cost order."""
+    ch = decide(ask, roster)
+    seen, out = set(), []
+    for a in ch.considered:
+        if a.verdict is not Verdict.QUALIFIES:
+            continue
+        family = a.seat.split(":", 1)[1].split("/", 1)[0].lower()
+        if family in seen:
+            continue
+        seen.add(family)
+        out.append(a)
+        if len(out) == k:
+            break
+    return out

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from decimal import Decimal
 import statistics
 import threading
 import time
@@ -53,7 +54,7 @@ class Profile:
     emits: Emits | None
     min_max_tokens: int | None
     reasoning_overhead_tokens: int | None
-    measured_usd_per_mtok: float | None
+    measured_usd_per_mtok: Decimal | None
     measured_basis: str                  # billed | computed | billed+computed | ""
     latency_s: float | None
     age_s: float | None
@@ -96,9 +97,10 @@ class Store:
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (seat, t or time.time(), source, max_tokens, status, content_chars,
                  reasoning_chars, tool_calls, prompt_tokens, completion_tokens, cached_tokens,
-                 cost_usd, cost_basis, latency_s, detail[:200],
+                 None if cost_usd is None else str(cost_usd), cost_basis, latency_s, detail[:200],
                  None if reasoning_field is None else int(reasoning_field)))
             self._db.commit()
+            self._profiles = None           # observations changed: re-derive on next read
 
     # --- provider facts (e.g. the concurrency a provider survives) ---------------------
     def set_provider_fact(self, provider: str, key: str, value: float, source: str) -> None:
@@ -123,6 +125,16 @@ class Store:
         return [dict(r) for r in rows]
 
     def profiles(self) -> dict[str, Profile]:
+        """Derived per seat, cached until the next observation -- the per-request decision
+        path is a lookup, not a table scan."""
+        hit = getattr(self, "_profiles", None)
+        if hit is not None and time.time() - hit[0] < 60:
+            return hit[1]
+        out = self._derive_all()
+        self._profiles = (time.time(), out)
+        return out
+
+    def _derive_all(self) -> dict[str, Profile]:
         cutoff = time.time() - PROFILE_TTL_S
         with self._lock:
             rows = self._db.execute("SELECT * FROM observations WHERE t>=? AND status=200 "
@@ -222,8 +234,8 @@ def derive(seat: str, obs: list) -> Profile:
     priced = [o for o in obs if o["cost_usd"] is not None and o["prompt_tokens"] is not None
               and o["completion_tokens"] is not None]
     tokens = sum(o["prompt_tokens"] + o["completion_tokens"] for o in priced)
-    usd = sum(o["cost_usd"] for o in priced)
-    measured = usd / tokens * 1e6 if tokens else None
+    usd = sum((Decimal(str(o["cost_usd"])) for o in priced), Decimal(0))
+    measured = usd / tokens * Decimal(1_000_000) if tokens else None
     basis = "+".join(sorted({o["cost_basis"] for o in priced})) if priced else ""
     # Two different latencies. A short call measures connection + prefill + first token;
     # only a real generation measures decode. A 16-token probe called AkashML "fastest"

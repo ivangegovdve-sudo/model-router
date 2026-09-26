@@ -17,7 +17,10 @@ is needed.
 | POST | `/v1/chat/completions` | OpenAI chat completion. `model: "auto"` routes; `model: "provider:model"` is judged alone and refused if it cannot serve the request. `stream: true` supported. |
 | GET | `/v1/models` | `{object:"list", data:[{id:"auto"}, {id:"provider:model"}, ...]}` |
 
-Optional request header `X-Router-Max-Usd-Per-M: <float>` lowers the price ceiling for one call.
+Optional request headers: `X-Router-Max-Usd-Per-M` (price ceiling for one call),
+`X-Router-Answer-Tokens` (expected answer length — cost per answer is rate × tokens burned),
+`X-Router-Session` (conversation id for prompt-cache warmth; the OpenAI `user` field also works),
+`X-Router-Ensemble` (reserved: 501 until the experiment that decides it has run).
 
 **Lanes.** `model: "auto"` is the **interactive** lane: someone is waiting, so a seat is excluded
 when its **predicted** latency for this request — measured short-call latency + (completion +
@@ -93,6 +96,10 @@ and headers `X-Router-Decision`, `X-Router-Seat` (streams carry only the headers
 ```
 `because` is display text; clients must not parse it.
 
+Monetary values in records are floats for display; `result.cost_usd_exact` and
+`choice.expected_usd_exact` carry the exact Decimal strings sums are made from. `decide_ms` is the
+time spent deciding (roster lookup + comparison), per decision.
+
 `considered` lists every qualifier and every exclusion. Of the UNKNOWN seats (usually most of
 the roster: never measured) it lists only those whose list price undercuts the winner — they
 might have been cheaper — and counts the rest in `facts.unknown_not_listed`.
@@ -123,7 +130,7 @@ Provider states: `BLOCKED` — the account refused (auth, money); `QUOTA_EXHAUST
 UNAVAILABLE never implicates the key; do not rotate credentials over it.
 
 ### ProviderState
-`{provider, key, state, detail, until|null, models, price_source, ratelimit:{header:value}, free_quota_until|null, in_flight, max_concurrency|null, concurrency_source}`
+`{provider, key, state:"…|MIRROR", detail, mirror_of, same_price_share|null, until|null, models, price_source, ratelimit:{header:value}, free_quota_until|null, in_flight, max_concurrency|null, concurrency_source}`
 
 `max_concurrency` is the largest concurrency the provider completed with zero failures (imported
 or configured); at the cap the provider is `AT_CAPACITY` and routes go elsewhere. Slots are reserved

@@ -25,6 +25,26 @@ success. This router qualifies a model only on **measured behaviour** (where it 
 tokens it needs before content appears) and ranks it on its **own measured price** plus the
 reasoning tokens it actually spends.
 
+## The decision: many variables, no model calls
+
+Per request the router compares **expected cost per completed answer** — rate × tokens actually
+burned — not advertised $/M. A $2.00/M model that answers in 2 tokens beats a $0.10/M model that
+reasons for 200 first; priced at a 250-token cap, the $0.10 one genuinely wins. So answer length is
+an input: send `X-Router-Answer-Tokens` when you know it (otherwise the cap is used, and the
+decision says so).
+
+The inputs, all read live or measured, none pinned: input / cached-input / output rates per
+scheduling window (Decimal, from the providers' own strings); each rate's read time (a price older
+than `max_price_age_s` is UNKNOWN); reasoning tokens burned before an answer; the minimum viable
+`max_tokens`; whether a reasoning field exists at all; decode speed on a real generation;
+latency growth under the provider's current load (from its measured concurrency curve); the
+concurrency it survives; context length; lane; and prompt-cache warmth — a conversation's last
+seat is priced with its cache-read rate, so staying put wins exactly when it is cheaper
+(session = `X-Router-Session` or the OpenAI `user` field).
+
+Catalogues, pricing pages and context pages refresh out of band every 4 minutes; the decision
+itself is a lookup plus a comparison — measured 17–24 ms over ~1,000 seats, no network, no model.
+
 ## Three stages
 
 ```
@@ -79,7 +99,11 @@ modelrouter init
 
 `init` writes `~/.modelrouter/config.toml` (or `$MODELROUTER_CONFIG`). Choose
 `source = "gcp"` (set `gcp_project`) or `"env"`, and give each provider you use the name of the
-secret or variable holding its key. Supported: `openrouter`, `akashml`, `venice`, `nous`, `sail`, `ionet` (io.net Intelligence).
+secret or variable holding its key. Supported: `openrouter`, `akashml`, `venice`, `nous`, `sail`, `ionet` (io.net Intelligence),
+`groq`. A provider whose catalogue is mostly another's is detected by measurement: identical prices
+→ MIRROR (excluded); mostly identical → CORRELATED (routable, not independent for fallback). Nous:
+97% of its ids are OpenRouter's, 86% at identical prices — CORRELATED. Cerebras is not supported
+(no prices in its API).
 
 ```
 modelrouter doctor

@@ -43,6 +43,18 @@ def _error(status: int, code: str, message: str, **extra) -> JSONResponse:
                         status_code=status)
 
 
+def _int_header(v: str | None) -> int | None:
+    if not v:
+        return None
+    try:
+        n = int(v)
+    except ValueError:
+        raise HTTPException(400, "X-Router-Answer-Tokens must be an integer")
+    if n < 1:
+        raise HTTPException(400, "X-Router-Answer-Tokens must be >= 1")
+    return n
+
+
 def build(cfg: Config) -> FastAPI:
     keys = Keyring(cfg.source, dict(cfg.secrets), cfg.gcp_project)
     store = Store(cfg.state_dir / "modelrouter.sqlite3")
@@ -60,6 +72,10 @@ def build(cfg: Config) -> FastAPI:
         # not the thread pool, are what should limit concurrency.
         import anyio.to_thread
         anyio.to_thread.current_default_thread_limiter().total_tokens = 256
+        # Prices, catalogues, pricing pages and context pages are refreshed out of band:
+        # a request never waits on one. The decision is a lookup plus a comparison.
+        if cfg.secrets:
+            router.gather.start_refresher()
 
     def auth(authorization: str | None = Header(default=None)) -> None:
         if cfg.no_auth:
@@ -134,13 +150,16 @@ def build(cfg: Config) -> FastAPI:
     @app.post("/router/explain", dependencies=[Depends(auth)])
     async def explain(request: Request,
                       x_router_max_usd_per_m: str | None = Header(default=None),
-                      x_router_lane: str | None = Header(default=None)):
+                      x_router_lane: str | None = Header(default=None),
+                      x_router_session: str | None = Header(default=None),
+                      x_router_answer_tokens: str | None = Header(default=None)):
         req = await request.json()
         try:
             lane = lane_of(req, x_router_lane)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
-        return await run_in_threadpool(router.explain, req, ceiling(x_router_max_usd_per_m), lane)
+        return await run_in_threadpool(router.explain, req, ceiling(x_router_max_usd_per_m), lane,
+                                       x_router_session, _int_header(x_router_answer_tokens))
 
     @app.post("/router/probe", dependencies=[Depends(auth)])
     async def probe(request: Request):
@@ -174,7 +193,10 @@ def build(cfg: Config) -> FastAPI:
     @app.post("/v1/chat/completions", dependencies=[Depends(auth)])
     async def chat(request: Request, user_agent: str | None = Header(default=None),
                    x_router_max_usd_per_m: str | None = Header(default=None),
-                   x_router_lane: str | None = Header(default=None)):
+                   x_router_lane: str | None = Header(default=None),
+                   x_router_session: str | None = Header(default=None),
+                   x_router_ensemble: str | None = Header(default=None),
+                   x_router_answer_tokens: str | None = Header(default=None)):
         try:
             req = await request.json()
         except ValueError:
@@ -187,9 +209,17 @@ def build(cfg: Config) -> FastAPI:
             lane = lane_of(req, x_router_lane)
         except ValueError as exc:
             return _error(400, "invalid_request", str(exc))
+        if x_router_ensemble:
+            return _error(501, "not_enabled", "ensemble routing (k cheap models from different "
+                          "families + a verifier) is a reserved hook: the experiment that "
+                          "decides whether it pays has not run")
+        # Conversation identity for prompt-cache warmth: explicit header, else OpenAI `user`.
+        session = (x_router_session or str(req.get("user") or "") or None)
+        answer = _int_header(x_router_answer_tokens)
         if req.get("stream"):
             routed, it = await run_in_threadpool(
-                lambda: router.route_stream(req, client=client, ceiling=lim, lane=lane))
+                lambda: router.route_stream(req, client=client, ceiling=lim, lane=lane,
+                                            session=session, answer_tokens=answer))
             if it is None:
                 return _abstain(routed)
             return StreamingResponse(it, media_type="text/event-stream",
@@ -197,7 +227,8 @@ def build(cfg: Config) -> FastAPI:
                                               "X-Router-Seat": routed.choice.seat or "",
                                               "Cache-Control": "no-cache"})
         routed = await run_in_threadpool(lambda: router.route(req, client=client, ceiling=lim,
-                                                                 lane=lane))
+                                                                 lane=lane, session=session,
+                                                                 answer_tokens=answer))
         if routed.status == "ABSTAINED":
             return _abstain(routed)
         res = routed.result

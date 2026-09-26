@@ -1,5 +1,6 @@
 """GATHER -> DECIDE -> ACT with a fake upstream: probes, retry-by-redecision, refusals."""
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -199,7 +200,7 @@ def test_classify_failure():
 def test_catalogue_parsers_keep_unknown_prices_unknown():
     rows = P.parse_catalogue("akashml", [{"id": "a/b", "pricing": {"input": "0.0000002",
                                                                      "output": None}}])
-    assert rows[0].prompt == pytest.approx(0.2) and rows[0].completion is None
+    assert rows[0].prompt == Decimal("0.2") and rows[0].completion is None
     rows = P.parse_catalogue("openrouter", [{"id": "x/y", "pricing": {"prompt": "-1",
                                                                        "completion": "0"}}])
     assert rows[0].prompt is None
@@ -247,7 +248,7 @@ def test_ionet_catalogue_parses_per_token_prices():
         "cache_read_token_price": 1.475e-07, "context_window": 262124,
         "supports_tools": True, "supports_reasoning": True, "output_modalities": ["text"]}])
     li = rows[0]
-    assert li.prompt == pytest.approx(0.295) and li.completion == pytest.approx(1.15)
+    assert li.prompt == Decimal("0.295") and li.completion == Decimal("1.15")
     assert li.context_length == 262124 and li.supports_tools is True
 
 
@@ -257,7 +258,8 @@ def test_sail_pricing_page_parses_per_window_and_keys_by_page_id():
             'output $2.00 per 1M tokens."></tr><tr aria-label="Gemma 4 12B IT Flex pricing: '
             'input $0.05, cached $0.02, output $1.00 per 1M tokens."></tr></tbody>')
     w = P.parse_window_prices(page)
-    assert w == {"google/gemma-4-12B-it": {"asap": (0.30, 2.00, 0.15), "flex": (0.05, 1.00, 0.02)}}
+    assert w == {"google/gemma-4-12B-it": {"asap": (Decimal("0.30"), Decimal("2.00"), Decimal("0.15")),
+                                            "flex": (Decimal("0.05"), Decimal("1.00"), Decimal("0.02"))}}
 
 
 def test_sail_models_page_context_pairs_with_the_following_id():
@@ -352,3 +354,55 @@ def test_named_seat_at_capacity_is_429_with_retry_after_and_names_the_cap(app):
         router.gather.release("akashml")
     assert r.status_code == 429 and r.headers["Retry-After"] == "1"
     assert "AT_CAPACITY" in r.json()["error"]["message"] and "test cap" in r.json()["error"]["message"]
+
+
+def test_mirror_detection_finds_a_catalogue_copied_with_identical_prices():
+    from modelrouter.gather import detect_mirrors
+    def L(p, m, pr): return P.Listing(p, m, Decimal(pr), Decimal(pr))
+    orig = [L("openrouter", "m%d" % i, "0.%d" % (i + 1)) for i in range(10)]
+    copy = [L("nous", "m%d" % i, "0.%d" % (i + 1)) for i in range(9)]
+    indep = [L("ionet", "m%d" % i, "0.9") for i in range(9)]            # same ids, own prices
+    assert detect_mirrors({"openrouter": orig, "nous": copy, "ionet": indep}) ==         {"nous": ("openrouter", 1.0), "ionet": ("openrouter", pytest.approx(1 / 9))}  # own prices
+    reprice = [L("nous", "m%d" % i, "0.%d" % (i + 1) if i < 7 else "0.05") for i in range(9)]
+    assert detect_mirrors({"openrouter": orig, "nous": reprice})["nous"][1] == pytest.approx(7 / 9)
+
+
+def test_groq_null_pricing_is_unknown_not_free():
+    rows = P.parse_catalogue("groq", [
+        {"id": "allam-2-7b", "pricing": None, "context_window": 4096, "active": True},
+        {"id": "openai/gpt-oss-20b", "pricing": {"prompt": "0.000000075", "completion": "0.0000003",
+         "input_cache_read": "0.0000000375"}, "context_window": 131072, "active": True}])
+    assert rows[0].prompt is None and rows[0].completion is None
+    assert rows[1].prompt == Decimal("0.075") and rows[1].cached_prompt == Decimal("0.0375")
+
+
+def test_curve_import_records_latency_ratios_and_load_factor_interpolates(app):
+    client, up = app
+    router = client.app.state.router
+    curve = [{"provider": "ionet", "model": "m", "concurrency": n, "succeeded": n, "failed": 0,
+              "median_latency_s": lat, "per_request_tok_per_s": 200}
+             for n, lat in ((1, 1.11), (4, 1.26), (16, 1.72), (64, 1.80))]
+    router.import_measurements(None, curve, "t")
+    facts = router.store.provider_facts()["ionet"]
+    assert facts["latency_ratio_n64"]["value"] == pytest.approx(1.622, abs=1e-3)
+    lf = router.gather._load_factor(facts, in_flight=9)                  # n=10, between 4 and 16
+    assert 1.135 < lf < 1.55
+
+
+def test_ensemble_header_is_reserved_not_silently_ignored(app):
+    client, up = app
+    r = client.post("/v1/chat/completions", json={"model": "auto", "messages": [{"role": "user",
+                    "content": "x"}]}, headers={"X-Router-Ensemble": "3"})
+    assert r.status_code == 501 and "has not run" in r.text
+
+
+def test_same_open_weights_at_independent_prices_is_not_correlation(app):
+    client, up = app
+    g = client.app.state.router.gather
+    def L(p, m, pr): return P.Listing(p, m, Decimal(pr), Decimal(pr))
+    g._cat = {"akashml": (0, [L("akashml", "m%d" % i, "0.1") for i in range(6)])}
+    g.states["ionet"] = type(g.states["akashml"])("ionet")
+    g._cat["ionet"] = (0, [L("ionet", "m%d" % i, "0.3") for i in range(30)])
+    from modelrouter.gather import detect_mirrors, CORRELATED_SAME_PRICE
+    share = detect_mirrors({p: v[1] for p, v in g._cat.items()})["akashml"][1]
+    assert share < CORRELATED_SAME_PRICE     # same ids, own prices: independent host

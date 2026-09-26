@@ -234,3 +234,61 @@ def test_named_model_skips_the_lane_latency_gate():
     slow = _seat("sail:m", 0.05, 0.20, Emits.CONTENT, lat=2.4)
     ask = Ask(prompt_tokens=40, max_tokens=50, interactive_max_latency_s=1.2, only_seat="sail:m")
     assert decide(ask, [slow]).seat == "sail:m"
+
+
+# --- the multi-variable decision (2026-09-26) -------------------------------------------
+from decimal import Decimal as D
+
+from modelrouter.decision import decide_ensemble
+
+
+def test_cost_per_answer_not_per_token_inverts_the_rate_card():
+    """$2.00/M output in 2 tokens beats $0.10/M that burns 200 reasoning tokens first."""
+    gemma = _seat("sail:google/gemma-4-12B-it", "0.30", "2.00", Emits.CONTENT,
+                  has_reasoning_field=False)
+    cheap = _seat("x:reasoner", "0.05", "0.10", Emits.REASONING_THEN_CONTENT, floor=201, oh=200)
+    # Declared answer length: 2 tokens. Gemma burns 2; the reasoner burns 200 + 2.
+    ch = decide(Ask(prompt_tokens=20, max_tokens=250, answer_tokens=2), [gemma, cheap])
+    assert ch.seat == "sail:google/gemma-4-12B-it"
+    by = {a.seat: a.expected_usd for a in ch.considered}
+    assert by["sail:google/gemma-4-12B-it"] == D("0.00001")        # (20*0.30 + 2*2.00) / 1e6
+    assert by["x:reasoner"] == D("0.0000212")                       # (20*0.05 + 202*0.10) / 1e6
+    # Priced at the cap instead, 250 answer tokens make the $0.10 reasoner genuinely cheaper:
+    # the inversion is about tokens burned, so the answer length has to be an input.
+    assert decide(Ask(prompt_tokens=20, max_tokens=250), [gemma, cheap]).seat == "x:reasoner"
+
+
+def test_money_is_exact_decimal_from_price_strings():
+    s = _seat("akashml:gpt-oss-120b", D("0.03"), D("0.17"), Emits.CONTENT)
+    a = assess(Ask(prompt_tokens=1000, max_tokens=1000), s)
+    assert a.expected_usd == D("0.00020")          # (1000*0.03 + 1000*0.17) / 1e6, no float drift
+    assert isinstance(a.expected_usd, D)
+
+
+def test_warm_prompt_cache_makes_the_same_seat_cheaper_so_routing_stays_sticky():
+    warm = _seat("sail:kimi", "2.50", "12.50", Emits.CONTENT, list_cached="0.25")
+    cold = _seat("ionet:kimi", "2.00", "12.50", Emits.CONTENT, list_cached="1.00")
+    ask = Ask(prompt_tokens=8000, max_tokens=100)
+    assert decide(ask, [warm, cold]).seat == "ionet:kimi"            # cold: cheaper input wins
+    ch = decide(replace(ask, warm=(("sail:kimi", 7900),)), [warm, cold])
+    assert ch.seat == "sail:kimi" and "7900 prompt tokens warm" in ch.because
+
+
+def test_stale_price_is_unknown_not_fact():
+    s = _seat("sail:m", "0.1", "0.1", Emits.CONTENT, price_age_s=3 * 86400)
+    a = assess(Ask(prompt_tokens=10, max_price_age_s=172800), s)
+    assert a.verdict is Verdict.UNKNOWN and "stale" in a.because
+
+
+def test_load_factor_scales_predicted_latency():
+    busy = _seat("ionet:m", "0.1", "0.1", Emits.CONTENT, lat=1.0, tps=100, load_factor=1.6,
+                 in_flight=63)
+    a = assess(Ask(prompt_tokens=10, max_tokens=500, interactive_max_latency_s=8.0), busy)
+    assert a.verdict is Verdict.EXCLUDED and "x1.60 at 63 in flight" in a.because
+
+
+def test_ensemble_hook_picks_cheapest_per_family_only():
+    seats = [_seat("a:qwen/x", "0.1", "0.1", Emits.CONTENT), _seat("b:qwen/y", "0.2", "0.2", Emits.CONTENT),
+             _seat("c:meta/z", "0.3", "0.3", Emits.CONTENT), _seat("d:google/w", "0.4", "0.4", Emits.CONTENT)]
+    got = [a.seat for a in decide_ensemble(Ask(prompt_tokens=10, max_tokens=10), seats, k=3)]
+    assert got == ["a:qwen/x", "c:meta/z", "d:google/w"]

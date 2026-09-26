@@ -18,12 +18,16 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
+from decimal import Decimal
 
 import httpx
 
 from . import providers as P
 from .config import Config
-from .decision import Candidate
+from dataclasses import replace
+
+from .decision import Candidate, money
 from .secrets import Keyring
 from .store import Store
 
@@ -33,6 +37,55 @@ DASHBOARD_TTL_S = 1800
 BLOCK_S = 900          # an account-level refusal benches the provider this long
 QUOTA_S = 600          # a quota refusal, unless the provider says when it resets
 UNAVAILABLE_S = 300    # unreachable / CDN bot check: retry soon, never blame the key
+REFRESH_S = 240        # out-of-band refresh, well inside the TTLs: the request path reads cache
+MIRROR_OVERLAP = 0.8   # share of a catalogue found in another's ...
+MIRROR_SAME_PRICE = 0.95   # ... with prices identical to the digit: MIRROR
+CORRELATED_SAME_PRICE = 0.5   # ... mostly identical: CORRELATED (shared upstream)
+# Below that, the same ids are just the same open weights hosted independently: AkashML's
+# six models are all on io.net, and not one price matches (2026-09-26).
+
+
+def _iso_age(ts: str | None) -> float | None:
+    if not ts:
+        return None
+    try:
+        return time.time() - datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def detect_mirrors(cats: dict[str, list]) -> dict[str, tuple[str, float]]:
+    """{copy: (original, share of shared models priced identically)} for every provider
+    whose catalogue is mostly another's (>= MIRROR_OVERLAP of its ids).
+
+    Two kinds, told apart by price:
+      MIRROR      >= MIRROR_SAME_PRICE identical: comparing it scores a provider against
+                  itself. Excluded.
+      CORRELATED  same catalogue, its own prices: a real alternative for price, but not
+                  independent for fallback. Measured 2026-09-26: Nous carries 97% of its
+                  ids from OpenRouter, but 51 of 368 shared models are priced differently
+                  (DeepSeek-V4.1-Flash $0.035/$0.29 vs $0.30/$1.20), and it served billed
+                  calls while every OpenRouter key was refused for the org budget."""
+    priced = {p: {li.model: (li.prompt, li.completion) for li in ls} for p, ls in cats.items() if ls}
+    out: dict[str, tuple[str, float]] = {}
+    for b, pb in priced.items():
+        best = None
+        for a, pa in priced.items():
+            if a == b or not pb:
+                continue
+            # the copy is the one contained in the other; equal size -> the later name
+            if not (len(pb) < len(pa) or (len(pb) == len(pa) and b > a)):
+                continue
+            common = set(pa) & set(pb)
+            if len(common) / len(pb) < MIRROR_OVERLAP:
+                continue
+            same = sum(1 for m in common if pb[m] == pa[m] and pb[m][0] is not None) / len(common)
+            key = (same, len(common) / len(pb))
+            if best is None or key > best[0]:
+                best = (key, a)
+        if best:
+            out[b] = (best[1], best[0][0])
+    return out
 
 
 @dataclass
@@ -52,6 +105,8 @@ class ProviderState:
     in_flight: int = 0               # calls this router has open to the provider right now
     max_concurrency: int | None = None   # measured (or configured) concurrency it survives
     concurrency_source: str = ""
+    mirror_of: str = ""              # its catalogue is this provider's (MIRROR or CORRELATED)
+    same_price_share: float | None = None
 
     def public(self) -> dict:
         d = dict(self.__dict__)
@@ -216,6 +271,7 @@ class Gatherer:
     def roster(self, lane: str = "interactive") -> list[Candidate]:
         profiles = self.store.profiles()
         self._caps()
+        facts = self.store.provider_facts()
         out: list[Candidate] = []
         with self._lock:
             for provider, st in self.states.items():
@@ -264,13 +320,17 @@ class Gatherer:
                 for li in listings:
                     seat = "%s:%s" % (provider, li.model)
                     pr, co, src, available = li.prompt, li.completion, "provider-catalogue", True
+                    ca = li.cached_prompt
+                    age = time.time() - li.read_at if li.read_at else None
                     window = None
                     blocked = li.blocked
                     cards = windows.get(li.model) or li.windows or {}
                     for w in P.LANE_WINDOWS.get(lane, ("asap",)):
                         if w in cards:
-                            pr, co, _cached = cards[w]
+                            pr, co, ca = cards[w]
                             window, src = w, "provider pricing page"
+                            age = time.time() - self._win[provider][0] \
+                                if provider in self._win else age
                             break
                     else:
                         if cards and not blocked:
@@ -284,8 +344,11 @@ class Gatherer:
                         pp = row.get("pricing") or {}
                         dp, dc = P._per_m(pp.get("promptUsdPerToken")), \
                             P._per_m(pp.get("completionUsdPerToken"))
-                        if dp is not None and dc is not None:
+                        # The provider's own catalogue, read this run, beats the dashboard's
+                        # daily copy; the dashboard fills a price the provider did not give.
+                        if (pr is None or co is None) and dp is not None and dc is not None:
                             pr, co, src = dp, dc, "dashboard"
+                            age = _iso_age(row.get("lastConfirmedAt") or row.get("lastSeenAt"))
                         if row.get("availability") == "disappeared":
                             available = False
                     sources.add(src)
@@ -299,7 +362,9 @@ class Gatherer:
                         provider_state=state, provider_detail=detail, available=available,
                         context_length=li.context_length or contexts.get(li.model),
                         supports_tools=li.supports_tools,
-                        list_prompt=pr, list_completion=co, price_source=src,
+                        list_prompt=pr, list_completion=co, list_cached=ca, price_age_s=age,
+                        price_source=src, in_flight=st.in_flight,
+                        load_factor=self._load_factor(facts.get(provider, {}), st.in_flight),
                         measured_usd_per_mtok=prof.measured_usd_per_mtok if prof else None,
                         measured_basis=prof.measured_basis if prof else "", window=window,
                         blocked=blocked,
@@ -313,7 +378,78 @@ class Gatherer:
                         probe_age_s=prof.age_s if prof else None,
                         latency_s=prof.latency_s if prof else None))
                 st.price_source = "mixed" if len(sources) > 1 else (next(iter(sources), ""))
+            mirrors = detect_mirrors({p: self._cat[p][1] for p in self.states if p in self._cat})
+            excluded = set()
+            for copy, (original, same) in mirrors.items():
+                st = self.states[copy]
+                if same < CORRELATED_SAME_PRICE:
+                    continue                    # same open weights, independent host
+                st.mirror_of = original
+                st.same_price_share = round(same, 3)
+                if same >= MIRROR_SAME_PRICE and not self.cfg.allow_mirrors and st.state == "OK":
+                    st.state = "MIRROR"
+                    st.detail = ("mirror of %s: %.0f%% of shared models priced identically -- "
+                                 "not an independent provider" % (original, 100 * same))
+                    excluded.add(copy)
+                elif same >= CORRELATED_SAME_PRICE and st.state == "OK":
+                    st.detail = ("CORRELATED with %s: shares its catalogue, own prices on %.0f%% "
+                                 "of shared models -- not independent for fallback" % (
+                                     original, 100 * (1 - same)))
+            if excluded:
+                out = [c if c.provider not in excluded else
+                       replace(c, provider_state="MIRROR",
+                               provider_detail=self.states[c.provider].detail)
+                       for c in out]
         return out
+
+    @staticmethod
+    def _load_factor(facts: dict, in_flight: int) -> float:
+        """Latency multiplier with this call added to what is already open, interpolated
+        from the provider's measured curve (median latency at n / at 1). Sail stays flat
+        (2.70 -> 3.23s at 64); io.net degrades 60% (1.11 -> 1.80s)."""
+        pts = sorted((int(k[len("latency_ratio_n"):]), f["value"]) for k, f in facts.items()
+                     if k.startswith("latency_ratio_n"))
+        if not pts:
+            return 1.0
+        n = in_flight + 1
+        prev = (1, 1.0)
+        for x, y in pts:
+            if n <= x:
+                return prev[1] + (y - prev[1]) * (n - prev[0]) / max(1, x - prev[0])
+            prev = (x, y)
+        return pts[-1][1]
+
+    # --- out-of-band refresh --------------------------------------------------------
+    def refresh(self) -> None:
+        """Re-read every live source now. Run on a timer so a request never waits on a
+        catalogue: the per-request decision is a lookup plus a comparison."""
+        for provider in list(self.states):
+            if not self.keys.load(provider).present:
+                continue
+            try:
+                self._cat[provider] = (time.time(), P.fetch_catalogue(provider,
+                                                                      self.keys.get(provider)))
+            except Exception:                                   # noqa: BLE001
+                pass                    # the next roster() records why, on the request path
+            self._dash.pop(provider, None)
+            self._win.pop(provider, None)
+            self._ctx.pop(provider, None)
+            for fn in (self._dashboard, self._window_prices, self._context_lengths):
+                try:
+                    fn(provider)
+                except Exception:                               # noqa: BLE001
+                    pass
+        self.last_refresh = time.time()
+
+    def start_refresher(self, every_s: float = REFRESH_S) -> None:
+        def loop():
+            while True:
+                try:
+                    self.refresh()
+                except Exception:                               # noqa: BLE001
+                    log.exception("refresh failed")
+                time.sleep(every_s)
+        threading.Thread(target=loop, daemon=True, name="modelrouter-refresh").start()
 
     def listing(self, seat: str, window: str | None = None) -> P.Listing | None:
         """The seat's rate card -- for a windowed provider, the card of the window the
@@ -330,16 +466,17 @@ class Gatherer:
         return None
 
 
-def call_cost(li: P.Listing | None, res: P.Result) -> tuple[float | None, str]:
+def call_cost(li: P.Listing | None, res: P.Result) -> tuple[Decimal | None, str]:
     """What one call cost: billed when the provider says, else usage x this model's
     own rate card (cached prompt tokens at the cached rate when published)."""
     if res.billed_usd is not None:
-        return res.billed_usd, "billed"
+        return Decimal(str(res.billed_usd)), "billed"
     if li is None or li.prompt is None or li.completion is None \
             or res.prompt_tokens is None or res.completion_tokens is None:
         return None, "unknown"
     cached = res.cached_tokens or 0
-    cached_rate = li.cached_prompt if li.cached_prompt is not None else li.prompt
-    usd = ((res.prompt_tokens - cached) * li.prompt + cached * cached_rate
-           + res.completion_tokens * li.completion) / 1e6
+    p, c = money(li.prompt), money(li.completion)
+    cached_rate = money(li.cached_prompt) if li.cached_prompt is not None else p
+    usd = ((res.prompt_tokens - cached) * p + cached * cached_rate
+           + res.completion_tokens * c) / Decimal(1_000_000)
     return usd, "computed"

@@ -36,6 +36,10 @@ secret = ""
 secret = ""
 [providers.ionet]
 secret = ""
+[providers.groq]
+secret = ""
+# Not supported: Nous (its /models is an OpenRouter mirror -- same ids, same prices to the
+# digit; detected and excluded as MIRROR if configured) and Cerebras (no prices in its API).
 
 [server]
 bind = "127.0.0.1"
@@ -57,6 +61,12 @@ interactive_max_latency_s = 8.0
 # When no model answers within a caller's small max_tokens, raise it for the cheapest
 # reasoning model (recorded in the decision) instead of refusing. Never silent.
 clamp_max_tokens = true
+# A price read longer ago than this is UNKNOWN, not fact (Sail's is scraped from docs).
+max_price_age_s = 172800
+# A provider whose catalogue is >= 80% another's with identical prices is a MIRROR: comparing
+# it against the original would score the provider against itself, and one fault takes out
+# both. Excluded unless allowed.
+allow_mirrors = false
 # Free tiers (":free", or $0 list price) may log prompts and have their own daily quota.
 allow_free = false
 # Probing spends real money to learn how a model behaves. Hard cap per probe run.
@@ -76,12 +86,14 @@ class Config:
     port: int = 7480
     token_secret: str = ""
     no_auth: bool = False
-    ceiling_usd_per_mtok: float | None = 5.0
+    ceiling_usd_per_mtok: float | None = 5.0     # converted to Decimal at the decision
     probe_budget_usd: float = 0.02
     allow_free: bool = False
     interactive_max_latency_s: float | None = 8.0
     max_concurrency: dict[str, int] = field(default_factory=dict)   # provider -> cap
     clamp_max_tokens: bool = True
+    max_price_age_s: float | None = 172800
+    allow_mirrors: bool = False
     dashboard_url: str = ""
     state_dir: Path = field(default_factory=lambda: Path.home() / ".modelrouter")
     problems: list[str] = field(default_factory=list)
@@ -125,6 +137,9 @@ def load(path: Path | None = None) -> Config:
     lat = pol.get("interactive_max_latency_s", cfg.interactive_max_latency_s)
     cfg.interactive_max_latency_s = float(lat) if lat not in (None, "", 0) else None
     cfg.clamp_max_tokens = bool(pol.get("clamp_max_tokens", True))
+    age = pol.get("max_price_age_s", cfg.max_price_age_s)
+    cfg.max_price_age_s = float(age) if age not in (None, "", 0) else None
+    cfg.allow_mirrors = bool(pol.get("allow_mirrors", False))
     cfg.dashboard_url = (pol.get("dashboard_url", "") or "").rstrip("/")
     if cfg.source not in ("gcp", "env"):
         cfg.problems.append('secrets.source must be "gcp" or "env"')

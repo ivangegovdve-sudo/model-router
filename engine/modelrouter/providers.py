@@ -15,6 +15,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterator
 
 import httpx
@@ -35,6 +36,9 @@ PROVIDERS: dict[str, dict[str, Any]] = {
              "specs": "https://docs.sailresearch.com/models.md", "windows": True},
     "ionet": {"base": "https://api.intelligence.io.solutions/api/v1", "catalogue": "/models",
               "parse": "ionet"},
+    "groq": {"base": "https://api.groq.com/openai/v1", "catalogue": "/models", "parse": "groq"},
+    # Cerebras is deliberately absent: its /models carries no prices, and Ivan's Cerebras
+    # credit is ring-fenced for Chloe's conversational front end (2026-09-23).
 }
 # Every provider call carries a real User-Agent. io.net sits behind Cloudflare, which
 # answers a request with no recognisable client (Python urllib's default) with
@@ -46,23 +50,26 @@ _ACCOUNT = re.compile(r"budget|credit|balance|insufficient|payment|billing|unaut
                       r"invalid api key|no auth|forbidden", re.I)
 _QUOTA = re.compile(r"quota|rate.?limit|per.?day|too many|limit exceeded", re.I)
 _NOT_TEXT = re.compile(r"(embed|rerank|moderation|guard|whisper|tts|transcri|image|"
-                       r"flux|sdxl|video|audio|ocr)", re.I)
+                       r"flux|sdxl|video|audio|ocr|orpheus|safeguard)", re.I)
+_MILLION = Decimal(1_000_000)
 
 
-def _f(v) -> float | None:
-    """A price field -> float, or None. Negative means 'variable' upstream: UNKNOWN."""
-    if v is None or v == "":
+def _f(v) -> Decimal | None:
+    """A price field -> Decimal, or None. Providers send prices as decimal STRINGS on
+    purpose; parsing them as float loses precision at 6-7 places and the drift compounds
+    over volume. Negative means 'variable' upstream: UNKNOWN. Null is UNKNOWN, never 0."""
+    if v is None or v == "" or isinstance(v, bool):
         return None
     try:
-        x = float(v)
-    except (TypeError, ValueError):
+        x = Decimal(str(v))
+    except (InvalidOperation, ValueError):
         return None
-    return x if x >= 0 else None
+    return x if x.is_finite() and x >= 0 else None
 
 
-def _per_m(v) -> float | None:
+def _per_m(v) -> Decimal | None:
     x = _f(v)
-    return None if x is None else x * 1e6
+    return None if x is None else x * _MILLION
 
 
 #: Lane -> the scheduling windows it may buy, most preferred first. Sail names them
@@ -89,7 +96,7 @@ def parse_window_prices(page: str) -> dict[str, dict[str, tuple[float, float, fl
         for w, inp, cached, outp in _PRICE_ARIA.findall(chunk):
             win = _WINDOW_LABEL.get(w.lower())
             if win:
-                out.setdefault(m.group(1), {})[win] = (float(inp), float(outp), float(cached))
+                out.setdefault(m.group(1), {})[win] = (Decimal(inp), Decimal(outp), Decimal(cached))
     return out
 
 
@@ -135,15 +142,16 @@ class Listing:
 
     provider: str
     model: str
-    prompt: float | None            # USD / M tokens
-    completion: float | None
-    cached_prompt: float | None = None
+    prompt: Decimal | None          # USD / M tokens
+    completion: Decimal | None
+    cached_prompt: Decimal | None = None
     context_length: int | None = None
     supports_tools: bool | None = None
     reasoning: bool | None = None
     text_out: bool | None = True
-    windows: dict[str, tuple[float, float, float]] | None = None   # window -> (p, c, cached)
+    windows: dict[str, tuple[Decimal, Decimal, Decimal]] | None = None  # window -> (p, c, cached)
     blocked: str = ""               # the catalogue itself says this key cannot use it
+    read_at: float | None = None    # when these prices were read
 
 
 def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
@@ -154,7 +162,14 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
         mid = str(m.get("id") or "")
         if not mid:
             continue
-        if shape in ("openrouter", "akashml"):
+        if shape == "groq":
+            p = m.get("pricing") or {}          # a null pricing object is UNKNOWN, not free
+            pr, co, ca = _per_m(p.get("prompt")), _per_m(p.get("completion")), \
+                _per_m(p.get("input_cache_read"))
+            ctx = m.get("context_window")
+            tools = reasoning = None
+            text_out = None if m.get("active") is not False else False
+        elif shape in ("openrouter", "akashml"):
             p = m.get("pricing") or {}
             if shape == "openrouter":
                 pr, co, ca = _per_m(p.get("prompt")), _per_m(p.get("completion")), \
@@ -175,7 +190,10 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
             ctx = m.get("context_length")
             text_out = None if outs is None else ("text" in outs)
         elif shape == "ionet":
-            pr, co, ca = _per_m(m.get("input_token_price")), _per_m(m.get("output_token_price")),                 _per_m(m.get("cache_read_token_price"))
+            pr, co, ca = _per_m(m.get("input_token_price")), _per_m(m.get("output_token_price")), \
+                _per_m(m.get("cache_read_token_price"))
+            if m.get("supports_prompt_cache") is False:
+                ca = None                       # a cache-read rate it will never apply
             ctx = m.get("context_window") or m.get("max_model_len")
             tools = m.get("supports_tools")
             reasoning = m.get("supports_reasoning")
@@ -228,7 +246,11 @@ def fetch_catalogue(provider: str, key: str, timeout: float = 30) -> list[Listin
                              msg)
     d = r.json()
     rows = (d.get("data") if isinstance(d, dict) else d) or []
-    return parse_catalogue(provider, rows)
+    listings = parse_catalogue(provider, rows)
+    now = time.time()
+    for li in listings:
+        li.read_at = now
+    return listings
 
 
 @dataclass
@@ -245,7 +267,7 @@ class Result:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     cached_tokens: int | None = None
-    billed_usd: float | None = None
+    billed_usd: Decimal | None = None
     latency_s: float = 0.0
     detail: str = ""
     scope: str = "model"             # on failure: model | provider | quota
