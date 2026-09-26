@@ -229,13 +229,7 @@ class Router:
                              {"messages": PROBE_PROMPT, "temperature": 0}, max_tokens=mt,
                              timeout=90)
                 usd, basis = self._observe(seat, "probe", mt, res)
-                if usd is None:
-                    # Unknown cost is charged against the budget at the worst price the
-                    # policy allows, so a provider that publishes no prices cannot
-                    # probe for free.
-                    toks = (res.prompt_tokens or 0) + (res.completion_tokens or mt)
-                    usd = toks * (self.cfg.ceiling_usd_per_mtok or 5.0) / 1e6
-                spent += usd
+                spent += usd or 0.0
                 rung = self._attempt(seat, mt, res, usd, basis)
                 rungs.append(rung)
                 if progress:
