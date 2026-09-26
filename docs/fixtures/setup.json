@@ -1,0 +1,54 @@
+{
+    "config": "N:\\work\\modelrouter-state\\config.toml",
+    "config_problems": [],
+    "secrets_source": "gcp",
+    "gcp_project": "forest-family-cloud",
+    "gcloud_installed": true,
+    "keys": [
+        {
+            "provider": "openrouter",
+            "source": "gcp",
+            "name": "openrouter-spare",
+            "present": true,
+            "detail": "read"
+        },
+        {
+            "provider": "akashml",
+            "source": "gcp",
+            "name": "akashml-2026-09",
+            "present": true,
+            "detail": "read"
+        },
+        {
+            "provider": "venice",
+            "source": "gcp",
+            "name": "venice-api-key",
+            "present": true,
+            "detail": "read"
+        },
+        {
+            "provider": "nous",
+            "source": "gcp",
+            "name": "nous-fleet",
+            "present": true,
+            "detail": "read"
+        },
+        {
+            "provider": "sail",
+            "source": "gcp",
+            "name": "sail-api-key",
+            "present": true,
+            "detail": "read"
+        }
+    ],
+    "auth": "disabled (loopback only)",
+    "dashboard": "https://openrouter-github-dashboard.vercel.app",
+    "dashboard_status": {
+        "openrouter": "ok (676 rows)",
+        "akashml": "not carried",
+        "venice": "not carried",
+        "nous": "not carried",
+        "sail": "not carried"
+    },
+    "ready": true
+}

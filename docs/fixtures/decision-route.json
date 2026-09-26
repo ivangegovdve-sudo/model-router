@@ -1,0 +1,317 @@
+{
+    "requested": "auto",
+    "client": "curl/8.11.0",
+    "ask": {
+        "prompt_tokens": 17,
+        "max_tokens": 1200,
+        "needs_tools": false,
+        "ceiling_usd_per_mtok": 5.0,
+        "stream": false
+    },
+    "choice": {
+        "outcome": "ROUTE",
+        "because": "cheapest of 8 qualifying: $0.0512/M measured; next akashml:openai/gpt-oss-20b at $0.05145/M measured",
+        "seat": "venice:e2ee-qwen-2-5-7b-p",
+        "max_tokens": 1200,
+        "expected_usd": 6.230786458333334e-05,
+        "considered": [
+            {
+                "seat": "venice:e2ee-qwen-2-5-7b-p",
+                "verdict": "QUALIFIES",
+                "because": "$0.0512/M (measured), emits into content",
+                "unknown": [],
+                "usd_per_mtok": 0.05119791666666667,
+                "price_basis": "measured",
+                "expected_usd": 6.230786458333334e-05
+            },
+            {
+                "seat": "akashml:openai/gpt-oss-20b",
+                "verdict": "QUALIFIES",
+                "because": "$0.05145/M (measured), emits into reasoning_then_content",
+                "unknown": [],
+                "usd_per_mtok": 0.05144602851323828,
+                "price_basis": "measured",
+                "expected_usd": 6.492488798370671e-05
+            },
+            {
+                "seat": "venice:mercury-2-5",
+                "verdict": "QUALIFIES",
+                "because": "$0.06113/M (measured), emits into reasoning_then_content",
+                "unknown": [],
+                "usd_per_mtok": 0.06112924281984333,
+                "price_basis": "measured",
+                "expected_usd": 8.955434073107048e-05
+            },
+            {
+                "seat": "akashml:openai/gpt-oss-120b",
+                "verdict": "QUALIFIES",
+                "because": "$0.08402/M (measured), emits into reasoning_then_content",
+                "unknown": [],
+                "usd_per_mtok": 0.08402489626556016,
+                "price_basis": "measured",
+                "expected_usd": 0.00010729979253112032
+            },
+            {
+                "seat": "akashml:meta-llama/Llama-3.3-70B-Instruct",
+                "verdict": "QUALIFIES",
+                "because": "$0.1897/M (measured), emits into content",
+                "unknown": [],
+                "usd_per_mtok": 0.18967741935483873,
+                "price_basis": "measured",
+                "expected_usd": 0.00023083741935483874
+            },
+            {
+                "seat": "akashml:Qwen/Qwen3.6-35B-A3B",
+                "verdict": "QUALIFIES",
+                "because": "$0.7847/M (measured), emits into reasoning_then_content",
+                "unknown": [],
+                "usd_per_mtok": 0.7847457627118642,
+                "price_basis": "measured",
+                "expected_usd": 0.0010876576271186438
+            },
+            {
+                "seat": "akashml:Qwen/Qwen3.8-27B",
+                "verdict": "QUALIFIES",
+                "because": "$1.371/M (measured), emits into reasoning_then_content",
+                "unknown": [],
+                "usd_per_mtok": 1.37125,
+                "price_basis": "measured",
+                "expected_usd": 0.00169897875
+            },
+            {
+                "seat": "akashml:zai-org/GLM-5.3",
+                "verdict": "QUALIFIES",
+                "because": "$3.299/M (measured), emits into reasoning_then_content",
+                "unknown": [],
+                "usd_per_mtok": 3.2990654205607477,
+                "price_basis": "measured",
+                "expected_usd": 0.004133728971962617
+            },
+            {
+                "seat": "nous:mistralai/mistral-nemo",
+                "verdict": "UNKNOWN",
+                "because": "never measured: a price alone does not show it returns content",
+                "unknown": [
+                    "emits"
+                ],
+                "usd_per_mtok": null,
+                "price_basis": "",
+                "expected_usd": null
+            },
+            {
+                "seat": "openrouter:mistralai/mistral-nemo",
+                "verdict": "UNKNOWN",
+                "because": "never measured: a price alone does not show it returns content",
+                "unknown": [
+                    "emits"
+                ],
+                "usd_per_mtok": null,
+                "price_basis": "",
+                "expected_usd": null
+            },
+            {
+                "seat": "nous:meta-llama/llama-3.1-8b-instruct",
+                "verdict": "UNKNOWN",
+                "because": "never measured: a price alone does not show it returns content",
+                "unknown": [
+                    "emits"
+                ],
+                "usd_per_mtok": null,
+                "price_basis": "",
+                "expected_usd": null
+            },
+            {
+                "seat": "nous:inclusionai/ling-3.0-flash-vl",
+                "verdict": "UNKNOWN",
+                "because": "never measured: a price alone does not show it returns content",
+                "unknown": [
+                    "emits"
+                ],
+                "usd_per_mtok": null,
+                "price_basis": "",
+                "expected_usd": null
+            },
+            {
+                "seat": "nous:inclusionai/ling-3.0-flash",
+                "verdict": "UNKNOWN",
+                "because": "never measured: a price alone does not show it returns content",
+                "unknown": [
+                    "emits"
+                ],
+                "usd_per_mtok": null,
+                "price_basis": "",
+                "expected_usd": null
+            },
+            {
+                "seat": "openrouter:inclusionai/ling-3.0-flash",
+                "verdict": "UNKNOWN",
+                "because": "never measured: a price alone does not show it returns content",
+                "unknown": [
+                    "emits"
+                ],
+                "usd_per_mtok": null,
+                "price_basis": "",
+                "expected_usd": null
+            },
+            {
+                "seat": "nous:openai/gpt-oss-20b",
+                "verdict": "UNKNOWN",
+                "because": "never measured: a price alone does not show it returns content",
+                "unknown": [
+                    "emits"
+                ],
+                "usd_per_mtok": null,
+                "price_basis": "",
+                "expected_usd": null
+            },
+            {
+                "seat": "openrouter:openai/gpt-oss-20b",
+                "verdict": "UNKNOWN",
+                "because": "never measured: a price alone does not show it returns content",
+                "unknown": [
+                    "emits"
+                ],
+                "usd_per_mtok": null,
+                "price_basis": "",
+                "expected_usd": null
+            },
+            {
+                "seat": "openrouter:sao10k/l3-lunaris-8b",
+                "verdict": "UNKNOWN",
+                "because": "never measured: a price alone does not show it returns content",
+                "unknown": [
+                    "emits"
+                ],
+                "usd_per_mtok": null,
+                "price_basis": "",
+                "expected_usd": null
+            },
+            {
+                "seat": "openrouter:ibm-granite/granite-4.0-h-micro",
+                "verdict": "UNKNOWN",
+                "because": "never measured: a price alone does not show it returns content",
+                "unknown": [
+                    "emits"
+                ],
+                "usd_per_mtok": null,
+                "price_basis": "",
+                "expected_usd": null
+            }
+        ],
+        "unknown": [],
+        "facts": {
+            "prompt_tokens": 17,
+            "max_tokens": 1200,
+            "needs_tools": false,
+            "ceiling_usd_per_mtok": 5.0,
+            "only_seat": null,
+            "roster_size": 967,
+            "free_tier_not_listed": 29,
+            "unknown_not_listed": 920
+        }
+    },
+    "earlier_decisions": [],
+    "attempts": [
+        {
+            "seat": "venice:e2ee-qwen-2-5-7b-p",
+            "max_tokens": 1200,
+            "http": 200,
+            "ok": true,
+            "detail": "ok",
+            "finish_reason": "stop",
+            "content_chars": 185,
+            "reasoning_chars": 0,
+            "tool_calls": 0,
+            "prompt_tokens": 39,
+            "completion_tokens": 36,
+            "cached_tokens": 24,
+            "cost_usd": 6.63e-06,
+            "cost_basis": "billed",
+            "latency_s": 3.335,
+            "scope": null
+        }
+    ],
+    "providers": [
+        {
+            "provider": "openrouter",
+            "key": "read",
+            "state": "OK",
+            "detail": "",
+            "until": null,
+            "models": 446,
+            "price_source": "mixed",
+            "ratelimit": {},
+            "free_quota_until": null
+        },
+        {
+            "provider": "akashml",
+            "key": "read",
+            "state": "OK",
+            "detail": "",
+            "until": null,
+            "models": 6,
+            "price_source": "provider-catalogue",
+            "ratelimit": {},
+            "free_quota_until": null
+        },
+        {
+            "provider": "venice",
+            "key": "read",
+            "state": "OK",
+            "detail": "",
+            "until": null,
+            "models": 123,
+            "price_source": "provider-catalogue",
+            "ratelimit": {
+                "x-ratelimit-limit-requests": "500",
+                "x-ratelimit-remaining-requests": "499",
+                "x-ratelimit-reset-requests": "1790381576067",
+                "x-ratelimit-limit-tokens": "5000000",
+                "x-ratelimit-remaining-tokens": "5000000",
+                "x-ratelimit-reset-tokens": "1790381576070",
+                "x-ratelimit-resets": "1790381546043",
+                "x-ratelimit-remaining": "50"
+            },
+            "free_quota_until": null
+        },
+        {
+            "provider": "nous",
+            "key": "read",
+            "state": "OK",
+            "detail": "",
+            "until": null,
+            "models": 380,
+            "price_source": "provider-catalogue",
+            "ratelimit": {},
+            "free_quota_until": null
+        },
+        {
+            "provider": "sail",
+            "key": "read",
+            "state": "OK",
+            "detail": "",
+            "until": null,
+            "models": 12,
+            "price_source": "provider-catalogue",
+            "ratelimit": {},
+            "free_quota_until": null
+        }
+    ],
+    "dashboard": {
+        "openrouter": "ok (676 rows)",
+        "akashml": "not carried",
+        "venice": "not carried",
+        "nous": "not carried",
+        "sail": "not carried"
+    },
+    "status": "ANSWERED",
+    "elapsed_s": 6.97,
+    "result": {
+        "cost_usd": 6.63e-06,
+        "cost_basis": "billed",
+        "calls": 1,
+        "calls_unknown_cost": 0
+    },
+    "id": "20260926T031159-c4ee0e",
+    "t": 1790381519.68551
+}
