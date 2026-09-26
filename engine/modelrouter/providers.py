@@ -161,10 +161,12 @@ class Result:
 def classify_failure(status: int, msg: str) -> str:
     if status in (401, 402):
         return "provider"
+    # Money before rate: "Budget limit exceeded (monthly limit)" is an account that
+    # cannot pay, not a rate window that will reopen in a minute.
+    if status in (403, 429) and _ACCOUNT.search(msg or ""):
+        return "provider"
     if status == 429 or _QUOTA.search(msg or ""):
         return "quota"
-    if status == 403 and _ACCOUNT.search(msg or ""):
-        return "provider"
     return "model"
 
 

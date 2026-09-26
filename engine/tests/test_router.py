@@ -159,7 +159,8 @@ def test_derive_reasoning_only_after_large_empty_budget(tmp_path):
 def test_classify_failure():
     assert P.classify_failure(402, "") == "provider"
     assert P.classify_failure(429, "") == "quota"
-    assert P.classify_failure(403, "Key limit exceeded (monthly budget)") in ("quota", "provider")
+    assert P.classify_failure(403, "Budget limit exceeded (monthly limit). Contact your org admin.") == "provider"
+    assert P.classify_failure(429, "Rate limit exceeded: free-models-per-day") == "quota"
     assert P.classify_failure(500, "internal") == "model"
 
 

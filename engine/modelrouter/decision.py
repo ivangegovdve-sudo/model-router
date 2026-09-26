@@ -284,10 +284,16 @@ def decide(ask: Ask, roster: list[Candidate]) -> Choice:
 
     win = ok[0]
     runner = ok[1] if len(ok) > 1 else None
-    because = "cheapest of %d qualifying: $%.4g/M %s" % (len(ok), win.usd_per_mtok, win.price_basis)
+    # Say what actually decided: expected cost for THIS request, which folds in the
+    # reasoning tokens a model spends before answering -- a lower $/M can still lose.
+    def cost(a: Assessment) -> str:
+        oh = by_seat[a.seat].reasoning_overhead_tokens
+        return "$%.3g expected ($%.4g/M %s%s)" % (
+            a.expected_usd, a.usd_per_mtok, a.price_basis,
+            ", +%d reasoning tokens" % oh if oh else "")
+    because = "lowest expected cost of %d qualifying: %s" % (len(ok), cost(win))
     if runner:
-        because += "; next %s at $%.4g/M %s" % (runner.seat, runner.usd_per_mtok,
-                                               runner.price_basis)
+        because += "; next %s at %s" % (runner.seat, cost(runner))
     # The client's budget is forwarded untouched. Raising it would change what the
     # call costs behind the client's back; a budget too small was excluded above.
     return Choice(Outcome.ROUTE, because, seat=win.seat, max_tokens=ask.max_tokens,
