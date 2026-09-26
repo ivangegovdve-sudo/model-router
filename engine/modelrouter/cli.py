@@ -4,6 +4,7 @@
     modelrouter doctor            what is configured, what is readable, what is missing
     modelrouter serve             run the proxy
     modelrouter probe --cheapest 3   buy behavioural facts for the likeliest winners
+    modelrouter probe --refresh-days 3   re-measure before facts expire (7 days)
     modelrouter explain "prompt" [--max-tokens N] [--tools]   the decision, no call
 """
 from __future__ import annotations
@@ -90,7 +91,12 @@ def cmd_probe(a) -> int:
             rung["seat"], rung["max_tokens"], rung["http"], rung["content_chars"],
             rung["reasoning_chars"], rung["cost_usd"], rung["cost_basis"], rung["detail"]),
             flush=True)
-    out = r.probe(a.seat or None, a.cheapest, a.budget, progress=show)
+    if not (a.seat or a.cheapest or a.refresh_days is not None):
+        print("nothing to probe: give --seat, --cheapest N or --refresh-days D")
+        return 1
+    out = r.probe(a.seat or None, a.cheapest, a.budget, progress=show,
+                  refresh_older_than_s=a.refresh_days * 86400 if a.refresh_days is not None
+                  else None)
     print(json.dumps({"spent_usd": out["spent_usd"], "budget_usd": out["budget_usd"],
                       "profiles": {p["seat"]: p.get("profile") for p in out["probed"]}},
                      indent=1))
@@ -127,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--seat", action="append", help="provider:model (repeatable)")
     p.add_argument("--cheapest", type=int, default=0)
     p.add_argument("--budget", type=float)
+    p.add_argument("--refresh-days", type=float,
+                   help="re-probe measured seats last observed more than D days ago")
     p = sub.add_parser("explain")
     p.add_argument("prompt")
     p.add_argument("--model", default="auto")

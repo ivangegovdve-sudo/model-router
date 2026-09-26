@@ -182,17 +182,25 @@ class Router:
     # --- probing: buying facts -----------------------------------------------------------
     def probe(self, seats: list[str] | None = None, cheapest: int = 0,
               budget_usd: float | None = None,
-              progress: Callable[[dict], None] | None = None) -> dict:
+              progress: Callable[[dict], None] | None = None,
+              refresh_older_than_s: float | None = None) -> dict:
         """Learn how models behave by calling them with a one-word task at rising
         budgets until content appears. Spends real money, capped by budget_usd.
 
         With `cheapest=N`, probes the N cheapest-by-list-price never-measured models
         per provider -- the ones most likely to win a route, and so the ones whose
-        behaviour matters most.
+        behaviour matters most. With `refresh_older_than_s`, re-probes measured seats
+        whose newest observation is older than that, before their profile expires and
+        routes start abstaining on them.
         """
         budget = self.cfg.probe_budget_usd if budget_usd is None else budget_usd
         roster = {c.seat: c for c in self.gather.roster()}
         targets: list[str] = list(seats or [])
+        if refresh_older_than_s is not None:
+            stale = [c for c in roster.values() if c.emits is not None
+                     and (c.probe_age_s or 0) > refresh_older_than_s]
+            targets += [c.seat for c in sorted(stale, key=lambda c: c.seat)
+                        if c.seat not in targets]
         if cheapest:
             by_p: dict[str, list] = {}
             for c in roster.values():
