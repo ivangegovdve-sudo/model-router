@@ -61,6 +61,10 @@ class Profile:
     floor_evidence: str = ""             # why min_max_tokens is what it is
     max_reasoning_tokens: int | None = None  # most reasoning seen before an answer, any task
     has_reasoning_field: bool | None = None  # False: the response has no field to strand text in
+    billing_ratio: Decimal | None = None     # billed / rate-card cost over the same calls
+    billed_prompt: Decimal | None = None     # $/M actually charged, solved from its own bills
+    billed_completion: Decimal | None = None
+    billed_evidence: str = ""
     decode_tps: float | None = None          # tokens/s on a real generation (>= 150 tokens)
 
     def public(self) -> dict:
@@ -81,6 +85,9 @@ class Store:
         if "reasoning_field" not in cols:            # migrate stores from before 2026-09-26
             self._db.execute("ALTER TABLE observations ADD COLUMN reasoning_field INTEGER")
             self._db.commit()
+        if "card_usd" not in cols:                   # what the rate card said the call cost
+            self._db.execute("ALTER TABLE observations ADD COLUMN card_usd TEXT")
+            self._db.commit()
 
     # --- observations ---------------------------------------------------------
     def observe(self, seat: str, source: str, *, max_tokens: int | None, status: int,
@@ -88,17 +95,18 @@ class Store:
                 prompt_tokens: int | None, completion_tokens: int | None,
                 cached_tokens: int | None, cost_usd: float | None, cost_basis: str,
                 latency_s: float, detail: str, reasoning_field: bool | None = None,
-                t: float | None = None) -> None:
+                t: float | None = None, card_usd=None) -> None:
         with self._lock:
             self._db.execute(
                 "INSERT INTO observations (seat,t,source,max_tokens,status,content_chars,"
                 "reasoning_chars,tool_calls,prompt_tokens,completion_tokens,cached_tokens,"
-                "cost_usd,cost_basis,latency_s,detail,reasoning_field) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "cost_usd,cost_basis,latency_s,detail,reasoning_field,card_usd) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (seat, t or time.time(), source, max_tokens, status, content_chars,
                  reasoning_chars, tool_calls, prompt_tokens, completion_tokens, cached_tokens,
                  None if cost_usd is None else str(cost_usd), cost_basis, latency_s, detail[:200],
-                 None if reasoning_field is None else int(reasoning_field)))
+                 None if reasoning_field is None else int(reasoning_field),
+                 None if card_usd is None else str(card_usd)))
             self._db.commit()
             self._profiles = None           # observations changed: re-derive on next read
 
@@ -237,6 +245,14 @@ def derive(seat: str, obs: list) -> Profile:
     usd = sum((Decimal(str(o["cost_usd"])) for o in priced), Decimal(0))
     measured = usd / tokens * Decimal(1_000_000) if tokens else None
     basis = "+".join(sorted({o["cost_basis"] for o in priced})) if priced else ""
+    # Billed against what the rate card said, on the same calls: keeps the input/output
+    # split of the card (which decides Kimi-K3 between Sail and Nous) while still catching
+    # what a card misses (Venice's injected system prompt billed 1507 tokens for "hi").
+    both = [o for o in priced if o["cost_basis"] == "billed" and "card_usd" in o.keys()
+            and o["card_usd"] not in (None, "", "0")]
+    card = sum((Decimal(o["card_usd"]) for o in both), Decimal(0))
+    billing_ratio = (sum((Decimal(str(o["cost_usd"])) for o in both), Decimal(0)) / card
+                     if card else None)
     # Two different latencies. A short call measures connection + prefill + first token;
     # only a real generation measures decode. A 16-token probe called AkashML "fastest"
     # while its decode ran at 24 tok/s against io.net's 260 (2026-09-26).
@@ -252,10 +268,47 @@ def derive(seat: str, obs: list) -> Profile:
         # caller's budget can be honoured as-is. Any empty reply was something else.
         emits, min_mt, overhead, max_reasoning = Emits.CONTENT, 1, None, None
         floor_evidence = "no reasoning field in any response: budget honoured as-is"
+    bp, bc, bev = solve_billed_rates(priced)
     return Profile(seat, len(obs_all), emits, min_mt, overhead, measured, basis,
                    statistics.median(lat) if lat else None,
                    time.time() - max(o["t"] for o in obs_all) if obs_all else None, floor_evidence,
-                   max_reasoning, has_field, statistics.median(tps) if tps else None)
+                   max_reasoning, has_reasoning_field=has_field,
+                   decode_tps=statistics.median(tps) if tps else None,
+                   billing_ratio=billing_ratio, billed_prompt=bp, billed_completion=bc,
+                   billed_evidence=bev)
+
+
+def solve_billed_rates(obs: list) -> tuple[Decimal | None, Decimal | None, str]:
+    """The input and output rates a provider ACTUALLY charged, solved from its own bills.
+
+    Each billed call is one equation: billed = prompt x a + completion x b. Two calls with
+    different prompt:completion splits pin both rates (least squares over all of them). An
+    advertised price is a claim; this is the bill. Measured 2026-09-26: Nous advertised
+    Kimi-K3 at $1.03 / $9.04 per M (API and portal alike) and billed $3.00 / $15.00 --
+    OpenRouter's list -- on the nous-fleet key.
+    """
+    rows = [(Decimal(o["prompt_tokens"]), Decimal(o["completion_tokens"]),
+             Decimal(str(o["cost_usd"]))) for o in obs
+            if o["cost_basis"] == "billed" and not (o["cached_tokens"] or 0)
+            and o["prompt_tokens"] and o["completion_tokens"] is not None]
+    if len({(p, c) for p, c, _ in rows}) < 2:
+        return None, None, ""
+    spp = sum(p * p for p, _, _ in rows)
+    scc = sum(c * c for _, c, _ in rows)
+    spc = sum(p * c for p, c, _ in rows)
+    spy = sum(p * y for p, _, y in rows)
+    scy = sum(c * y for _, c, y in rows)
+    det = spp * scc - spc * spc
+    # Near-collinear splits (every call the same shape) cannot separate the two rates.
+    if det <= 0 or det / (spp * scc) < Decimal("1e-4"):
+        return None, None, ""
+    a = (spy * scc - scy * spc) / det
+    b = (scy * spp - spy * spc) / det
+    if a < 0 or b < 0:
+        return None, None, ""
+    m = Decimal(1_000_000)
+    q = Decimal("0.0001")
+    return (a * m).quantize(q), (b * m).quantize(q), "solved from %d billed calls" % len(rows)
 
 
 def _spent_before_answer(o) -> int:

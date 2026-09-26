@@ -106,6 +106,7 @@ class ProviderState:
     max_concurrency: int | None = None   # measured (or configured) concurrency it survives
     concurrency_source: str = ""
     mirror_of: str = ""              # its catalogue is this provider's (MIRROR or CORRELATED)
+    correlated_with: list = field(default_factory=list)   # shared upstream, both directions
     same_price_share: float | None = None
 
     def public(self) -> dict:
@@ -369,6 +370,10 @@ class Gatherer:
                         measured_basis=prof.measured_basis if prof else "", window=window,
                         blocked=blocked,
                         has_reasoning_field=prof.has_reasoning_field if prof else None,
+                        billing_ratio=prof.billing_ratio if prof else None,
+                        billed_prompt=prof.billed_prompt if prof else None,
+                        billed_completion=prof.billed_completion if prof else None,
+                        billed_evidence=prof.billed_evidence if prof else "",
                         decode_tps=prof.decode_tps if prof else None,
                         emits=prof.emits if prof else None,
                         min_max_tokens=prof.min_max_tokens if prof else None,
@@ -380,12 +385,18 @@ class Gatherer:
                 st.price_source = "mixed" if len(sources) > 1 else (next(iter(sources), ""))
             mirrors = detect_mirrors({p: self._cat[p][1] for p in self.states if p in self._cat})
             excluded = set()
+            for st in self.states.values():
+                st.correlated_with = []
             for copy, (original, same) in mirrors.items():
                 st = self.states[copy]
                 if same < CORRELATED_SAME_PRICE:
                     continue                    # same open weights, independent host
                 st.mirror_of = original
                 st.same_price_share = round(same, 3)
+                st.correlated_with = sorted(set(st.correlated_with) | {original})
+                if original in self.states:
+                    o = self.states[original]
+                    o.correlated_with = sorted(set(o.correlated_with) | {copy})
                 if same >= MIRROR_SAME_PRICE and not self.cfg.allow_mirrors and st.state == "OK":
                     st.state = "MIRROR"
                     st.detail = ("mirror of %s: %.0f%% of shared models priced identically -- "
@@ -395,6 +406,8 @@ class Gatherer:
                     st.detail = ("CORRELATED with %s: shares its catalogue, own prices on %.0f%% "
                                  "of shared models -- not independent for fallback" % (
                                      original, 100 * (1 - same)))
+            out = [replace(c, correlated_with=tuple(self.states[c.provider].correlated_with))
+                   if self.states[c.provider].correlated_with else c for c in out]
             if excluded:
                 out = [c if c.provider not in excluded else
                        replace(c, provider_state="MIRROR",
@@ -464,6 +477,18 @@ class Gatherer:
                                      li.context_length, li.supports_tools, li.reasoning)
                 return li
         return None
+
+
+def card_cost(li: P.Listing | None, res: P.Result) -> Decimal | None:
+    """What this model's own rate card says the call cost."""
+    if li is None or li.prompt is None or li.completion is None \
+            or res.prompt_tokens is None or res.completion_tokens is None:
+        return None
+    p, c = money(li.prompt), money(li.completion)
+    cached = res.cached_tokens or 0
+    cached_rate = money(li.cached_prompt) if li.cached_prompt is not None else p
+    return ((res.prompt_tokens - cached) * p + cached * cached_rate
+            + res.completion_tokens * c) / Decimal(1_000_000)
 
 
 def call_cost(li: P.Listing | None, res: P.Result) -> tuple[Decimal | None, str]:

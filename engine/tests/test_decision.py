@@ -292,3 +292,53 @@ def test_ensemble_hook_picks_cheapest_per_family_only():
              _seat("c:meta/z", "0.3", "0.3", Emits.CONTENT), _seat("d:google/w", "0.4", "0.4", Emits.CONTENT)]
     got = [a.seat for a in decide_ensemble(Ask(prompt_tokens=10, max_tokens=10), seats, k=3)]
     assert got == ["a:qwen/x", "c:meta/z", "d:google/w"]
+
+
+def test_kimi_k3_has_no_single_cheapest_provider_it_depends_on_the_token_split():
+    """Measured 2026-09-26. Sail flex 1.25/6.25; Nous 1.0301/9.043 ($/M in/out, live API).
+    Nous wins iff 1.0301P + 9.043C < 1.25P + 6.25C, i.e. P/C > 2.793/0.2199 = 12.70."""
+    sail = _seat("sail:moonshotai/Kimi-K3", "1.25", "6.25", Emits.CONTENT, window="flex")
+    nous = _seat("nous:moonshotai/kimi-k3", "1.0301", "9.043", Emits.CONTENT)
+    rag = Ask(prompt_tokens=20000, max_tokens=1000, answer_tokens=1000, lane="batch")    # 20:1
+    gen = Ask(prompt_tokens=2000, max_tokens=2000, answer_tokens=2000, lane="batch")     # 1:1
+    assert decide(rag, [sail, nous]).seat == "nous:moonshotai/kimi-k3"
+    assert decide(gen, [sail, nous]).seat == "sail:moonshotai/Kimi-K3"
+    by = {a.seat: a.expected_usd for a in decide(rag, [sail, nous]).considered}
+    assert by["nous:moonshotai/kimi-k3"] == D("0.029645")         # (20000*1.0301 + 1000*9.043)/1e6
+    assert by["sail:moonshotai/Kimi-K3"] == D("0.03125")          # (20000*1.25 + 1000*6.25)/1e6
+    near = Ask(prompt_tokens=12700, max_tokens=1000, answer_tokens=1000, lane="batch")    # the knee
+    a = {x.seat: x.expected_usd for x in decide(near, [sail, nous]).considered}
+    assert abs(a["nous:moonshotai/kimi-k3"] - a["sail:moonshotai/Kimi-K3"]) < D("0.00001")
+
+
+def test_upstream_fault_takes_out_correlated_providers_not_just_the_one_that_failed():
+    orr = _seat("openrouter:m", "0.10", "0.10", Emits.CONTENT, correlated_with=("nous",))
+    nous = _seat("nous:m", "0.05", "0.05", Emits.CONTENT, correlated_with=("openrouter",))
+    indep = _seat("ionet:m", "0.20", "0.20", Emits.CONTENT)
+    ask = Ask(prompt_tokens=10, max_tokens=10)
+    assert decide(ask, [orr, nous, indep]).seat == "nous:m"              # cheaper, yes
+    after = replace(ask, upstream_down=(("nous", "HTTP 502 bad gateway"),))
+    ch = decide(after, [orr, nous, indep])
+    assert ch.seat == "ionet:m"                                           # redundant, no
+    why = {a.seat: a.because for a in ch.considered}["openrouter:m"]
+    assert "correlated with nous" in why and "not an independent second chance" in why
+
+
+def test_billed_provider_keeps_the_card_split_scaled_by_its_measured_billing_ratio():
+    nous = _seat("nous:moonshotai/kimi-k3", "1.0301", "9.043", Emits.CONTENT,
+                 measured_usd_per_mtok=D("3.0"), measured_basis="billed", billing_ratio=D("1.1"))
+    a = assess(Ask(prompt_tokens=20000, max_tokens=1000, answer_tokens=1000), nous)
+    assert a.expected_usd == D("0.029645") * D("1.1")        # split preserved, then scaled
+    assert "x1.1 billed/card measured" in a.price_basis
+
+
+def test_kimi_k3_with_nous_billed_rates_sail_flex_wins_every_split():
+    sail = _seat("sail:moonshotai/Kimi-K3", "1.25", "6.25", Emits.CONTENT, window="flex")
+    nous = _seat("nous:moonshotai/kimi-k3", "1.0301", "9.043", Emits.CONTENT,
+                 billed_prompt=D("3"), billed_completion=D("15"),
+                 billed_evidence="solved from 4 billed calls")
+    for p, c in ((20000, 1000), (2000, 2000), (100000, 100)):
+        ch = decide(Ask(prompt_tokens=p, max_tokens=c, answer_tokens=c, lane="batch"), [sail, nous])
+        assert ch.seat == "sail:moonshotai/Kimi-K3"
+    why = {a.seat: a.price_basis for a in ch.considered}["nous:moonshotai/kimi-k3"]
+    assert "billed rates 3/15 per M (solved from 4 billed calls)" in why

@@ -118,6 +118,10 @@ class Candidate:
     price_source: str = ""                      # dashboard | provider-catalogue
     measured_usd_per_mtok: Decimal | None = None  # cost / tokens, from this model's own calls
     measured_basis: str = ""                    # billed | computed | billed+computed
+    billing_ratio: Decimal | None = None        # billed / rate card on this model's own calls
+    billed_prompt: Decimal | None = None        # $/M actually charged, solved from its bills
+    billed_completion: Decimal | None = None
+    billed_evidence: str = ""
     window: str | None = None                   # provider scheduling window priced for this lane
     # Behaviour, from probes.
     emits: Emits | None = None
@@ -130,6 +134,9 @@ class Candidate:
     blocked: str = ""                           # a model-level refusal known before calling
     load_factor: float = 1.0                    # latency multiplier at the provider's current load
     in_flight: int = 0
+    # Providers that share this one's upstream (e.g. Nous resells OpenRouter's catalogue):
+    # cheaper is possible, redundant is not -- one upstream fault takes both out.
+    correlated_with: tuple[str, ...] = ()
     probe_age_s: float | None = None
     latency_s: float | None = None              # a SHORT call: connection + prefill + first token
 
@@ -144,6 +151,7 @@ class Ask:
     ceiling_usd_per_mtok: Decimal | None = None  # refuse anything dearer than this
     only_seat: str | None = None                # client named a model: judge only that one
     failed: tuple[tuple[str, str], ...] = ()    # (seat, why) already tried for THIS request
+    upstream_down: tuple[tuple[str, str], ...] = ()  # (provider, why): an upstream fault seen now
     allow_free: bool = False                    # free tiers may log prompts; separate quotas
     # LANE: interactive (someone is waiting) | background | batch (nobody is waiting).
     # Only the interactive lane gates on measured latency; the others buy cheaper, slower
@@ -244,16 +252,30 @@ def _cost(ask: Ask, c: Candidate, completion: int) -> tuple[Decimal | None, Deci
     oh = c.reasoning_overhead_tokens or 0
     tokens = ask.prompt_tokens + completion + oh
     measured = money(c.measured_usd_per_mtok)
-    if measured is not None and "billed" in c.measured_basis:
-        return measured * tokens / _M, measured, "measured, billed"
     p, co = money(c.list_prompt), money(c.list_completion)
+    ratio = money(c.billing_ratio)
+    bp, bc = money(c.billed_prompt), money(c.billed_completion)
+    if bp is not None and bc is not None:
+        # The bill beats the advertisement: rates solved from this model's own charges.
+        p, co, ratio = bp, bc, None
+        solved = "billed rates %s/%s per M (%s)" % (bp.normalize(), bc.normalize(),
+                                                     c.billed_evidence or "solved")
+    else:
+        solved = ""
+    if measured is not None and "billed" in c.measured_basis and ratio is None and not solved:
+        # Billed, but no billed-vs-card ratio measured yet: the blended billed price is the
+        # truest number available (calls recorded from now on carry the card cost too).
+        return measured * tokens / _M, measured, "measured, billed"
     if p is not None and co is not None:
         warm = min(dict(ask.warm).get(c.seat, 0), ask.prompt_tokens)
         cached = money(c.list_cached)
         if not warm or cached is None:
             warm, cached = 0, p
         exp = ((ask.prompt_tokens - warm) * p + warm * cached + (completion + oh) * co) / _M
-        basis = "rate card" + (" " + c.window if c.window else "")
+        basis = solved or "rate card" + (" " + c.window if c.window else "")
+        if ratio is not None and ratio != 1:
+            exp = exp * ratio
+            basis += " x%.3g billed/card measured" % ratio
         if warm:
             basis += ", %d prompt tokens warm in its cache" % warm
         return exp, exp / tokens * _M, basis
@@ -272,6 +294,12 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
     for seat, why in ask.failed:
         if seat == c.seat:
             return out(Verdict.EXCLUDED, "already failed for this request: " + why)
+    for provider, why in ask.upstream_down:
+        if provider == c.provider:
+            return out(Verdict.EXCLUDED, "provider failed upstream on this request: " + why)
+        if provider in c.correlated_with:
+            return out(Verdict.EXCLUDED, "correlated with %s, which just failed upstream (%s): "
+                       "not an independent second chance" % (provider, why))
     if c.provider_state != "OK":
         return out(Verdict.EXCLUDED, "provider %s%s" % (
             c.provider_state, (": " + c.provider_detail) if c.provider_detail else ""))

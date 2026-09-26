@@ -114,7 +114,7 @@ might have been cheaper — and counts the rest in `facts.unknown_not_listed`.
 the model spent the budget reasoning and returned nothing.
 
 ### Candidate (roster seat)
-`{seat, provider, model, provider_state:"OK|NO_KEY|BLOCKED|QUOTA_EXHAUSTED|UNAVAILABLE|AT_CAPACITY|CATALOGUE_FAILED", blocked, has_reasoning_field|null, decode_tps|null, window|null, provider_detail, available, context_length|null, supports_tools|null, list_prompt|null, list_completion|null, price_source:"dashboard|provider-catalogue", measured_usd_per_mtok|null, emits:"content|reasoning_then_content|reasoning_only"|null, min_max_tokens|null, floor_evidence, reasoning_overhead_tokens|null, probe_age_s|null, latency_s|null}`
+`{seat, provider, model, provider_state:"OK|NO_KEY|BLOCKED|QUOTA_EXHAUSTED|UNAVAILABLE|AT_CAPACITY|CATALOGUE_FAILED", blocked, has_reasoning_field|null, decode_tps|null, window|null, correlated_with[], billed_prompt|null, billed_completion|null, billed_evidence, billing_ratio|null, provider_detail, available, context_length|null, supports_tools|null, list_prompt|null, list_completion|null, price_source:"dashboard|provider-catalogue", measured_usd_per_mtok|null, emits:"content|reasoning_then_content|reasoning_only"|null, min_max_tokens|null, floor_evidence, reasoning_overhead_tokens|null, probe_age_s|null, latency_s|null}`
 
 Prices are USD per million tokens.
 
@@ -131,6 +131,8 @@ UNAVAILABLE never implicates the key; do not rotate credentials over it.
 
 ### ProviderState
 `{provider, key, state:"…|MIRROR", detail, mirror_of, same_price_share|null, until|null, models, price_source, ratelimit:{header:value}, free_quota_until|null, in_flight, max_concurrency|null, concurrency_source}`
+
+`correlated_with` lists providers that share this one's upstream (both directions).
 
 `max_concurrency` is the largest concurrency the provider completed with zero failures (imported
 or configured); at the cap the provider is `AT_CAPACITY` and routes go elsewhere. Slots are reserved

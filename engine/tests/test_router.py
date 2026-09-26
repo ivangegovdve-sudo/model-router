@@ -406,3 +406,40 @@ def test_same_open_weights_at_independent_prices_is_not_correlation(app):
     from modelrouter.gather import detect_mirrors, CORRELATED_SAME_PRICE
     share = detect_mirrors({p: v[1] for p, v in g._cat.items()})["akashml"][1]
     assert share < CORRELATED_SAME_PRICE     # same ids, own prices: independent host
+
+
+def test_gateway_502_marks_the_provider_down_for_the_rest_of_the_request(app):
+    client, up = app
+    client.post("/router/probe", json={"cheapest": 3})
+    orig = up.__call__
+    def gw(provider, model, key, req, *, max_tokens, timeout=180, window=None):
+        if model.startswith("meta-llama"):
+            return P.Result(False, 502, provider, model, detail="HTTP 502 bad gateway", scope="model")
+        return orig(provider, model, key, req, max_tokens=max_tokens, timeout=timeout, window=window)
+    P.call = gw
+    r = chat(client, max_tokens=16)
+    assert r.status_code == 502                    # the only other provider is the same one
+    d = client.get("/router/decisions/" + r.json()["error"]["decision_id"]).json()
+    assert "provider failed upstream on this request" in json.dumps(d["choice"])
+
+
+def test_billed_rates_are_solved_from_the_bills_not_taken_from_the_advertisement(tmp_path):
+    """Nous, 2026-09-26: advertised Kimi-K3 at $1.03/$9.04 per M; the bills solve to $3/$15."""
+    s = Store(tmp_path / "s.db")
+    for p, c, usd in ((92, 46, "0.000966"), (92, 32, "0.000756")):
+        s.observe("nous:moonshotai/kimi-k3", "probe", max_tokens=256, status=200, content_chars=5,
+                  reasoning_chars=100, tool_calls=0, prompt_tokens=p, completion_tokens=c,
+                  cached_tokens=0, cost_usd=Decimal(usd), cost_basis="billed", latency_s=1.0,
+                  detail="", card_usd=Decimal("0.0005107472"))
+    prof = s.profiles()["nous:moonshotai/kimi-k3"]
+    assert (prof.billed_prompt, prof.billed_completion) == (Decimal("3.0000"), Decimal("15.0000"))
+    assert prof.billed_evidence == "solved from 2 billed calls"
+
+
+def test_one_shape_of_call_cannot_separate_the_two_rates(tmp_path):
+    s = Store(tmp_path / "s.db")
+    for _ in range(3):
+        s.observe("x:m", "probe", max_tokens=16, status=200, content_chars=5, reasoning_chars=0,
+                  tool_calls=0, prompt_tokens=20, completion_tokens=2, cached_tokens=0,
+                  cost_usd=Decimal("0.0000004"), cost_basis="billed", latency_s=1.0, detail="")
+    assert s.profiles()["x:m"].billed_prompt is None

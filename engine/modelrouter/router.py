@@ -18,7 +18,7 @@ from typing import Callable, Iterator
 from . import providers as P
 from .config import Config
 from .decision import Ask, Choice, Outcome, decide, is_free
-from .gather import Gatherer, call_cost
+from .gather import Gatherer, call_cost, card_cost
 from .secrets import Keyring
 from .store import Store
 
@@ -122,7 +122,9 @@ class Router:
 
     def _observe(self, seat: str, source: str, max_tokens: int | None, res: P.Result,
                  window: str | None = None) -> tuple:
-        usd, basis = call_cost(self.gather.listing(seat, window), res)
+        li = self.gather.listing(seat, window)
+        usd, basis = call_cost(li, res)
+        card = card_cost(li, res)
         if window not in (None, "asap"):
             # A call scheduled in a slow window says nothing about interactive latency.
             res.latency_s = 0.0
@@ -134,7 +136,7 @@ class Router:
                                completion_tokens=res.completion_tokens,
                                cached_tokens=res.cached_tokens, cost_usd=usd, cost_basis=basis,
                                latency_s=res.latency_s, detail=res.detail,
-                               reasoning_field=res.reasoning_field)
+                               reasoning_field=res.reasoning_field, card_usd=card)
         self.gather.note_ratelimit(res.provider, res.ratelimit)
         if not res.ok and res.status != 200:
             self.gather.penalise(res.provider, res.model, res.scope, res.detail, res.ratelimit)
@@ -219,6 +221,13 @@ class Router:
                 ask = replace(ask, failed=ask.failed + ((choice.seat, res.detail),))
             else:
                 ask = replace(ask, escalate=ask.escalate + (choice.seat,))
+            # An UPSTREAM fault (unreachable, CDN, timeout, 5xx) -- not an account refusal,
+            # which is per-account (OpenRouter's budget 403 never stopped Nous) -- takes out
+            # every provider that shares the upstream. Retrying on a correlated provider is
+            # the same bet twice.
+            # A plain 500 is usually the one model; gateway codes are the upstream.
+            if res.scope in ("transport", "edge") or res.status in (502, 503, 504) or                     (res.status == 0 and "timeout" in res.detail):
+                ask = replace(ask, upstream_down=ask.upstream_down + ((provider, res.detail),))
         assert choice is not None
         answered = bool(res and res.ok)
         status = "ANSWERED" if answered else ("ABSTAINED" if choice.abstained and not attempts

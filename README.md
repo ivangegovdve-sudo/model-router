@@ -42,6 +42,18 @@ concurrency it survives; context length; lane; and prompt-cache warmth — a con
 seat is priced with its cache-read rate, so staying put wins exactly when it is cheaper
 (session = `X-Router-Session` or the OpenAI `user` field).
 
+**The bill beats the advertisement.** For providers that report a charge per call, the router
+solves each model's actual input and output rates from its own bills (two calls with different
+splits pin both). On the `nous-fleet` key, Nous advertises Kimi-K3 at $1.03 / $9.04 per M (API and
+portal agree) and bills $3.00 / $15.00 — OpenRouter's list. Priced on the bill, Sail's flex window
+wins Kimi-K3 at every token split; priced on the advertisement, a 20:1 job would have gone to Nous
+and been billed ~1.5× the estimate.
+
+**Correlated providers are cheaper, not redundant.** `correlated_with` is explicit on providers and
+seats; after an upstream fault (unreachable, CDN, timeout, 502/503/504) every correlated provider is
+ruled out for the rest of the request. An account refusal is per-account and does not propagate —
+OpenRouter's budget 403 never stopped Nous.
+
 Catalogues, pricing pages and context pages refresh out of band every 4 minutes; the decision
 itself is a lookup plus a comparison — measured 17–24 ms over ~1,000 seats, no network, no model.
 
