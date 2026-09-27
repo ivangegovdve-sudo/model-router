@@ -1,0 +1,29 @@
+[Unit]
+Description=modelrouter - OpenAI-compatible proxy that decides on cost per completed answer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=modelrouter
+Group=modelrouter
+WorkingDirectory=/opt/modelrouter
+# Delivery, not the vault: provider keys and the operator token, rendered from GCP Secret
+# Manager at deploy time by deploy.sh (root:root 600). Rotate in SM, then re-run deploy.sh.
+EnvironmentFile=/etc/modelrouter.env
+Environment=MODELROUTER_CONFIG=/opt/modelrouter/config.toml
+Environment=MODELROUTER_STATE=/var/lib/modelrouter
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/modelrouter/venv/bin/modelrouter serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/modelrouter
+StateDirectory=modelrouter
+MemoryMax=600M
+
+[Install]
+WantedBy=multi-user.target
