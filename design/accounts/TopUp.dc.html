@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Confirm top-up</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0b0e10;font-family:"IBM Plex Sans",system-ui,sans-serif;color:#e7ebe9}
+a{color:#d4f36a;text-decoration:none}a:hover{color:#e6fb9e}
+.num{font-family:"IBM Plex Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums}
+</style>
+</helmet>
+<div style="width: 1440px; height: 900px; box-sizing: border-box; padding: 40px 56px; display: flex; flex-direction: column; gap: 40px; background: #0b0e10;">
+  <header style="display: flex; align-items: center; justify-content: space-between;">
+    <div style="display: flex; align-items: center; gap: 10px;">
+      <svg width="26" height="26" viewBox="0 0 26 26" fill="none" aria-hidden="true"><rect x="1" y="1" width="24" height="24" rx="6" stroke="#d4f36a" stroke-width="1.6"></rect><path d="M7 17 L11 10 L15 14 L19 8" stroke="#d4f36a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+      <span style="font-family: 'Bricolage Grotesque', sans-serif; font-size: 19px; font-weight: 700; color: #f2f5f3;">modelrouter</span>
+    </div>
+    <a href="#" style="font-size: 14px; color: #a3aeb3;">Back to overview</a>
+  </header>
+
+  <div style="display: flex; gap: 12px; align-items: center; font-size: 13px;">
+    <span style="display: flex; align-items: center; gap: 8px; color: #93a0a6;"><span style="width: 22px; height: 22px; border-radius: 4px; background: #1b2225; display: flex; align-items: center; justify-content: center;"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M2.5 6.2 L5 8.5 L9.5 3.5" stroke="#d4f36a" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path></svg></span>Amount</span>
+    <span style="width: 40px; height: 1px; background: #2a3338;"></span>
+    <span style="display: flex; align-items: center; gap: 8px; color: #f2f5f3; font-weight: 500;"><span style="width: 22px; height: 22px; border-radius: 4px; border: 1.5px solid #d4f36a; box-sizing: border-box;"></span>Payment</span>
+    <span style="width: 40px; height: 1px; background: #2a3338;"></span>
+    <span style="display: flex; align-items: center; gap: 8px; color: #93a0a6;"><span style="width: 22px; height: 22px; border-radius: 4px; border: 1px solid #2a3338; box-sizing: border-box;"></span>Credited</span>
+  </div>
+
+  <div style="display: flex; gap: 32px; align-items: flex-start;">
+    <section style="flex-grow: 1; box-sizing: border-box; padding: 32px; border: 1px solid #1f262a; border-radius: 10px; background: #111618; display: flex; flex-direction: column; gap: 24px;">
+      <h1 style="margin: 0; font-family: 'Bricolage Grotesque', sans-serif; font-size: 30px; font-weight: 600; letter-spacing: -0.4px; color: #f2f5f3;">Pay for your top-up</h1>
+      <div style="box-sizing: border-box; min-height: 300px; border: 1.5px dashed #2f3a40; border-radius: 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 32px; text-align: center;">
+        <svg width="40" height="40" viewBox="0 0 40 40" fill="none" aria-hidden="true"><rect x="4" y="9" width="32" height="22" rx="4" stroke="#7f8f97" stroke-width="1.8"></rect><path d="M4 16 H36" stroke="#7f8f97" stroke-width="1.8"></path><path d="M10 24 H18" stroke="#7f8f97" stroke-width="1.8" stroke-linecap="round"></path></svg>
+        <span style="font-size: 16px; color: #dfe5e2; font-weight: 500;">[Payment provider form]</span>
+        <span style="font-size: 14px; color: #93a0a6; max-width: 420px;">Card or wallet entry appears here once a payment provider is connected. In this version the step is a stub.</span>
+      </div>
+      <div style="display: flex; gap: 12px;">
+        <button type="button" style="height: 48px; padding: 0 24px; border: 0; border-radius: 6px; background: #d4f36a; color: #0b0e10; font-family: 'IBM Plex Sans', sans-serif; font-size: 15px; font-weight: 600; cursor: pointer;">Pay $25.00</button>
+        <button type="button" style="height: 48px; padding: 0 20px; border: 1px solid #2a3338; border-radius: 6px; background: transparent; color: #dfe5e2; font-family: 'IBM Plex Sans', sans-serif; font-size: 15px; cursor: pointer;">Change amount</button>
+      </div>
+    </section>
+
+    <aside style="width: 420px; flex-shrink: 0; box-sizing: border-box; padding: 28px; border: 1px solid #1f262a; border-radius: 10px; background: #111618; display: flex; flex-direction: column; gap: 18px;">
+      <h2 style="margin: 0; font-family: 'Bricolage Grotesque', sans-serif; font-size: 20px; font-weight: 600; color: #f2f5f3;">Summary</h2>
+      <div style="display: flex; justify-content: space-between; font-size: 14px;"><span style="color: #a3aeb3;">Current balance</span><span class="num" style="color: #dfe5e2;">$24.61</span></div>
+      <div style="display: flex; justify-content: space-between; font-size: 14px;"><span style="color: #a3aeb3;">Top-up</span><span class="num" style="color: #dfe5e2;">+ $25.00</span></div>
+      <div style="display: flex; justify-content: space-between; font-size: 14px;"><span style="color: #a3aeb3;">Fees</span><span class="num" style="color: #dfe5e2;">[FEE]</span></div>
+      <div style="height: 1px; background: #1f262a;"></div>
+      <div style="display: flex; justify-content: space-between; align-items: baseline;"><span style="font-size: 14px; color: #a3aeb3;">New balance</span><span class="num" style="font-size: 30px; color: #f5f8f6;">$49.61</span></div>
+      <p style="margin: 0; font-size: 13px; line-height: 1.5; color: #93a0a6;">Credit is added to your key's spend limit the moment payment clears, so your next call can use it immediately.</p>
+      <span style="font-size: 12px; color: #93a0a6;">[Expiry and refund terms]</span>
+    </aside>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>
