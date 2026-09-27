@@ -55,9 +55,12 @@ PROJECT="$1"; shift 1
 id modelrouter >/dev/null 2>&1 || sudo useradd --system --home /opt/modelrouter --shell /sbin/nologin modelrouter
 sudo mkdir -p /opt/modelrouter /var/lib/modelrouter
 [ -x /opt/modelrouter/venv/bin/python ] || sudo python3.11 -m venv /opt/modelrouter/venv
-rm -rf /tmp/modelrouter-src && mkdir -p /tmp/modelrouter-src && tar -xzf /tmp/modelrouter-src.tar.gz -C /tmp/modelrouter-src
+# pip runs as root and writes build/ and *.egg-info into the source tree, so the tree is
+# root-owned afterwards: clean it up with sudo, before and after (a previous run may have
+# left one behind).
+sudo rm -rf /tmp/modelrouter-src && mkdir -p /tmp/modelrouter-src && tar -xzf /tmp/modelrouter-src.tar.gz -C /tmp/modelrouter-src
 sudo /opt/modelrouter/venv/bin/pip install -q --upgrade /tmp/modelrouter-src/engine
-rm -rf /tmp/modelrouter-src /tmp/modelrouter-src.tar.gz
+sudo rm -rf /tmp/modelrouter-src /tmp/modelrouter-src.tar.gz
 sudo mv /tmp/modelrouter-config.toml /opt/modelrouter/config.toml
 sudo mv /tmp/modelrouter.service /etc/systemd/system/modelrouter.service
 # Render the delivery file. Values go gcloud -> shell variable -> sudo tee (stdout to
