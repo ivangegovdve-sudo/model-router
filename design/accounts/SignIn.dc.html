@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sign in</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0b0e10;font-family:"IBM Plex Sans",system-ui,sans-serif;color:#e7ebe9}
+a{color:#d4f36a;text-decoration:none}a:hover{color:#e6fb9e}
+</style>
+</helmet>
+<div style="width: 1440px; height: 900px; box-sizing: border-box; display: flex; background: #0b0e10;">
+  <section style="width: 640px; box-sizing: border-box; padding: 56px 64px; display: flex; flex-direction: column; justify-content: space-between; background: #0d1113; border-right: 1px solid #1c2226;">
+    <div style="display: flex; align-items: center; gap: 10px;">
+      <svg width="28" height="28" viewBox="0 0 26 26" fill="none" aria-hidden="true"><rect x="1" y="1" width="24" height="24" rx="6" stroke="#d4f36a" stroke-width="1.6"></rect><path d="M7 17 L11 10 L15 14 L19 8" stroke="#d4f36a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+      <span style="font-family: 'Bricolage Grotesque', sans-serif; font-size: 20px; font-weight: 700; color: #f2f5f3;">modelrouter</span>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 28px;">
+      <h1 style="margin: 0; font-family: 'Bricolage Grotesque', sans-serif; font-size: 52px; line-height: 1.05; font-weight: 600; letter-spacing: -1.2px; color: #f2f5f3;">Top up once.<br>Every call draws down what it actually cost.</h1>
+      <div style="display: flex; flex-direction: column; gap: 14px; font-size: 15px; color: #b3bdc1;">
+        <div style="display: flex; gap: 12px; align-items: flex-start;"><span style="width: 8px; height: 8px; margin-top: 7px; background: #d4f36a; border-radius: 2px; flex-shrink: 0;"></span><span>One OpenAI-compatible endpoint. The router picks the model that answers for the least.</span></div>
+        <div style="display: flex; gap: 12px; align-items: flex-start;"><span style="width: 8px; height: 8px; margin-top: 7px; background: #d4f36a; border-radius: 2px; flex-shrink: 0;"></span><span>Your balance is a hard ceiling. A call that could overrun it is refused before anything is spent.</span></div>
+        <div style="display: flex; gap: 12px; align-items: flex-start;"><span style="width: 8px; height: 8px; margin-top: 7px; background: #d4f36a; border-radius: 2px; flex-shrink: 0;"></span><span>Every answer shows which model gave it and what it cost.</span></div>
+      </div>
+    </div>
+    <span style="font-size: 13px; color: #93a0a6;">[Company name and legal links]</span>
+  </section>
+
+  <section style="flex-grow: 1; display: flex; align-items: center; justify-content: center;">
+    <form style="width: 400px; display: flex; flex-direction: column; gap: 22px;">
+      <div style="display: flex; border: 1px solid #242c31; border-radius: 6px; overflow: hidden;">
+        <button type="button" aria-pressed="true" style="flex-grow: 1; height: 44px; border: 0; background: #1b2225; color: #f2f5f3; font-family: 'IBM Plex Sans', sans-serif; font-size: 14px; font-weight: 500; cursor: pointer;">Sign in</button>
+        <button type="button" aria-pressed="false" style="flex-grow: 1; height: 44px; border: 0; border-left: 1px solid #242c31; background: transparent; color: #a3aeb3; font-family: 'IBM Plex Sans', sans-serif; font-size: 14px; cursor: pointer;">Create account</button>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 6px;">
+        <h2 style="margin: 0; font-family: 'Bricolage Grotesque', sans-serif; font-size: 28px; font-weight: 600; color: #f2f5f3;">Welcome back</h2>
+        <p style="margin: 0; font-size: 14px; color: #a3aeb3;">Sign in to see your balance and usage.</p>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <label for="email" style="font-size: 13px; color: #b3bdc1;">Email</label>
+        <input id="email" type="email" autocomplete="email" value="sample@example.com" style="height: 46px; box-sizing: border-box; padding: 0 14px; border: 1px solid #2a3338; border-radius: 6px; background: #0d1214; color: #f2f5f3; font-family: 'IBM Plex Sans', sans-serif; font-size: 15px;">
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <div style="display: flex; justify-content: space-between;">
+          <label for="password" style="font-size: 13px; color: #b3bdc1;">Password</label>
+          <a href="#" style="font-size: 13px;">Forgot password</a>
+        </div>
+        <input id="password" type="password" autocomplete="current-password" value="samplepassword" style="height: 46px; box-sizing: border-box; padding: 0 14px; border: 1.5px solid #d4f36a; border-radius: 6px; background: #0d1214; color: #f2f5f3; font-family: 'IBM Plex Sans', sans-serif; font-size: 15px;">
+      </div>
+      <button type="submit" style="height: 48px; border: 0; border-radius: 6px; background: #d4f36a; color: #0b0e10; font-family: 'IBM Plex Sans', sans-serif; font-size: 15px; font-weight: 600; cursor: pointer;">Sign in</button>
+      <p style="margin: 0; font-size: 13px; color: #93a0a6; text-align: center;">New here? <a href="#">Create an account</a>. You start at $0 and top up when you're ready.</p>
+    </form>
+  </section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>
