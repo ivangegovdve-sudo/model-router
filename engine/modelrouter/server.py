@@ -29,7 +29,10 @@ from starlette.concurrency import run_in_threadpool
 
 from . import __version__
 from .config import Config, load
-from .router import LANES, Router, lane_of
+from decimal import Decimal
+
+from .clientkeys import ClientKeys, Refusal, worst_case
+from .router import LANES, MAX_ATTEMPTS, Router, estimate_tokens, lane_of
 from .secrets import Keyring
 from .store import Store
 
@@ -63,6 +66,8 @@ def build(cfg: Config) -> FastAPI:
                          cfg.gcp_project)
     app = FastAPI(title="modelrouter", version=__version__)
     app.state.router = router
+    client_keys = ClientKeys(cfg.state_dir / "modelrouter.sqlite3")
+    app.state.client_keys = client_keys
 
     @app.on_event("startup")
     async def _threads() -> None:
@@ -77,14 +82,31 @@ def build(cfg: Config) -> FastAPI:
         if cfg.secrets:
             router.gather.start_refresher()
 
-    def auth(authorization: str | None = Header(default=None)) -> None:
-        if cfg.no_auth:
-            return
-        want = token_keys.get("_token")
+    def principal(authorization: str | None = Header(default=None)):
+        """Who is calling: ("client", ClientKey) for a caller key, ("admin", None) for the
+        operator's router token (or anyone, on a no_auth loopback bind)."""
         got = (authorization or "").removeprefix("Bearer ").strip()
+        if got.startswith("mr_"):
+            key = client_keys.authenticate(got)
+            if key is None:
+                raise HTTPException(401, "invalid caller key", headers={"WWW-Authenticate": "Bearer"})
+            if key.revoked:
+                raise HTTPException(401, "this key has been revoked",
+                                    headers={"WWW-Authenticate": "Bearer"})
+            return ("client", key)
+        if cfg.no_auth:
+            return ("admin", None)
+        want = token_keys.get("_token")
         if not want or not got or not pysecrets.compare_digest(got.encode(), want.encode()):
             raise HTTPException(401, "invalid or missing router token",
                                 headers={"WWW-Authenticate": "Bearer"})
+        return ("admin", None)
+
+    def auth(who=Depends(principal)) -> None:
+        """Operator-only routes: probes spend money, decisions show every caller's traffic."""
+        if who[0] != "admin":
+            raise HTTPException(403, "caller keys can use /v1/chat/completions, /v1/models and "
+                                     "/v1/usage only")
 
     def ceiling(h: str | None) -> float | None:
         if not h:
@@ -123,7 +145,15 @@ def build(cfg: Config) -> FastAPI:
     def router_setup():
         return setup()
 
-    @app.get("/v1/models", dependencies=[Depends(auth)])
+    @app.get("/v1/usage")
+    def usage(who=Depends(principal)):
+        """A caller key's own spend: cap, spent, remaining, recent charges."""
+        if who[0] != "client":
+            raise HTTPException(400, "usage is per caller key; the operator reads /router/*")
+        key = client_keys.get(who[1].id)
+        return {**key.public(), "recent_charges": client_keys.charges(key.id, 20)}
+
+    @app.get("/v1/models", dependencies=[Depends(principal)])
     def models():
         seats = router.gather.roster()
         data = [{"id": "auto" if lane == "interactive" else "auto:" + lane, "object": "model",
@@ -190,8 +220,9 @@ def build(cfg: Config) -> FastAPI:
     def observations(seat: str):
         return store.observations(seat)
 
-    @app.post("/v1/chat/completions", dependencies=[Depends(auth)])
-    async def chat(request: Request, user_agent: str | None = Header(default=None),
+    @app.post("/v1/chat/completions")
+    async def chat(request: Request, who=Depends(principal),
+                   user_agent: str | None = Header(default=None),
                    x_router_max_usd_per_m: str | None = Header(default=None),
                    x_router_lane: str | None = Header(default=None),
                    x_router_session: str | None = Header(default=None),
@@ -205,6 +236,23 @@ def build(cfg: Config) -> FastAPI:
             return _error(400, "invalid_request", "`messages` must be a non-empty list")
         lim = ceiling(x_router_max_usd_per_m)
         client = (user_agent or "")[:80]
+        key, held = None, Decimal(0)
+        if who[0] == "client":
+            key = who[1]
+            client = "key:%s" % key.id
+            # A caller key never runs open-ended: an unset budget gets the key's default,
+            # and the price ceiling is the key's, however high the caller asks for.
+            if req.get("max_tokens") is None and req.get("max_completion_tokens") is None:
+                req["max_tokens"] = key.default_max_tokens
+            key_lim = float(key.max_usd_per_mtok)
+            lim = key_lim if lim is None else min(lim, key_lim)
+            budget = int(req.get("max_completion_tokens") or req.get("max_tokens"))
+            try:
+                held = client_keys.reserve(key, worst_case(
+                    estimate_tokens(req), budget, 1024 if cfg.clamp_max_tokens else 0,
+                    MAX_ATTEMPTS, key.max_usd_per_mtok))
+            except Refusal as r:
+                return _error(r.status, r.code, r.message)
         try:
             lane = lane_of(req, x_router_lane)
         except ValueError as exc:
@@ -221,7 +269,11 @@ def build(cfg: Config) -> FastAPI:
                 lambda: router.route_stream(req, client=client, ceiling=lim, lane=lane,
                                             session=session, answer_tokens=answer))
             if it is None:
+                if key:
+                    client_keys.release(key, held)
                 return _abstain(routed)
+            if key:
+                it = _settling(it, key, held, routed)
             return StreamingResponse(it, media_type="text/event-stream",
                                      headers={"X-Router-Decision": routed.decision_id,
                                               "X-Router-Seat": routed.choice.seat or "",
@@ -229,6 +281,13 @@ def build(cfg: Config) -> FastAPI:
         routed = await run_in_threadpool(lambda: router.route(req, client=client, ceiling=lim,
                                                                  lane=lane, session=session,
                                                                  answer_tokens=answer))
+        charged = None
+        if key:
+            if not routed.doc["attempts"]:
+                client_keys.release(key, held)          # nothing was called: nothing to pay
+            else:
+                charged = client_keys.settle(key, held, _exact(routed.doc), routed.decision_id,
+                                             routed.doc["result"]["cost_basis"] or "unknown")
         if routed.status == "ABSTAINED":
             return _abstain(routed)
         res = routed.result
@@ -244,8 +303,30 @@ def build(cfg: Config) -> FastAPI:
                           "cost_usd": routed.doc["result"]["cost_usd"],
                           "cost_basis": routed.doc["result"]["cost_basis"],
                           "attempts": len(routed.doc["attempts"])}
-        return JSONResponse(body, headers={"X-Router-Decision": routed.decision_id,
-                                           "X-Router-Seat": routed.choice.seat or ""})
+        headers = {"X-Router-Decision": routed.decision_id,
+                   "X-Router-Seat": routed.choice.seat or ""}
+        if key:
+            left = client_keys.get(key.id)
+            body["router"]["charged_usd"] = str(charged)
+            body["router"]["key_remaining_usd"] = str(left.remaining)
+            headers["X-Router-Key-Charged"] = str(charged)
+            headers["X-Router-Key-Remaining"] = str(left.remaining)
+        return JSONResponse(body, headers=headers)
+
+    def _exact(doc: dict):
+        r = doc.get("result") or {}
+        if r.get("calls_unknown_cost"):
+            return None                    # charged at the reservation, the worst case
+        v = r.get("cost_usd_exact")
+        return Decimal(v) if v is not None else None
+
+    def _settling(it, key, held, routed):
+        try:
+            yield from it
+        finally:
+            # providers.stream records the result before this runs (its own finally).
+            client_keys.settle(key, held, _exact(routed.doc), routed.decision_id,
+                               (routed.doc.get("result") or {}).get("cost_basis") or "unknown")
 
     def _abstain(routed) -> JSONResponse:
         ch = routed.choice

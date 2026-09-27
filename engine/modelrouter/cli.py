@@ -112,6 +112,74 @@ def cmd_probe(a) -> int:
     return 0
 
 
+def _store_key_value(cfg, target: str, value: str) -> str:
+    """Hand a new caller key to the operator's secret store. The value goes over stdin or
+    into a file the operator chose; it is never printed, logged or put on a command line."""
+    import os
+    import subprocess
+    kind, _, where = target.partition(":")
+    if kind == "gcp":
+        if not cfg.gcp_project:
+            raise SystemExit("secrets.gcp_project is not set in the config")
+        exe = shutil.which("gcloud")
+        if not exe:
+            raise SystemExit("gcloud not installed")
+        r = subprocess.run([exe, "secrets", "create", where, "--replication-policy=automatic",
+                            "--project=" + cfg.gcp_project, "--data-file=-"],
+                           input=value, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            raise RuntimeError("gcloud secrets create %s failed (exit %d)" % (where, r.returncode))
+        return "GCP Secret Manager %s (project %s)" % (where, cfg.gcp_project)
+    if kind == "file":
+        path = Path(where)
+        if path.exists():
+            raise RuntimeError("refusing to overwrite %s" % path)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(value)
+        return "file %s (mode 600)" % path
+    raise SystemExit("--store must be gcp:<secret-name> or file:<path>")
+
+
+def cmd_keys(a) -> int:
+    from decimal import Decimal
+    from .clientkeys import ClientKeys
+    cfg = load(a.config)
+    ck = ClientKeys(cfg.state_dir / "modelrouter.sqlite3")
+    if a.keys_cmd == "create":
+        value, rec = ck.create(a.name, Decimal(a.cap_usd),
+                               max_usd_per_mtok=Decimal(a.max_usd_per_mtok), rpm=a.rpm,
+                               default_max_tokens=a.default_max_tokens, note=a.note)
+        try:
+            where = _store_key_value(cfg, a.store, value)
+        except Exception as exc:                                # noqa: BLE001
+            ck.revoke(rec.id)          # a key nobody can retrieve must not stay valid
+            print("NOT CREATED: storing the key failed (%s); key %s revoked" % (exc, rec.id))
+            return 2
+        finally:
+            value = None
+        print("created caller key %s (%s): cap $%s, <= $%s/M, %d req/min, default max_tokens %d"
+              % (rec.id, rec.name, rec.cap_usd, rec.max_usd_per_mtok, rec.rpm,
+                 rec.default_max_tokens))
+        print("value stored in %s -- deliver it to the caller out of band" % where)
+        return 0
+    if a.keys_cmd == "list":
+        print(json.dumps([k.public() for k in ck.list()], indent=1))
+        return 0
+    if a.keys_cmd == "revoke":
+        print("revoked" if ck.revoke(a.id) else "no active key %s" % a.id)
+        return 0
+    if a.keys_cmd == "set-cap":
+        print("cap set" if ck.set_cap(a.id, Decimal(a.cap_usd)) else "no key %s" % a.id)
+        return 0
+    if a.keys_cmd == "usage":
+        k = ck.get(a.id)
+        print(json.dumps({**k.public(), "recent_charges": ck.charges(a.id)}, indent=1) if k
+              else "no key %s" % a.id)
+        return 0
+    return 1
+
+
 def cmd_import(a) -> int:
     import json as _json
     cfg = load(a.config)
@@ -159,6 +227,21 @@ def main(argv: list[str] | None = None) -> int:
                         "seat without one, or the given --seat)")
     p.add_argument("--refresh-days", type=float,
                    help="re-probe measured seats last observed more than D days ago")
+    p = sub.add_parser("keys", help="caller keys: spend-capped keys for people who are not the operator")
+    ks = p.add_subparsers(dest="keys_cmd", required=True)
+    c = ks.add_parser("create")
+    c.add_argument("--name", required=True)
+    c.add_argument("--cap-usd", required=True, help="hard spend cap in USD, e.g. 5")
+    c.add_argument("--store", required=True,
+                   help="where the key value goes: gcp:<secret-name> or file:<new path>")
+    c.add_argument("--max-usd-per-mtok", default="5", help="price ceiling for this key's calls")
+    c.add_argument("--rpm", type=int, default=60)
+    c.add_argument("--default-max-tokens", type=int, default=1024)
+    c.add_argument("--note", default="")
+    ks.add_parser("list")
+    r = ks.add_parser("revoke"); r.add_argument("id")
+    r = ks.add_parser("set-cap"); r.add_argument("id"); r.add_argument("cap_usd")
+    r = ks.add_parser("usage"); r.add_argument("id")
     p = sub.add_parser("import-measurements")
     p.add_argument("--rows", help="one-word sweep rows (e.g. exp4_results.json)")
     p.add_argument("--curve", help="concurrency runs (e.g. exp5_results.json)")
@@ -175,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
         serve(["--config", str(a.config)] if a.config else [])
         return 0
     return {"init": cmd_init, "doctor": cmd_doctor, "probe": cmd_probe,
-            "explain": cmd_explain, "import-measurements": cmd_import}[a.cmd](a)
+            "explain": cmd_explain, "import-measurements": cmd_import, "keys": cmd_keys}[a.cmd](a)
 
 
 if __name__ == "__main__":

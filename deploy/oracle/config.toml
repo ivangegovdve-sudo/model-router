@@ -1,0 +1,33 @@
+# modelrouter on Oracle (forest-a1-v3). Secret NAMES only: values arrive as environment
+# variables from /etc/modelrouter.env, rendered from GCP SM `forest-family-cloud` by deploy.sh.
+[secrets]
+source = "env"
+
+[providers.openrouter]
+secret = "MR_KEY_OPENROUTER"      # SM openrouter-spare
+[providers.akashml]
+secret = "MR_KEY_AKASHML"         # SM akashml-2026-09
+[providers.venice]
+secret = "MR_KEY_VENICE"          # SM venice-api-key
+[providers.nous]
+secret = "MR_KEY_NOUS"            # SM nous-fleet
+[providers.sail]
+secret = "MR_KEY_SAIL"            # SM sail-api-key
+[providers.ionet]
+secret = "MR_KEY_IONET"           # SM ionet-intelligence-2026-09
+
+[server]
+bind = "127.0.0.1"                # public only through the nginx location
+port = 8687
+token_secret = "MR_OPERATOR_TOKEN" # SM modelrouter-operator-token (to be minted)
+no_auth = false
+
+[policy]
+ceiling_usd_per_mtok = 5.0
+probe_budget_usd = 0.02
+interactive_max_latency_s = 8.0
+clamp_max_tokens = true
+max_price_age_s = 172800
+allow_free = false
+allow_mirrors = false
+dashboard_url = "https://openrouter-github-dashboard.vercel.app"
