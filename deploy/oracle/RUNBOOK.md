@@ -15,6 +15,12 @@ Everything below that changes production, the vault or the public internet is ma
   ("Red, Blue, Yellow", charged $0.0000010574), an over-cap call was refused 402 before any
   provider was called, `/v1/usage` matched, operator routes returned 403. Test key revoked.
 
+## Status (2026-09-27)
+Steps 1 and 2 are DONE, with Ivan's go: `modelrouter-operator-token` v1 in SM; service
+`active` on Oracle at 127.0.0.1:8687 from `main` @ 5b0952c, 66 measured models seeded; no
+token -> 401; a real call answered on-host ($0.00000079); not reachable from the internet.
+Steps 3 (public) and 4 (buyer key) await Ivan's per-step go.
+
 ## 1. Operator token **[IVAN — vault write]**
 The router refuses to start off loopback without one. Mint a random value into SM:
 ```
