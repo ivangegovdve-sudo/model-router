@@ -25,6 +25,38 @@ success. This router qualifies a model only on **measured behaviour** (where it 
 tokens it needs before content appears) and ranks it on its **own measured price** plus the
 reasoning tokens it actually spends.
 
+## The decision: many variables, no model calls
+
+Per request the router compares **expected cost per completed answer** — rate × tokens actually
+burned — not advertised $/M. A $2.00/M model that answers in 2 tokens beats a $0.10/M model that
+reasons for 200 first; priced at a 250-token cap, the $0.10 one genuinely wins. So answer length is
+an input: send `X-Router-Answer-Tokens` when you know it (otherwise the cap is used, and the
+decision says so).
+
+The inputs, all read live or measured, none pinned: input / cached-input / output rates per
+scheduling window (Decimal, from the providers' own strings); each rate's read time (a price older
+than `max_price_age_s` is UNKNOWN); reasoning tokens burned before an answer; the minimum viable
+`max_tokens`; whether a reasoning field exists at all; decode speed on a real generation;
+latency growth under the provider's current load (from its measured concurrency curve); the
+concurrency it survives; context length; lane; and prompt-cache warmth — a conversation's last
+seat is priced with its cache-read rate, so staying put wins exactly when it is cheaper
+(session = `X-Router-Session` or the OpenAI `user` field).
+
+**The bill beats the advertisement.** For providers that report a charge per call, the router
+solves each model's actual input and output rates from its own bills (two calls with different
+splits pin both). On the `nous-fleet` key, Nous advertises Kimi-K3 at $1.03 / $9.04 per M (API and
+portal agree) and bills $3.00 / $15.00 — OpenRouter's list. Priced on the bill, Sail's flex window
+wins Kimi-K3 at every token split; priced on the advertisement, a 20:1 job would have gone to Nous
+and been billed ~1.5× the estimate.
+
+**Correlated providers are cheaper, not redundant.** `correlated_with` is explicit on providers and
+seats; after an upstream fault (unreachable, CDN, timeout, 502/503/504) every correlated provider is
+ruled out for the rest of the request. An account refusal is per-account and does not propagate —
+OpenRouter's budget 403 never stopped Nous.
+
+Catalogues, pricing pages and context pages refresh out of band every 4 minutes; the decision
+itself is a lookup plus a comparison — measured 17–24 ms over ~1,000 seats, no network, no model.
+
 ## Three stages
 
 ```
@@ -47,6 +79,20 @@ ACT      forward the call; an empty answer is a failure, never a success
   GLM-5.3-Flash spent 36–90 tokens to say one word, DeepSeek-V4.1-Flash 18. The router gates each
   model on its own measured spend (resampled, maximum taken), never on a global threshold, and
   refuses a request whose budget is below it.
+- **Lanes: someone waiting vs nobody waiting.** `auto` is interactive and excludes seats whose
+  *predicted* latency for the request (short-call latency + tokens ÷ decode speed measured on a
+  real generation) is above `interactive_max_latency_s` (default 8 s). `auto:background` /
+  `auto:batch` buy Sail's `balanced` / `flex` windows; one gemma-4-12B answer measured $0.0000127
+  asap, $0.0000061 balanced, $0.0000035 flex.
+- **A small budget is never passed to a reasoning model.** The router prefers a no-reasoning model
+  that fits; otherwise it raises the budget (caller's + 2× the most reasoning observed), on the record.
+- **Nothing pinned, including prices.** Sail's `/models` lists ids only, so its per-window prices
+  and context lengths are read live from its docs pricing and models pages each run; if a page
+  cannot be read, those facts are UNKNOWN for that run.
+- **Concurrency caps from measurement.** A provider is capped at the largest concurrency it
+  completed with zero failures (AkashML dropped 34 of 64; io.net and Sail completed 64). At the cap
+  it is `AT_CAPACITY`: `auto` routes elsewhere, a named model gets 429 + `Retry-After`.
+  `modelrouter import-measurements --rows … --curve …` loads sweeps taken outside the router.
 - **A CDN refusal is not a bad key.** Every call carries a real User-Agent; a Cloudflare
   `403 error code: 1010` marks the provider UNAVAILABLE and says the credential is not suspect.
 - **Account-level refusals bench the provider once** (budget, auth: 15 min; rate/quota: 10 min;
@@ -65,11 +111,16 @@ modelrouter init
 
 `init` writes `~/.modelrouter/config.toml` (or `$MODELROUTER_CONFIG`). Choose
 `source = "gcp"` (set `gcp_project`) or `"env"`, and give each provider you use the name of the
-secret or variable holding its key. Supported: `openrouter`, `akashml`, `venice`, `nous`, `sail`, `ionet` (io.net Intelligence).
+secret or variable holding its key. Supported: `openrouter`, `akashml`, `venice`, `nous`, `sail`, `ionet` (io.net Intelligence),
+`groq`. A provider whose catalogue is mostly another's is detected by measurement: identical prices
+→ MIRROR (excluded); mostly identical → CORRELATED (routable, not independent for fallback). Nous:
+97% of its ids are OpenRouter's, 86% at identical prices — CORRELATED. Cerebras is not supported
+(no prices in its API).
 
 ```
 modelrouter doctor
 modelrouter probe --cheapest 3
+modelrouter probe --generation      # decode speed: the interactive lane needs it
 modelrouter serve
 ```
 
@@ -113,6 +164,8 @@ Full contract: [`docs/CONTRACT.md`](docs/CONTRACT.md).
 | key | default | meaning |
 |---|---|---|
 | `ceiling_usd_per_mtok` | 5.0 | refuse any model priced above this (measured, else list) |
+| `interactive_max_latency_s` | 8.0 | the interactive lane (`auto`) excludes seats predicted slower for the request |
+| `clamp_max_tokens` | true | raise a too-small budget for a reasoning model instead of refusing |
 | `allow_free` | false | free tiers may log prompts and run on their own daily quota |
 | `probe_budget_usd` | 0.02 | hard cap per probe run |
 | `dashboard_url` | open-dashboard | price source for providers it carries; else each provider's own catalogue |

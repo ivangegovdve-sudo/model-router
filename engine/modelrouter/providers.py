@@ -15,6 +15,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterator
 
 import httpx
@@ -28,10 +29,16 @@ PROVIDERS: dict[str, dict[str, Any]] = {
                "parse": "venice"},
     "nous": {"base": "https://inference-api.nousresearch.com/v1", "catalogue": "/models",
              "parse": "openrouter"},
+    # Sail's /models lists ids only. Its prices -- one rate card per completion
+    # window -- are published on its docs pricing page, read live like a catalogue.
     "sail": {"base": "https://api.sailresearch.com/v1", "catalogue": "/models",
-             "parse": "bare"},                  # publishes no prices: UNKNOWN
+             "parse": "bare", "prices": "https://docs.sailresearch.com/pricing.md",
+             "specs": "https://docs.sailresearch.com/models.md", "windows": True},
     "ionet": {"base": "https://api.intelligence.io.solutions/api/v1", "catalogue": "/models",
               "parse": "ionet"},
+    "groq": {"base": "https://api.groq.com/openai/v1", "catalogue": "/models", "parse": "groq"},
+    # Cerebras is deliberately absent: its /models carries no prices, and Ivan's Cerebras
+    # credit is ring-fenced for Chloe's conversational front end (2026-09-23).
 }
 # Every provider call carries a real User-Agent. io.net sits behind Cloudflare, which
 # answers a request with no recognisable client (Python urllib's default) with
@@ -43,23 +50,90 @@ _ACCOUNT = re.compile(r"budget|credit|balance|insufficient|payment|billing|unaut
                       r"invalid api key|no auth|forbidden", re.I)
 _QUOTA = re.compile(r"quota|rate.?limit|per.?day|too many|limit exceeded", re.I)
 _NOT_TEXT = re.compile(r"(embed|rerank|moderation|guard|whisper|tts|transcri|image|"
-                       r"flux|sdxl|video|audio|ocr)", re.I)
+                       r"flux|sdxl|video|audio|ocr|orpheus|safeguard)", re.I)
+_MILLION = Decimal(1_000_000)
 
 
-def _f(v) -> float | None:
-    """A price field -> float, or None. Negative means 'variable' upstream: UNKNOWN."""
-    if v is None or v == "":
+def _f(v) -> Decimal | None:
+    """A price field -> Decimal, or None. Providers send prices as decimal STRINGS on
+    purpose; parsing them as float loses precision at 6-7 places and the drift compounds
+    over volume. Negative means 'variable' upstream: UNKNOWN. Null is UNKNOWN, never 0."""
+    if v is None or v == "" or isinstance(v, bool):
         return None
     try:
-        x = float(v)
-    except (TypeError, ValueError):
+        x = Decimal(str(v))
+    except (InvalidOperation, ValueError):
         return None
-    return x if x >= 0 else None
+    return x if x.is_finite() and x >= 0 else None
 
 
-def _per_m(v) -> float | None:
+def _per_m(v) -> Decimal | None:
     x = _f(v)
-    return None if x is None else x * 1e6
+    return None if x is None else x * _MILLION
+
+
+#: Lane -> the scheduling windows it may buy, most preferred first. Sail names them
+#: asap (low latency), balanced (wider scheduling), flex (best effort).
+LANE_WINDOWS = {"interactive": ("asap",), "background": ("balanced", "asap"),
+                "batch": ("flex", "balanced", "asap")}
+_WINDOW_LABEL = {"default (asap)": "asap", "asap": "asap", "balanced": "balanced",
+                 "flex": "flex"}
+_PRICE_ARIA = re.compile(
+    r'aria-label="[^"]*?\s(Default \(ASAP\)|ASAP|Balanced|Flex) pricing: input \$([\d.]+), '
+    r'cached \$([\d.]+), output \$([\d.]+) per 1M tokens\.?"', re.I)
+
+
+def parse_window_prices(page: str) -> dict[str, dict[str, tuple[float, float, float]]]:
+    """Sail pricing page -> {model_id: {window: (prompt, completion, cached)}} in $/M.
+
+    Keyed by the page's own `data-model` ids, so nothing here names a model. A model
+    or window the page does not price is simply absent: UNKNOWN, never zero."""
+    out: dict[str, dict[str, tuple[float, float, float]]] = {}
+    for chunk in page.split("<tbody")[1:]:
+        m = re.search(r'data-model="([^"]+)"', chunk[:400])
+        if not m:
+            continue
+        for w, inp, cached, outp in _PRICE_ARIA.findall(chunk):
+            win = _WINDOW_LABEL.get(w.lower())
+            if win:
+                out.setdefault(m.group(1), {})[win] = (Decimal(inp), Decimal(outp), Decimal(cached))
+    return out
+
+
+_CTX = re.compile(r'cap-expand-key">Context</span>\s*<span className="cap-expand-val">\s*'
+                  r'([\d.]+)\s*([KkMm]?)\s*</span>')
+_CODE_ID = re.compile(r"<code>([^<\s]+/[^<\s]+)</code>")
+
+
+def parse_context_lengths(page: str) -> dict[str, int]:
+    """Sail models page -> {model_id: context tokens}. Each model's "Context" value
+    precedes its `<code>org/model</code>` id in the page; pair each with the next id."""
+    out: dict[str, int] = {}
+    for m in _CTX.finditer(page):
+        ident = _CODE_ID.search(page, m.end())
+        if not ident or ident.group(1) in out:
+            continue
+        n = float(m.group(1)) * {"k": 1_000, "m": 1_000_000}.get(m.group(2).lower(), 1)
+        out[ident.group(1)] = int(n)
+    return out
+
+
+def fetch_context_lengths(provider: str, timeout: float = 30) -> dict[str, int]:
+    url = PROVIDERS[provider].get("specs")
+    if not url:
+        return {}
+    r = httpx.get(url, timeout=timeout, headers={"User-Agent": UA})
+    r.raise_for_status()
+    return parse_context_lengths(r.text)
+
+
+def fetch_window_prices(provider: str, timeout: float = 30) -> dict:
+    url = PROVIDERS[provider].get("prices")
+    if not url:
+        return {}
+    r = httpx.get(url, timeout=timeout, headers={"User-Agent": UA})
+    r.raise_for_status()
+    return parse_window_prices(r.text)
 
 
 @dataclass
@@ -68,23 +142,34 @@ class Listing:
 
     provider: str
     model: str
-    prompt: float | None            # USD / M tokens
-    completion: float | None
-    cached_prompt: float | None = None
+    prompt: Decimal | None          # USD / M tokens
+    completion: Decimal | None
+    cached_prompt: Decimal | None = None
     context_length: int | None = None
     supports_tools: bool | None = None
     reasoning: bool | None = None
     text_out: bool | None = True
+    windows: dict[str, tuple[Decimal, Decimal, Decimal]] | None = None  # window -> (p, c, cached)
+    blocked: str = ""               # the catalogue itself says this key cannot use it
+    read_at: float | None = None    # when these prices were read
 
 
 def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
     shape = PROVIDERS[provider]["parse"]
     out: list[Listing] = []
     for m in rows:
+        blocked_why = ""
         mid = str(m.get("id") or "")
         if not mid:
             continue
-        if shape in ("openrouter", "akashml"):
+        if shape == "groq":
+            p = m.get("pricing") or {}          # a null pricing object is UNKNOWN, not free
+            pr, co, ca = _per_m(p.get("prompt")), _per_m(p.get("completion")), \
+                _per_m(p.get("input_cache_read"))
+            ctx = m.get("context_window")
+            tools = reasoning = None
+            text_out = None if m.get("active") is not False else False
+        elif shape in ("openrouter", "akashml"):
             p = m.get("pricing") or {}
             if shape == "openrouter":
                 pr, co, ca = _per_m(p.get("prompt")), _per_m(p.get("completion")), \
@@ -105,12 +190,19 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
             ctx = m.get("context_length")
             text_out = None if outs is None else ("text" in outs)
         elif shape == "ionet":
-            pr, co, ca = _per_m(m.get("input_token_price")), _per_m(m.get("output_token_price")),                 _per_m(m.get("cache_read_token_price"))
+            pr, co, ca = _per_m(m.get("input_token_price")), _per_m(m.get("output_token_price")), \
+                _per_m(m.get("cache_read_token_price"))
+            if m.get("supports_prompt_cache") is False:
+                ca = None                       # a cache-read rate it will never apply
             ctx = m.get("context_window") or m.get("max_model_len")
             tools = m.get("supports_tools")
             reasoning = m.get("supports_reasoning")
             outs = m.get("output_modalities")
             text_out = None if outs is None else ("text" in outs)
+            if m.get("higher_tier_required") is True:
+                tier = m.get("min_access_tier")
+                blocked_why = "io.net access tier %s required; this key's tier is lower" % tier \
+                    if tier is not None else "a higher io.net access tier is required"
         elif shape == "venice":
             spec = m.get("model_spec") or {}
             pp = spec.get("pricing") or {}
@@ -133,7 +225,8 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
             ctx = int(ctx) if ctx is not None else None
         except (TypeError, ValueError):
             ctx = None
-        out.append(Listing(provider, mid, pr, co, ca, ctx, tools, reasoning, text_out))
+        out.append(Listing(provider, mid, pr, co, ca, ctx, tools, reasoning, text_out,
+                           blocked=blocked_why))
     return out
 
 
@@ -153,7 +246,11 @@ def fetch_catalogue(provider: str, key: str, timeout: float = 30) -> list[Listin
                              msg)
     d = r.json()
     rows = (d.get("data") if isinstance(d, dict) else d) or []
-    return parse_catalogue(provider, rows)
+    listings = parse_catalogue(provider, rows)
+    now = time.time()
+    for li in listings:
+        li.read_at = now
+    return listings
 
 
 @dataclass
@@ -164,12 +261,13 @@ class Result:
     model: str
     content: str = ""
     reasoning: str = ""              # reasoning_content / reasoning, if emitted
+    reasoning_field: bool | None = None  # the response HAS a reasoning field (even empty)
     tool_calls: int = 0
     finish_reason: str | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     cached_tokens: int | None = None
-    billed_usd: float | None = None
+    billed_usd: Decimal | None = None
     latency_s: float = 0.0
     detail: str = ""
     scope: str = "model"             # on failure: model | provider | quota
@@ -197,6 +295,11 @@ def classify_failure(status: int, msg: str, raw: str = "",
     the credential is not suspect and must not be rotated over it."""
     if is_edge_block(status, raw or msg, headers):
         return "edge"
+    # io.net answers 402 for ONE model the key's tier cannot use ("requires a higher IO
+    # Intelligence tier"). That is the model, not the account: benching the provider over
+    # it would take every other io.net model down with it.
+    if status == 402 and re.search(r"tier", (msg or "") + (raw or ""), re.I):
+        return "model"
     if status in (401, 402):
         return "provider"
     # Money before rate: "Budget limit exceeded (monthly limit)" is an account that
@@ -221,6 +324,7 @@ def extract(provider: str, model: str, payload: dict) -> Result:
     if isinstance(content, list):  # content parts
         content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
     reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    has_field = "reasoning_content" in msg or "reasoning" in msg
     usage = payload.get("usage") or {}
     billed = usage.get("cost")
     if billed is None and isinstance(payload.get("cost"), dict):   # Venice
@@ -232,15 +336,19 @@ def extract(provider: str, model: str, payload: dict) -> Result:
         tool_calls=len(msg.get("tool_calls") or []), finish_reason=choice.get("finish_reason"),
         prompt_tokens=usage.get("prompt_tokens"), completion_tokens=usage.get("completion_tokens"),
         cached_tokens=details.get("cached_tokens"),
-        billed_usd=_f(billed), body=payload)
+        billed_usd=_f(billed), body=payload, reasoning_field=has_field)
 
 
-def _body(provider: str, model: str, req: dict, max_tokens: int | None) -> dict:
+def _body(provider: str, model: str, req: dict, max_tokens: int | None,
+          window: str | None = None) -> dict:
     body = {k: v for k, v in req.items() if k not in ("model", "max_tokens",
                                                       "max_completion_tokens")}
     body["model"] = model
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
+    if window and PROVIDERS.get(provider, {}).get("windows"):
+        # The lane travels with the call: priced at this window, so scheduled in it.
+        body["metadata"] = {**(body.get("metadata") or {}), "completion_window": window}
     if provider == "openrouter":
         body["usage"] = {"include": True}      # ask for the billed cost
     elif provider == "venice" and "venice_parameters" not in body:
@@ -282,7 +390,7 @@ def _describe(status: int, msg: str, scope: str) -> str:
 
 
 def call(provider: str, model: str, key: str, req: dict, *, max_tokens: int | None,
-         timeout: float = 180) -> Result:
+         timeout: float = 180, window: str | None = None) -> Result:
     t0 = time.time()
 
     def fail(status: int, detail: str, scope: str = "model", rl=None) -> Result:
@@ -294,7 +402,7 @@ def call(provider: str, model: str, key: str, req: dict, *, max_tokens: int | No
         return fail(0, "unknown provider", "provider")
     if not key:
         return fail(0, "no key", "provider")
-    body = _body(provider, model, req, max_tokens)
+    body = _body(provider, model, req, max_tokens, window)
     body.pop("stream", None)
     body.pop("stream_options", None)
     try:
@@ -327,14 +435,15 @@ def call(provider: str, model: str, key: str, req: dict, *, max_tokens: int | No
 
 
 def stream(provider: str, model: str, key: str, req: dict, *, max_tokens: int | None,
-           on_done: Callable[[Result], None], timeout: float = 180) -> Iterator[bytes]:
+           on_done: Callable[[Result], None], timeout: float = 180,
+           window: str | None = None) -> Iterator[bytes]:
     """Forward an SSE stream verbatim while tallying what it carried.
 
     Usage arrives in the last chunk when requested; content and reasoning deltas are
     counted separately so an all-reasoning stream is recorded as empty.
     """
     t0 = time.time()
-    body = _body(provider, model, req, max_tokens)
+    body = _body(provider, model, req, max_tokens, window)
     body["stream"] = True
     body["stream_options"] = {"include_usage": True}
     res = Result(False, 0, provider, model)
@@ -370,6 +479,8 @@ def stream(provider: str, model: str, key: str, req: dict, *, max_tokens: int | 
                     if d.get("content"):
                         content.append(d["content"])
                     reasoning_chars += len(d.get("reasoning_content") or d.get("reasoning") or "")
+                    if "reasoning_content" in d or "reasoning" in d:
+                        res.reasoning_field = True
                     if d.get("tool_calls"):
                         res.tool_calls += 1
                     if ch.get("finish_reason"):

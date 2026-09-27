@@ -51,14 +51,18 @@ def summarise_choice(ch: dict, top: int = 8) -> dict:
 
 @mcp.tool()
 def explain_route(prompt: str, max_tokens: int | None = None, needs_tools: bool = False,
-                  model: str = "auto", ceiling_usd_per_mtok: float | None = None) -> str:
+                  model: str = "auto", ceiling_usd_per_mtok: float | None = None,
+                  answer_tokens: int | None = None, lane: str = "interactive") -> str:
     """Which model would the router choose for this request, and why? Makes no model
     call and spends nothing.
 
     Returns the outcome (ROUTE or ABSTAIN), the chosen seat ("provider:model"), the
     fact that decided, the qualifying candidates ranked by expected cost, and the
     excluded ones with the reason each was ruled out (e.g. a reasoning model whose
-    answer needs more max_tokens than the request allows). ABSTAIN means no model can
+    answer needs more max_tokens than the request allows). answer_tokens is the expected
+    answer length: cost per answer is rate x tokens actually burned, so a 2-token reply
+    can make a $2/M model cheaper than a $0.10/M one that reasons first. lane:
+    interactive | background | batch. ABSTAIN means no model can
     serve the request honestly -- read `because`.
     """
     req: dict = {"model": model, "messages": [{"role": "user", "content": prompt}]}
@@ -66,7 +70,9 @@ def explain_route(prompt: str, max_tokens: int | None = None, needs_tools: bool 
         req["max_tokens"] = max_tokens
     if needs_tools:
         req["tools"] = [{"type": "function", "function": {"name": "tool", "parameters": {}}}]
-    headers = {}
+    headers = {"X-Router-Lane": lane}
+    if answer_tokens is not None:
+        headers["X-Router-Answer-Tokens"] = str(answer_tokens)
     if ceiling_usd_per_mtok is not None:
         headers["X-Router-Max-Usd-Per-M"] = str(ceiling_usd_per_mtok)
     with _client() as c:

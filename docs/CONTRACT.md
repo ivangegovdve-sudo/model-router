@@ -17,7 +17,29 @@ is needed.
 | POST | `/v1/chat/completions` | OpenAI chat completion. `model: "auto"` routes; `model: "provider:model"` is judged alone and refused if it cannot serve the request. `stream: true` supported. |
 | GET | `/v1/models` | `{object:"list", data:[{id:"auto"}, {id:"provider:model"}, ...]}` |
 
-Optional request header `X-Router-Max-Usd-Per-M: <float>` lowers the price ceiling for one call.
+Optional request headers: `X-Router-Max-Usd-Per-M` (price ceiling for one call),
+`X-Router-Answer-Tokens` (expected answer length — cost per answer is rate × tokens burned),
+`X-Router-Session` (conversation id for prompt-cache warmth; the OpenAI `user` field also works),
+`X-Router-Ensemble` (reserved: 501 until the experiment that decides it has run).
+
+**Lanes.** `model: "auto"` is the **interactive** lane: someone is waiting, so a seat is excluded
+when its **predicted** latency for this request — measured short-call latency + (completion +
+reasoning tokens) ÷ decode speed measured on a real generation — exceeds
+`policy.interactive_max_latency_s`. A seat with no decode measurement is UNKNOWN there. (A one-word
+probe measures connection + prefill, not decode: AkashML answered one word in 0.6 s and decoded at
+24 tok/s.) `auto:background` and
+`auto:batch` (or header `X-Router-Lane`) ignore latency and buy cheaper scheduling where a provider
+sells it — Sail's `balanced` / `flex` completion windows, sent as `metadata.completion_window` and
+priced from that window's rate card. A named `provider:model` skips the latency gate (the caller
+chose). An unknown lane is HTTP 400.
+
+**max_tokens is a correctness parameter.** A reasoning model given less than its measured floor
+bills tokens and returns nothing, so the router never passes such a budget through. It prefers a
+model that answers within the caller's budget; if none does, it raises the budget for the cheapest
+reasoning model to `caller's budget + 2 × the most reasoning observed for it` (capped by
+`max_clamp_extra`), records `facts.max_tokens_raised_from`, and says so in `because`. If that still
+comes back empty (a real task can reason far longer than the probe), the observation raises the
+floor and the router decides once more, which may raise it again for the same model.
 
 A routed response is the upstream body unchanged plus one field:
 
@@ -33,6 +55,7 @@ and headers `X-Router-Decision`, `X-Router-Seat` (streams carry only the headers
 | HTTP | `error.type` | meaning |
 |---|---|---|
 | 422 | `router_abstained` | no model qualifies on known facts. `message` names the reasons; `decision_id`, `unknown[]` attached |
+| 429 | `router_at_capacity` | every eligible model's provider is at its measured concurrency cap; `Retry-After: 1` |
 | 502 | `routed_call_failed` | every attempt failed or came back **empty** (HTTP 200 with no content is a failure) |
 | 401 | — | missing/wrong router token |
 
@@ -44,7 +67,7 @@ and headers `X-Router-Decision`, `X-Router-Seat` (streams carry only the headers
 | GET | `/router/setup` | `Setup` |
 | GET | `/router/roster?provider=&measured_only=` | `{providers:[ProviderState], dashboard, seats:[Candidate]}` |
 | POST | `/router/explain` | `{choice: Choice, providers:[ProviderState], dashboard}` — body is a chat request; **no model call, no cost** |
-| POST | `/router/probe` | body `{seats?:[string], cheapest?:int, budget_usd?:float}` → `{spent_usd, budget_usd, probed:[{seat, rungs:[Attempt], profile}]}` — **spends money**, capped by config |
+| POST | `/router/probe` | body `{seats?:[string], cheapest?:int, generation?:bool, measured?:bool, budget_usd?:float}` (`generation`: a ~400-token run that measures decode speed) → `{spent_usd, budget_usd, probed:[{seat, rungs:[Attempt], profile}]}` — **spends money**, capped by config |
 | GET | `/router/decisions?limit=N` | `[DecisionRow]` newest first |
 | GET | `/router/decisions/{id}` | `Decision` |
 | GET | `/router/observations/{provider:model}` | raw observations behind a seat's measured profile |
@@ -73,6 +96,10 @@ and headers `X-Router-Decision`, `X-Router-Seat` (streams carry only the headers
 ```
 `because` is display text; clients must not parse it.
 
+Monetary values in records are floats for display; `result.cost_usd_exact` and
+`choice.expected_usd_exact` carry the exact Decimal strings sums are made from. `decide_ms` is the
+time spent deciding (roster lookup + comparison), per decision.
+
 `considered` lists every qualifier and every exclusion. Of the UNKNOWN seats (usually most of
 the roster: never measured) it lists only those whose list price undercuts the winner — they
 might have been cheaper — and counts the rest in `facts.unknown_not_listed`.
@@ -81,13 +108,13 @@ might have been cheaper — and counts the rest in `facts.unknown_not_listed`.
 `{seat, verdict:"QUALIFIES|EXCLUDED|UNKNOWN", because, unknown:[fact], usd_per_mtok|null, price_basis:"measured|list|", expected_usd|null}`
 
 ### Attempt
-`{seat, max_tokens|null, http, ok, detail, finish_reason, content_chars, reasoning_chars, tool_calls, prompt_tokens, completion_tokens, cached_tokens, cost_usd|null, cost_basis, latency_s, scope:"model|provider|quota|edge|transport"|null}`
+`{seat, window|null, max_tokens|null, http, ok, detail, finish_reason, content_chars, reasoning_chars, tool_calls, prompt_tokens, completion_tokens, cached_tokens, cost_usd|null, cost_basis, latency_s, scope:"model|provider|quota|edge|transport"|null}`
 
 `reasoning_chars > 0` with `content_chars == 0` is the measured failure this product exists for:
 the model spent the budget reasoning and returned nothing.
 
 ### Candidate (roster seat)
-`{seat, provider, model, provider_state:"OK|NO_KEY|BLOCKED|QUOTA_EXHAUSTED|UNAVAILABLE|CATALOGUE_FAILED", provider_detail, available, context_length|null, supports_tools|null, list_prompt|null, list_completion|null, price_source:"dashboard|provider-catalogue", measured_usd_per_mtok|null, emits:"content|reasoning_then_content|reasoning_only"|null, min_max_tokens|null, floor_evidence, reasoning_overhead_tokens|null, probe_age_s|null, latency_s|null}`
+`{seat, provider, model, provider_state:"OK|NO_KEY|BLOCKED|QUOTA_EXHAUSTED|UNAVAILABLE|AT_CAPACITY|CATALOGUE_FAILED", blocked, has_reasoning_field|null, decode_tps|null, window|null, correlated_with[], billed_prompt|null, billed_completion|null, billed_evidence, billing_ratio|null, provider_detail, available, context_length|null, supports_tools|null, list_prompt|null, list_completion|null, price_source:"dashboard|provider-catalogue", measured_usd_per_mtok|null, emits:"content|reasoning_then_content|reasoning_only"|null, min_max_tokens|null, floor_evidence, reasoning_overhead_tokens|null, probe_age_s|null, latency_s|null}`
 
 Prices are USD per million tokens.
 
@@ -103,7 +130,17 @@ Provider states: `BLOCKED` — the account refused (auth, money); `QUOTA_EXHAUST
 UNAVAILABLE never implicates the key; do not rotate credentials over it.
 
 ### ProviderState
-`{provider, key, state, detail, until|null, models, price_source, ratelimit:{header:value}, free_quota_until|null}`
+`{provider, key, state:"…|MIRROR", detail, mirror_of, same_price_share|null, until|null, models, price_source, ratelimit:{header:value}, free_quota_until|null, in_flight, max_concurrency|null, concurrency_source}`
+
+`correlated_with` lists providers that share this one's upstream (both directions).
+
+`advertised_unreliable` (on seats) is set once a provider has billed above its advertised price on
+any model (>10% on either leg, from solved billed rates). Its models without their own solved bills
+are then priced UNKNOWN — an advertised price from that provider is a claim, not a price.
+
+`max_concurrency` is the largest concurrency the provider completed with zero failures (imported
+or configured); at the cap the provider is `AT_CAPACITY` and routes go elsewhere. Slots are reserved
+atomically at call time.
 
 ### Setup
 `{config, config_problems[], secrets_source:"gcp|env", gcp_project, gcloud_installed, keys:[{provider, source, name, present, detail}], auth, dashboard, dashboard_status, ready}`
