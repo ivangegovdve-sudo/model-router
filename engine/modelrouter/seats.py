@@ -21,7 +21,9 @@ Policies (per consumer, set in server config; a request may tighten, never loose
 """
 from __future__ import annotations
 
+import json
 import re
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
@@ -33,7 +35,7 @@ TIER = {p: i for i, p in enumerate(POOL)}
 
 EXCLUDED_PROVIDERS = frozenset({"claude", "anthropic", "cerebras"})
 EXCLUDED_FAMILIES = frozenset({"anthropic"})
-_EXCLUDED_MODEL = re.compile(r"claude|anthropic|cerebras", re.I)
+_EXCLUDED_MODEL = re.compile(r"claude|anthropic|cerebras|(?<![a-z])(sonnet|opus|haiku)(?![a-z])", re.I)
 
 ROLES = ("review", "fix", "rebase", "council", "general")
 POLICIES = ("cheapest", "free-only")
@@ -93,15 +95,21 @@ class Seat:
 
     @property
     def free(self) -> bool:
-        return self.kind in ("free", "local")
+        """Free only when the kind says so AND the price is a known zero: a declared kind
+        never overrides a price."""
+        return self.kind in ("free", "local") and self.usd_per_mtok == 0
 
 
-def is_excluded(provider: str, model: str, family: str | None) -> str:
-    """The reason a seat may never be selected, or ''."""
+def is_excluded(provider: str, model: str, family: str | None, invoke: dict | None = None) -> str:
+    """The reason a seat may never be selected, or ''. Checked on the provider, the model id,
+    the family AND where the call would actually go (invoke), so a declared seat cannot
+    launder a forbidden backend behind an innocuous name."""
     if provider.lower() in EXCLUDED_PROVIDERS:
         return "provider %s is excluded (reserved)" % provider
-    if family in EXCLUDED_FAMILIES or _EXCLUDED_MODEL.search(model):
+    if (family or "").lower() in EXCLUDED_FAMILIES or _EXCLUDED_MODEL.search(model):
         return "Claude/Cerebras models are excluded from the pool"
+    if invoke and _EXCLUDED_MODEL.search(json.dumps(invoke, default=str)):
+        return "invoke target is a Claude/Cerebras backend"
     return ""
 
 
@@ -140,6 +148,11 @@ def adapter_placeholders(declared: list[dict]) -> list[Seat]:
             for p in ("codex", "antigravity") if p not in have]
 
 
+def _norm_family(f) -> str | None:
+    f = str(f).strip().lower() if f else ""
+    return f or None
+
+
 def from_declared(d: dict) -> Seat:
     """A seat declared in config ([[seats]]): codex / antigravity / local adapters, whose
     availability the operator (or a health probe) asserts. Default is UNAVAILABLE."""
@@ -148,12 +161,14 @@ def from_declared(d: dict) -> Seat:
     kind = d.get("kind") or {"local": "local", "codex": "subscription",
                              "antigravity": "subscription"}.get(provider, "priced")
     price = d.get("usd_per_mtok")
+    if price is not None and Decimal(str(price)) != 0 and kind in ("free", "local", "subscription"):
+        kind = "priced"                    # a declared price beats a declared kind
     return Seat(
         seat="%s:%s" % (provider, model), provider=provider, model=model,
-        family=d.get("family") or family_of(model), tier=TIER.get(provider, len(POOL)),
+        family=_norm_family(d.get("family") or family_of(model)), tier=TIER.get(provider, len(POOL)),
         kind=kind,
         usd_per_mtok=Decimal(str(price)) if price is not None
-        else (Decimal(0) if kind in ("subscription", "local", "free") else None),
+        else (Decimal(0) if kind in ("subscription", "local") else None),
         context_length=d.get("context_length"), supports_tools=d.get("supports_tools"),
         available=bool(d.get("available", False)),
         detail=d.get("detail", "" if d.get("available") else "adapter not verified live"),
@@ -230,7 +245,7 @@ class Resolution:
             "cost_basis": ({"priced": "list/measured", "free": "free", "local": "local-gpu",
                             "subscription": "subscription"}[s.kind] if s else None),
             "usd_per_mtok": str(s.usd_per_mtok) if s and s.usd_per_mtok is not None else None,
-            "invoke": s.invoke if s else None,
+            "invoke": public_invoke(s.invoke) if s else None,
             "jev": self.jev,
             "considered": [{"seat": a.seat, "verdict": a.verdict.value, "because": a.because,
                             "tier": a.tier, "family": a.family,
@@ -238,6 +253,21 @@ class Resolution:
                             if a.usd_per_mtok is not None else None}
                            for a in self.considered],
         }
+
+
+_INVOKE_KEYS = ("kind", "base_url", "model", "command")
+
+
+def public_invoke(invoke: dict) -> dict:
+    """What a caller may be told about HOW to call a seat: an allowlist, no credentials. A
+    base_url carrying userinfo or a query string is dropped, never echoed."""
+    out = {k: invoke[k] for k in _INVOKE_KEYS if isinstance(invoke.get(k), str)}
+    u = out.get("base_url")
+    if u:
+        sp = urlsplit(u)
+        if sp.username or sp.password or sp.query or sp.fragment or sp.scheme not in ("http", "https"):
+            out.pop("base_url")
+    return out
 
 
 def effective_policy(configured: str | None, requested: str | None) -> str:
@@ -256,13 +286,13 @@ def qualify(req: SeatRequest, policy: str, seats: list[Seat],
     """Apply every HARD rule. Returns (eligible seats in selection order, all assessments)."""
     out: list[Assessment] = []
     ok: list[Seat] = []
-    ex_fam = {f.lower() for f in req.exclude_families}
+    ex_fam = {str(f).strip().lower() for f in req.exclude_families}
 
     def note(s: Seat, v: Verdict, why: str) -> None:
         out.append(Assessment(s.seat, v, why, s.tier, s.family, s.usd_per_mtok))
 
     for s in seats:
-        why = is_excluded(s.provider, s.model, s.family)
+        why = is_excluded(s.provider, s.model, s.family, s.invoke)
         if why:
             note(s, Verdict.EXCLUDED, why)
         elif s.provider not in TIER:
@@ -273,7 +303,7 @@ def qualify(req: SeatRequest, policy: str, seats: list[Seat],
             note(s, Verdict.UNKNOWN, "unavailable: %s" % (s.detail or "not live"))
         elif ex_fam and s.family is None:
             note(s, Verdict.UNKNOWN, "family unknown; a cross-family constraint cannot be met")
-        elif s.family in ex_fam:
+        elif (s.family or "").lower() in ex_fam:
             note(s, Verdict.EXCLUDED, "same family (%s) as the author" % s.family)
         elif req.needs_tools and s.supports_tools is not True:
             note(s, Verdict.EXCLUDED if s.supports_tools is False else Verdict.UNKNOWN,

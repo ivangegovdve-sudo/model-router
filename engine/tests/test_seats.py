@@ -228,3 +228,108 @@ def test_config_template_parses_and_carries_the_consumer_policies(tmp_path):
     assert cfg.consumers["public-council"] == "free-only"
     assert cfg.consumers["glass-solver"] == "cheapest" and cfg.jev_secret == "typesafe-api-key"
     assert not [x for x in cfg.problems if "consumers" in x or "seats" in x]
+
+
+# ---- regressions from the cross-family review of PR #7 (Codex, 2026-10-03) --------------
+def test_forbidden_backend_cannot_hide_behind_a_name_or_invoke_metadata():
+    hidden = seats.from_declared({"provider": "sail", "model": "innocuous-7b", "available": True,
+                                  "invoke": {"kind": "openai-compat", "base_url": "https://api.anthropic.com/v1"}})
+    cere = seats.from_declared({"provider": "openrouter", "model": "plain", "available": True,
+                                "invoke": {"base_url": "https://api.cerebras.ai/v1"}})
+    alias = S("local", "sonnet", "0", "local")
+    alias2 = S("local", "opus:latest", "0", "local")
+    for s in (hidden, cere, alias, alias2):
+        r = resolve(SeatRequest(), [s], configured_policy="cheapest")
+        assert r.outcome is Outcome.UNAVAILABLE, s.seat
+
+
+def test_declared_kind_never_overrides_a_price():
+    paid = seats.from_declared({"provider": "openrouter", "model": "x/y", "kind": "free",
+                                "usd_per_mtok": 5, "available": True})
+    assert paid.kind == "priced" and paid.usd_per_mtok == 5 and not paid.free
+    assert resolve(SeatRequest(), [paid], configured_policy="free-only").outcome is Outcome.UNAVAILABLE
+    nopr = seats.from_declared({"provider": "openrouter", "model": "x/y", "kind": "free", "available": True})
+    assert nopr.usd_per_mtok is None and not nopr.free
+    sub = seats.from_declared({"provider": "codex", "model": "gpt-5.6-sol", "usd_per_mtok": 3, "available": True})
+    assert sub.kind == "priced"
+    assert resolve(SeatRequest(), [sub], configured_policy="free-only",
+                   allow_subscription_free=True).outcome is Outcome.UNAVAILABLE
+
+
+def test_family_comparison_is_case_and_space_insensitive():
+    s = seats.from_declared({"provider": "sail", "model": "m", "family": " OpenAI ", "available": True})
+    assert s.family == "openai"
+    r = resolve(SeatRequest(exclude_families=("OpenAI ",)), [s], configured_policy="cheapest")
+    assert r.outcome is Outcome.UNAVAILABLE
+
+
+def test_invoke_is_an_allowlist_without_credentials():
+    pub = seats.public_invoke({"kind": "openai-compat", "base_url": "https://u:p@h/v1", "model": "m",
+                               "token": "SECRET", "headers": {"authorization": "Bearer SECRET"}})
+    assert pub == {"kind": "openai-compat", "model": "m"}
+    assert "SECRET" not in str(seats.public_invoke({"base_url": "http://h/v1?key=SECRET"}))
+    assert seats.public_invoke({"base_url": "http://127.0.0.1:11434/v1"})["base_url"].endswith("/v1")
+
+
+def test_jev_rejects_nonfinite_and_out_of_range_probabilities_and_unlisted_seats():
+    for bad in (float("nan"), 1.5, -0.1):
+        r = resolve(SeatRequest(task="t"), POOL, configured_policy="cheapest",
+                    advisor=advisor_returning("codex:gpt-5.6-sol", bad))
+        assert r.seat.provider == "sail" and r.jev["used"] is False
+    many = [S("sail", f"m{i}", str(i + 1)) for i in range(jev.MAX_SEATS)] + [S("openrouter", "late/model", "50")]
+    r = resolve(SeatRequest(task="t"), many, configured_policy="cheapest",
+                advisor=advisor_returning("openrouter:late/model", 0.99))
+    assert r.seat.seat == "sail:m0" and r.jev["used"] is False       # was never shown to Jev
+
+
+# ---- the HTTP endpoint -------------------------------------------------------------------
+@pytest.fixture
+def client(tmp_path):
+    from fastapi.testclient import TestClient
+    from modelrouter import config, server
+    p = tmp_path / "c.toml"
+    p.write_text('[secrets]\nsource="env"\n[providers.openrouter]\nsecret="NOPE"\n'
+                 '[server]\nno_auth=true\n[policy]\nceiling_usd_per_mtok=5\ndashboard_url=""\n'
+                 '[jev]\nenabled=false\n[local]\nollama_url="http://127.0.0.1:9"\n'
+                 '[[seats]]\nprovider="sail"\nmodel="Qwen/Qwen3-32B"\navailable=true\nusd_per_mtok=0.3\n'
+                 '[[seats]]\nprovider="sail"\nmodel="deepseek-ai/Big"\navailable=true\nusd_per_mtok=9\n',
+                 encoding="utf-8")
+    cfg = config.load(p)
+    cfg.state_dir = tmp_path
+    return TestClient(server.build(cfg))
+
+
+def test_endpoint_unknown_or_mistyped_consumer_is_refused_even_with_a_policy(client):
+    for c in ("zzz", "public-council ", None, 7):
+        r = client.post("/v1/seats/resolve", json={"consumer": c, "policy": "cheapest"})
+        assert r.status_code == 400, c
+
+
+def test_endpoint_scalar_families_are_refused_not_split_into_characters(client):
+    r = client.post("/v1/seats/resolve", json={"consumer": "glass-solver", "exclude_families": "openai"})
+    assert r.status_code == 400
+
+
+def test_endpoint_applies_the_global_ceiling_and_a_request_can_only_lower_it(client):
+    r = client.post("/v1/seats/resolve", json={"consumer": "glass-solver", "exclude_seats": ["sail:Qwen/Qwen3-32B"]})
+    assert r.status_code == 422                       # the $9/M seat is above the configured $5/M
+    r = client.post("/v1/seats/resolve", json={"consumer": "glass-solver", "max_usd_per_m": 100})
+    assert r.status_code == 200 and r.json()["seat"] == "sail:Qwen/Qwen3-32B"
+
+
+def test_endpoint_public_council_gets_unavailable_not_a_paid_seat(client):
+    r = client.post("/v1/seats/resolve", json={"consumer": "public-council", "role": "council"})
+    assert r.status_code == 422
+    d = r.json()["detail"]
+    assert d["type"] == "seat_unavailable" and d["policy"] == "free-only" and d["seat"] is None
+    r = client.post("/v1/seats/resolve", json={"consumer": "public-council", "policy": "cheapest"})
+    assert r.status_code == 422                        # cannot loosen
+
+
+def test_pool_matches_the_fixture_shared_with_open_dashboard_mcp():
+    import json
+    from pathlib import Path
+    fx = json.loads((Path(__file__).parents[2] / "docs" / "fixtures" / "seat-pool.json").read_text("utf-8"))
+    assert list(seats.POOL) == fx["order"]
+    assert sorted(seats.EXCLUDED_PROVIDERS) == sorted(fx["excluded"])
+    assert list(seats.ROLES) == fx["roles"] and list(seats.POLICIES) == fx["policies"]
