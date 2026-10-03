@@ -197,9 +197,19 @@ def build(cfg: Config) -> FastAPI:
         """Which seat fills ROLE under POLICY and a cross-family constraint. Advisory: no
         inference on the chosen seat, no spend there (Jev's own call is the only cost)."""
         b = await request.json()
-        consumer = str(b.get("consumer") or "")
-        configured = cfg.consumers.get(consumer)
+        consumer = b.get("consumer")
+        if not isinstance(consumer, str) or consumer not in cfg.consumers:
+            raise HTTPException(400, "unknown consumer %r; configured: %s -- add it under "
+                                     "[consumers.<name>] with a policy" % (consumer, ", ".join(cfg.consumers)))
+        configured = cfg.consumers[consumer]
+        for field_ in ("exclude_families", "exclude_seats"):
+            v = b.get(field_) or []
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise HTTPException(400, "%s must be a list of strings" % field_)
         try:
+            # the request may lower the configured price ceiling, never raise it
+            ceilings = [Decimal(str(x)) for x in (b.get("max_usd_per_m"), cfg.ceiling_usd_per_mtok)
+                        if x is not None]
             req = seats.SeatRequest(
                 role=str(b.get("role") or "general"), consumer=consumer,
                 policy=b.get("policy"),
@@ -207,8 +217,7 @@ def build(cfg: Config) -> FastAPI:
                 exclude_seats=tuple(b.get("exclude_seats") or ()),
                 min_context=(b.get("need") or {}).get("min_context"),
                 needs_tools=bool((b.get("need") or {}).get("tools")),
-                ceiling_usd_per_mtok=(Decimal(str(b["max_usd_per_m"]))
-                                      if b.get("max_usd_per_m") is not None else None),
+                ceiling_usd_per_mtok=min(ceilings) if ceilings else None,
                 task=str(b.get("task") or ""))
             res = await run_in_threadpool(
                 lambda: seats.resolve(req, pool_seats(), configured_policy=configured,

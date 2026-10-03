@@ -76,8 +76,11 @@ returns. The caller then invokes the seat (`invoke`) itself, or via `/v1/chat/co
 ```
 
 Policy is **server config per consumer** (`[consumers.<name>] policy`). Defaults: `glass-solver`
-and `private-council` = `cheapest`; `public-council` = `free-only`. An unknown consumer with no
-`policy` is HTTP 400.
+and `private-council` = `cheapest`; `public-council` = `free-only`. An unknown or mistyped consumer is
+HTTP 400 even when the request names a policy (fail-closed); `exclude_families` / `exclude_seats` must
+be lists of strings. The configured `policy.ceiling_usd_per_mtok` applies; a request's `max_usd_per_m`
+can only lower it. `invoke` in the response is an allowlist (`kind`, `base_url`, `model`, `command`)
+and never carries credentials.
 
 * **cheapest** -- pool order, then cheapest live price within the tier:
   `sail` (0), `codex` (1), `antigravity` (2), `local` Ollama GPU (3), `openrouter` (4, last).

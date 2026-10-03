@@ -18,6 +18,7 @@ logged. This is the router's own runtime inference; it never touches a Claude su
 from __future__ import annotations
 
 import json
+import math
 import urllib.request
 from typing import Callable
 
@@ -79,8 +80,11 @@ def make_advisor(get_key: Callable[[], str], *, min_prob: float = 0.6, timeout: 
             pick, prob = ans["choice"], float(ans["probabilities"][ans["choice"]])
         except Exception as exc:                       # fail open
             return None, {"used": False, "why": "jev call failed: %s" % type(exc).__name__}
-        by = {s.seat: s for s in eligible}
+        by = {s.seat: s for s in eligible[:MAX_SEATS]}      # only seats Jev was shown
         info = {"used": False, "choice": pick, "probability": prob}
+        if not (isinstance(prob, float) and math.isfinite(prob) and 0.0 <= prob <= 1.0):
+            info["why"] = "probability is not a finite number in [0,1]; ignored"
+            return None, info
         if pick not in by:
             info["why"] = "choice is not an eligible seat; ignored"
             return None, info
