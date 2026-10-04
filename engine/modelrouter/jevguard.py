@@ -91,10 +91,14 @@ QUESTION_OVERHEAD_TOKENS = 64
 # A hold that has not settled after this long belongs to a crashed process. It is never simply
 # dropped: it is converted to a charge of its worst case (UNKNOWN_BILLING) in the day the sweep
 # runs. A row the sweep converted is terminal: a late result can raise its charge, never lower
-# it. The TTL is far above MAX_TIMEOUT_S, the longest any transport is asked to wait.
+# it. A call that is merely slow is not swept: while its thread lives it keeps its hold fresh
+# (HEARTBEAT_S), so it stays RESERVED -- counted, and widened if the bound is.
 RESERVATION_TTL_S = 3600
 MAX_TIMEOUT_S = 600.0
-DEADLINE_GRACE_S = 2.0              # the transport's own timeout gets this long to fire first
+# A call whose thread is still alive in this process re-stamps its hold this often, so the
+# sweep (which takes holds older than the TTL for crashed) never converts a call that can
+# still send or still be billed. Only a dead process stops beating.
+HEARTBEAT_S = 300.0
 # Statuses that can only mean the key was refused before inference. Every other HTTP error
 # (5xx, and 429 too: nothing guarantees a rate-limit answer is unbilled) may have been billed.
 NOT_BILLED_STATUSES = (401, 403)
@@ -206,6 +210,9 @@ class Ledger:
         self._tz = ZoneInfo(timezone) if timezone else None
         self._now = now
         self._local = threading.local()
+        self._live: set[int] = set()                    # holds whose call thread is alive here
+        self._live_lock = threading.Lock()
+        self._beater: threading.Thread | None = None
         with self._tx() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS jev_calls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,6 +290,33 @@ class Ledger:
                    "WHERE status = 'RESERVED' AND ts < ?",
                    (now.date().isoformat(), now.timestamp() - RESERVATION_TTL_S))
 
+    def alive(self, call_id: int, on: bool) -> None:
+        """Mark a hold as belonging to a call thread that is running in this process."""
+        with self._live_lock:
+            (self._live.add if on else self._live.discard)(call_id)
+            if on and self._beater is None:
+                self._beater = threading.Thread(target=self._beat_forever, daemon=True, name="jev-heartbeat")
+                self._beater.start()
+
+    def beat(self) -> int:
+        """Re-stamp every live hold of this process. -> how many."""
+        with self._live_lock:
+            ids = sorted(self._live)
+        if not ids:
+            return 0
+        with self._tx() as db:
+            return db.execute("UPDATE jev_calls SET ts = ? WHERE status = 'RESERVED' AND id IN (%s)"
+                              % ",".join("?" * len(ids)), (self.now().timestamp(), *ids)).rowcount
+
+    def _beat_forever(self) -> None:
+        import time
+        while True:
+            time.sleep(HEARTBEAT_S)
+            try:
+                self.beat()
+            except Exception as exc:                            # a beat must never kill the thread
+                log.error("jev hold heartbeat failed: %s", type(exc).__name__)
+
     def bound_factor(self, db=None) -> int:
         """Thousandths by which reservations are scaled: 1000 unless the provider was ever
         seen to bill more than a reservation."""
@@ -328,6 +362,10 @@ class Ledger:
             if row is None:
                 return None
             held, reserved = row[0] == "RESERVED", row[1]
+            if status == "UNKNOWN_BILLING":
+                # "worst case" means the hold as it stands NOW: it may have been widened since
+                # the caller captured it.
+                cost_nano = max(cost_nano, reserved)
             if held:
                 db.execute("UPDATE jev_calls SET day = ?, status = ?, cost_nano = ?, input_tokens = ?, "
                            "output_tokens = ?, served_by = 'jev', detail = ? WHERE id = ?",
@@ -504,8 +542,9 @@ class Guard:
         # The caller waits a hard wall-clock deadline (a socket timeout is only an inactivity
         # timeout, and an injected transport can ignore it). Past the deadline the caller gets
         # TimeoutError and the hold simply STAYS: the call is still counted, its late result is
-        # still settled and still checked against the bound. A call that never returns is
-        # charged its worst case by the sweep.
+        # still settled and still checked against the bound. While its thread lives the hold
+        # is kept fresh, so the sweep never converts a call that can still send; only a hold
+        # whose process died goes stale and is charged its worst case.
         box: dict = {}
 
         def work():
@@ -513,9 +552,12 @@ class Guard:
                 box["served"] = self._paid(call_id, body, caller, worst, nbytes, timeout)
             except BaseException as exc:                        # noqa: BLE001 -- re-raised below
                 box["err"] = exc
+            finally:
+                self.ledger.alive(call_id, False)               # settled: nothing left to keep fresh
         t = threading.Thread(target=work, daemon=True, name="jev-call-%d" % call_id)
+        self.ledger.alive(call_id, True)                        # before it starts: never swept while alive
         t.start()
-        t.join(timeout + DEADLINE_GRACE_S)
+        t.join(timeout)
         if t.is_alive():
             raise TimeoutError("Jev call passed its %.0fs wall-clock deadline; its hold of $%s stays "
                                "until it settles" % (timeout, usd(worst)))

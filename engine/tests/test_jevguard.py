@@ -577,7 +577,6 @@ def test_an_overshoot_widens_the_holds_already_in_flight_in_the_same_transaction
 def test_a_call_past_its_deadline_keeps_its_hold_and_settles_itself_late(tmp_path, monkeypatch):
     import time
     monkeypatch.setattr(jevguard, "MAX_TIMEOUT_S", 0.2)
-    monkeypatch.setattr(jevguard, "DEADLINE_GRACE_S", 0.1)
     release, sent, alerts = threading.Event(), [], []
 
     def drip(key, body, t):                                       # a transport that ignores its timeout
@@ -648,3 +647,88 @@ def test_a_swept_row_is_terminal_a_late_result_cannot_lower_or_move_its_charge(t
     assert row[:3] == ("2026-10-04", "UNKNOWN_BILLING", worst) and "late result: OK" in row[3]
     assert g.ledger.settle(cid, "OK", 2 * worst, 9, 0)            # a late result ABOVE it does raise it
     assert g.ledger._conn().execute("SELECT cost_nano FROM jev_calls WHERE id = ?", (cid,)).fetchone()[0] == 2 * worst
+
+
+# ---- fifth review round ----------------------------------------------------------------------
+def test_unknown_billing_charges_the_hold_as_widened_not_as_first_captured(tmp_path):
+    g = guard(tmp_path, Paid(), cap="100")
+    base = g.cfg.worst_case_nano(BODY)
+    a, worst_a, _ = g.ledger.reserve("in-flight", base, g.cfg.cap_nano, 1)        # captures W
+    b, _, _ = g.ledger.reserve("overshooter", base, g.cfg.cap_nano, 1)
+    g.ledger.settle(b, "OK", 3 * base, 3, 0)                      # widens A's hold to >= 3W
+    widened = g.ledger._conn().execute("SELECT reserved_nano FROM jev_calls WHERE id = ?", (a,)).fetchone()[0]
+    assert worst_a == base and widened >= 3 * base
+    g.ledger.settle(a, "UNKNOWN_BILLING", worst_a, None, None, "HTTP 500")        # A fails, passing stale W
+    cost = g.ledger._conn().execute("SELECT cost_nano FROM jev_calls WHERE id = ?", (a,)).fetchone()[0]
+    assert cost == widened                                        # charged the widened hold
+    c, _, _ = g.ledger.reserve("free", base, g.cfg.cap_nano, 1)   # NOT_BILLED still settles at zero
+    g.ledger.settle(c, "NOT_BILLED", 0, None, None, "HTTP 401")
+    assert g.ledger._conn().execute("SELECT cost_nano FROM jev_calls WHERE id = ?", (c,)).fetchone()[0] == 0
+
+
+def test_a_live_call_is_never_swept_and_stays_widenable_however_long_it_takes(tmp_path, monkeypatch):
+    import time
+    monkeypatch.setattr(jevguard, "MAX_TIMEOUT_S", 0.2)
+    clock, release, sent = Clock(), threading.Event(), []
+
+    def stuck(key, body, t):
+        sent.append(1)
+        release.wait(20)
+        return {"answers": {}, "usage": {"input_tokens": 10, "output_tokens": 0}}
+    g = guard(tmp_path, stuck, cap="100", clock=clock)
+    base = g.cfg.worst_case_nano(BODY)
+    with pytest.raises(TimeoutError):
+        g.call(BODY)
+    clock.t += timedelta(hours=3)                                 # far past the TTL, thread still alive
+    assert g.ledger.beat() == 1                                   # the heartbeat re-stamps its hold
+    other = guard(tmp_path, Paid(), cap="100", clock=clock)       # another process sweeps
+    c, _, _ = other.ledger.reserve("overshooter", base, other.cfg.cap_nano, 1)
+    row = other.ledger._conn().execute("SELECT status FROM jev_calls ORDER BY id LIMIT 1").fetchone()
+    assert row == ("RESERVED",)                                   # not swept: still a live hold
+    other.ledger.settle(c, "OK", 3 * base, 3, 0)                  # and it IS widened with the bound
+    assert other.ledger._conn().execute("SELECT reserved_nano FROM jev_calls ORDER BY id LIMIT 1").fetchone()[0] >= 3 * base
+    release.set()
+    for _ in range(100):
+        if g.status()["in_flight_usd"] == "0":
+            break
+        time.sleep(0.05)
+    assert g.ledger.beat() == 0 and g.ledger._live == set()       # finished: nothing left to beat
+
+
+def test_a_dead_process_stops_beating_and_its_hold_is_swept(tmp_path):
+    clock = Clock()
+    g = guard(tmp_path, Paid(), cap="100", clock=clock)
+    cid, _, _ = g.ledger.reserve("crashed-process", g.cfg.worst_case_nano(BODY), g.cfg.cap_nano, 1)
+    clock.t += timedelta(hours=3)
+    assert g.ledger.beat() == 0                                   # nobody claims it as alive
+    g.ledger.reserve("trigger-sweep", 1, g.cfg.cap_nano, 1)
+    assert g.ledger._conn().execute("SELECT status FROM jev_calls WHERE id = ?", (cid,)).fetchone() == ("UNKNOWN_BILLING",)
+
+
+def test_the_heartbeat_thread_runs_by_itself(tmp_path, monkeypatch):
+    import time
+    monkeypatch.setattr(jevguard, "HEARTBEAT_S", 0.05)
+    clock = Clock()
+    g = guard(tmp_path, Paid(), cap="100", clock=clock)
+    cid, _, _ = g.ledger.reserve("live", g.cfg.worst_case_nano(BODY), g.cfg.cap_nano, 1)
+    g.ledger.alive(cid, True)
+    clock.t += timedelta(hours=5)
+    want = clock.t.timestamp()
+    for _ in range(100):
+        if g.ledger._conn().execute("SELECT ts FROM jev_calls WHERE id = ?", (cid,)).fetchone()[0] == want:
+            break
+        time.sleep(0.05)
+    assert g.ledger._conn().execute("SELECT ts FROM jev_calls WHERE id = ?", (cid,)).fetchone()[0] == want
+    g.ledger.alive(cid, False)
+
+
+def test_the_caller_waits_exactly_the_deadline_not_longer(tmp_path, monkeypatch):
+    import time
+    monkeypatch.setattr(jevguard, "MAX_TIMEOUT_S", 0.3)
+    release = threading.Event()
+    g = guard(tmp_path, lambda key, body, t: release.wait(20) and {}, cap="100")
+    t0 = time.time()
+    with pytest.raises(TimeoutError):
+        g.call(BODY, timeout=999)
+    assert 0.3 <= time.time() - t0 < 1.0
+    release.set()
