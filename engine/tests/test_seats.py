@@ -173,7 +173,7 @@ def test_jev_in_free_only_only_sees_free_seats():
 def test_jev_failures_fail_open():
     def boom(key, body, t):
         raise TimeoutError
-    for adv in (jev.make_advisor(lambda: "k", post=boom), jev.make_advisor(lambda: "")):
+    for adv in (jev.make_advisor(lambda: "k", post=boom), jev.make_advisor(lambda: "", post=boom)):
         r = resolve(SeatRequest(task="t"), POOL, configured_policy="cheapest", advisor=adv)
         assert r.outcome is Outcome.SEAT and r.seat.provider == "sail" and r.jev["used"] is False
 

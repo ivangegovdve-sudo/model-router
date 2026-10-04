@@ -11,20 +11,21 @@ the task. It cannot add a seat, cannot override a rule, and is only applied abov
 probability floor. Any failure -- no key, timeout, bad shape, low confidence -- returns
 None and the deterministic order stands (fail-open, recorded).
 
+Every paid call goes through jevguard.Guard: the hard daily cap. When the cap blocks the
+call, the free local fallback answers, or -- with none -- the deterministic order stands.
+
 The caller's task text is DATA: bounded, and framed as state, never as instructions.
 The key is a GCP Secret Manager NAME (`typesafe-api-key`), read through Keyring, never
 logged. This is the router's own runtime inference; it never touches a Claude subscription.
 """
 from __future__ import annotations
 
-import json
 import math
-import urllib.request
 from typing import Callable
 
+from .jevguard import CapReached, Guard
 from .seats import Seat, SeatRequest
 
-API = "https://api.typesafe.ai/v1/systemone"
 MODEL = "jev-latest"
 TASK_MAX_CHARS = 1500
 MAX_SEATS = 6
@@ -47,9 +48,10 @@ def build_request(req: SeatRequest, eligible: list[Seat]) -> dict:
         "state": {
             "role": req.role,
             "task": req.task[:TASK_MAX_CHARS],
-            "seats": [{"seat": s.seat, "tier": s.tier, "kind": s.kind,
-                       "usd_per_mtok": str(s.usd_per_mtok), "family": s.family,
-                       "context": s.context_length} for s in seats],
+            # tier / kind / price are already in each option's criteria: sending them twice
+            # is billed twice (Jev bills input tokens only).
+            "seats": [{"seat": s.seat, "family": s.family, "context": s.context_length}
+                      for s in seats],
         },
         "questions": {"seat": dict(QUESTION, criteria={
             s.seat: "%s (tier %d, %s, %s)" % (s.model, s.tier, s.kind,
@@ -59,29 +61,37 @@ def build_request(req: SeatRequest, eligible: list[Seat]) -> dict:
     }
 
 
-def _post(key: str, body: dict, timeout: float) -> dict:
-    r = urllib.request.Request(API, data=json.dumps(body).encode(), method="POST",
-                               headers={"Authorization": "Bearer " + key,
-                                        "Content-Type": "application/json"})
-    with urllib.request.urlopen(r, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
 def make_advisor(get_key: Callable[[], str], *, min_prob: float = 0.6, timeout: float = 4.0,
-                 post: Callable[[str, dict, float], dict] = _post):
-    """-> advisor(req, eligible) -> (Seat | None, info). `post` is injectable for tests."""
+                 post: Callable[[str, dict, float], dict] | None = None,
+                 guard: Guard | None = None):
+    """-> advisor(req, eligible) -> (Seat | None, info).
+
+    `guard` is the spend-capped door to the paid API and is what the server passes. `post`
+    alone is for tests (an injected fake); a real paid call without a guard is refused."""
+    if guard is None and post is None:
+        raise ValueError("an unguarded paid Jev call is refused: pass guard=jevguard.Guard(...)")
+
     def advise(req: SeatRequest, eligible: list[Seat]):
         key = get_key()
         if not key:
             return None, {"used": False, "why": "no TypeSafe key readable"}
         body = build_request(req, eligible)
+        served_by = "jev"
         try:
-            ans = post(key, body, timeout)["answers"]["seat"]
+            if guard is not None:
+                served = guard.call(body, caller="modelrouter:seats", timeout=timeout)
+                resp, served_by = served.response, served.served_by
+            else:
+                resp = post(key, body, timeout)
+            ans = resp["answers"]["seat"]
             pick, prob = ans["choice"], float(ans["probabilities"][ans["choice"]])
+        except CapReached as exc:                      # no paid call was made
+            return None, {"used": False, "why": "jev daily cap reached, paid call not made; "
+                                                 "deterministic order kept (resets in %ds)" % exc.retry_after_s}
         except Exception as exc:                       # fail open
             return None, {"used": False, "why": "jev call failed: %s" % type(exc).__name__}
         by = {s.seat: s for s in eligible[:MAX_SEATS]}      # only seats Jev was shown
-        info = {"used": False, "choice": pick, "probability": prob}
+        info = {"used": False, "choice": pick, "probability": prob, "served_by": served_by}
         if not (isinstance(prob, float) and math.isfinite(prob) and 0.0 <= prob <= 1.0):
             info["why"] = "probability is not a finite number in [0,1]; ignored"
             return None, info

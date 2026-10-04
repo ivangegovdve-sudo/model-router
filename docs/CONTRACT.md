@@ -104,6 +104,37 @@ Response: `{outcome:"SEAT", policy, seat, provider, family, tier, cost_basis:
 decision_id}`. `considered` lists every seat with `QUALIFIES|EXCLUDED|UNKNOWN` and the reason.
 No seat: HTTP 422 `{type:"seat_unavailable", outcome:"UNAVAILABLE", because, considered[]}`.
 
+## `POST /v1/systemone` -- Jev behind the hard daily spend cap
+
+TypeSafe has no server-side budget, so the cap is enforced here, before each call. Same body
+and same answer as `https://api.typesafe.ai/v1/systemone` (`{model, state, questions}` ->
+`{model, answers, usage}`), plus `guard`. A caller that points here holds no TypeSafe key.
+
+* **Cap:** `[jev] daily_cap_usd` (default **$1.00**), reset at local midnight (`timezone`).
+  Env overrides: `JEV_DAILY_CAP_USD`, `JEV_USD_PER_MTOK_IN`, `JEV_USD_PER_MTOK_OUT`,
+  `JEV_GUARD_TZ`, `JEV_FALLBACK`, `JEV_FALLBACK_URL`, `JEV_ALERT_URL`, `JEV_GUARD_LEDGER`.
+* **Cost:** TypeSafe's published price -- $0.042 per million input tokens, output free
+  (jev-1.13.0) -- applied to the `usage` each answer returns. Integer nano-USD, never a guess.
+  A call with unknown billing (timeout, no `usage`) is charged its worst case, never $0.
+* **How it holds:** each call reserves its worst case (one token per request byte) in one
+  `BEGIN IMMEDIATE` transaction on `<state>/jev_spend.sqlite3`, then settles to the actual
+  cost. Concurrent callers and separate processes share the ledger; a crash keeps the hold.
+* **At the cap** the paid call is not made. `fallback = "laya"` (in-process, `pip install
+  modelrouter[laya]`) or `"url"` (a Jev-compatible local endpoint) answers for free: HTTP 200,
+  `guard.served_by = "fallback:..."`, `guard.blocked = true`. With `"defer"`, or if the
+  fallback fails: HTTP 429 `{error.code: "jev_daily_cap_reached"}` with `Retry-After` =
+  seconds to local midnight.
+* **Alert:** the first block of a day logs `JEV DAILY CAP TRIPPED`, appends one line to
+  `<state>/jev_guard_alerts.jsonl`, and POSTs it to `alert_url` if set.
+
+`guard`: `{served_by, cost_usd, blocked, day, cap_usd, spent_usd, remaining_usd}`. Headers:
+`X-Jev-Served-By`, `X-Jev-Spent-Usd`, `X-Jev-Cap-Usd`. Optional request header `X-Jev-Caller`
+names the caller in the ledger. `GET /v1/systemone/spend` (or `modelrouter jev-spend`) reports
+today's spend, remaining, paid / blocked calls and when the cap tripped.
+
+The seat advisor above goes through the same guard: at the cap it makes no paid call and the
+deterministic order stands (`jev.why` says so).
+
 ## Legibility
 
 | Method | Path | Returns |

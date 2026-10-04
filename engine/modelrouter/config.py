@@ -70,6 +70,17 @@ ollama_url = "http://127.0.0.1:11434"    # local-GPU seats are read live from /a
 enabled = true
 secret = "typesafe-api-key"  # GCP SM name; the switching layer, fail-open
 min_probability = 0.6
+# HARD daily cap on what is paid to TypeSafe, enforced here before each call (TypeSafe has
+# no server-side budget). Resets at local midnight. At the cap the paid call is not made:
+# the free local fallback answers, or the call is deferred. Every Jev caller that goes
+# through the guard (or POST /v1/systemone) shares this one cap.
+daily_cap_usd = 1.00
+usd_per_mtok_in = 0.042      # TypeSafe's published price for jev-1.13.0; output is free
+usd_per_mtok_out = 0.0
+timezone = ""                # IANA name, e.g. "Europe/Sofia"; "" = this machine's local time
+fallback = "laya"            # "laya" (in-process, pip install laya) | "url" | "defer"
+fallback_url = ""            # a Jev-compatible LOCAL endpoint, for fallback = "url"
+alert_url = ""               # optional webhook, POSTed once per day when the cap trips
 
 [policy]
 # Refuse any model whose price (measured, else list) is above this, in USD per million tokens.
@@ -126,8 +137,21 @@ class Config:
     jev_enabled: bool = True
     jev_secret: str = "typesafe-api-key"
     jev_min_probability: float = 0.6
+    jev_guard: dict = field(default_factory=dict)   # [jev] cap / price / fallback keys, as read
     state_dir: Path = field(default_factory=lambda: Path.home() / ".modelrouter")
     problems: list[str] = field(default_factory=list)
+
+    def guard_config(self):
+        """The Jev spend guard's settings: [jev] in the file, then JEV_* environment overrides.
+        The ledger lives in the state dir so every process of this install shares one cap."""
+        from .jevguard import GuardConfig
+        g = self.jev_guard
+        base = GuardConfig(
+            cap_usd=g.get("daily_cap_usd", "1.00"), usd_per_mtok_in=g.get("usd_per_mtok_in", "0.042"),
+            usd_per_mtok_out=g.get("usd_per_mtok_out", "0"), timezone=g.get("timezone", ""),
+            ledger=self.state_dir / "jev_spend.sqlite3", fallback=g.get("fallback", "laya"),
+            fallback_url=g.get("fallback_url", ""), alert_url=g.get("alert_url", ""))
+        return GuardConfig.from_env(base)
 
 
 def default_path() -> Path:
@@ -190,6 +214,13 @@ def load(path: Path | None = None) -> Config:
     cfg.jev_enabled = bool(jv.get("enabled", True))
     cfg.jev_secret = jv.get("secret", cfg.jev_secret)
     cfg.jev_min_probability = float(jv.get("min_probability", cfg.jev_min_probability))
+    cfg.jev_guard = {k: jv[k] for k in ("daily_cap_usd", "usd_per_mtok_in", "usd_per_mtok_out",
+                                        "timezone", "fallback", "fallback_url", "alert_url")
+                     if k in jv}
+    try:
+        cfg.guard_config()
+    except Exception as exc:
+        cfg.problems.append("[jev] %s" % exc)
     if cfg.source not in ("gcp", "env"):
         cfg.problems.append('secrets.source must be "gcp" or "env"')
     if cfg.source == "gcp" and not cfg.gcp_project:

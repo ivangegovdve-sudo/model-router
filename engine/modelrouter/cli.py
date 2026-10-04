@@ -211,6 +211,26 @@ def cmd_explain(a) -> int:
     return 0 if ch["outcome"] == "ROUTE" else 3
 
 
+def cmd_jev_spend(a) -> int:
+    """Today's Jev spend against the hard daily cap. Reads the ledger; makes no call."""
+    import json as _json
+
+    from .jevguard import Guard
+    st = Guard(load(a.config).guard_config(), lambda: "", fallback=None).status()
+    if a.json:
+        print(_json.dumps(st, indent=1))
+        return 0
+    print("Jev spend %s: $%s of $%s (remaining $%s, in flight $%s)" % (
+        st["day"], st["spent_usd"], st["cap_usd"], st["remaining_usd"], st["in_flight_usd"]))
+    print("  paid calls %d, input tokens %d, blocked by the cap %d, unknown-billing %d" % (
+        st["paid_calls"], st["input_tokens"], st["blocked_calls"], st["unknown_billing_calls"]))
+    print("  price %s; cap %s; resets in %d min" % (
+        st["price"], "TRIPPED at " + st["cap_tripped_at"] if st["cap_tripped_at"] else "not tripped",
+        st["resets_in_s"] // 60))
+    print("  ledger %s" % st["ledger"])
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser("modelrouter")
     ap.add_argument("--config", type=Path)
@@ -246,6 +266,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rows", help="one-word sweep rows (e.g. exp4_results.json)")
     p.add_argument("--curve", help="concurrency runs (e.g. exp5_results.json)")
     p.add_argument("--note", default="", help="provenance, recorded with each row")
+    p = sub.add_parser("jev-spend", help="today's TypeSafe/Jev spend against the hard daily cap")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("explain")
     p.add_argument("prompt")
     p.add_argument("--model", default="auto")
@@ -257,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
         from .server import main as serve
         serve(["--config", str(a.config)] if a.config else [])
         return 0
-    return {"init": cmd_init, "doctor": cmd_doctor, "probe": cmd_probe,
+    return {"init": cmd_init, "doctor": cmd_doctor, "probe": cmd_probe, "jev-spend": cmd_jev_spend,
             "explain": cmd_explain, "import-measurements": cmd_import, "keys": cmd_keys}[a.cmd](a)
 
 
