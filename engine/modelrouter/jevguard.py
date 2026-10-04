@@ -17,10 +17,18 @@ upper bound (one input token per UTF-8 byte of the request: a token is never sho
 byte), so settled + in-flight spend can never exceed the cap -- across threads and across
 processes sharing the ledger file. A crash between reserve and settle leaves the reservation
 standing: a crash cannot buy calls. A call whose billing is unknown (timeout, a 5xx, no
-`usage`) is charged its reservation, never $0; only a 401/403/429 refusal is free. A call
-still in flight when local midnight passes keeps counting against the new day until it
-settles. The price cannot be configured below TypeSafe's published one, the cap cannot be
-configured above MAX_CAP_USD, and a request too large to bound is refused.
+`usage`) is charged its reservation, never $0; only a 401/403 refusal is free. A call still
+in flight when local midnight passes keeps counting until it settles, and its cost lands in
+the day it settles in. A hold is never dropped for being old: after RESERVATION_TTL_S it is
+converted to a charge of its worst case. The price cannot be configured below TypeSafe's
+published one, the cap cannot be configured above MAX_CAP_USD, and a request too large to
+bound is refused.
+
+THE ONE ASSUMPTION: the provider never bills more input tokens than the request has bytes
+(true of any byte-level tokenizer; measured 0.30-0.51 tokens per byte). The exact bytes that
+were measured are the bytes that are sent. No client can stop a provider billing more than
+that; if it ever happens the guard alerts and scales every later reservation by the observed
+ratio (persisted), so the exposure is that one call.
 
 When the cap would be crossed the paid call is NOT made. The call is answered by the free
 local System-1 fallback (Laya in-process, or a Jev-compatible local URL) when one is
@@ -36,6 +44,7 @@ The TypeSafe key is never read here: the caller passes `get_key`, which reads it
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -65,13 +74,14 @@ MAX_CAP_USD = Decimal("100")        # a "cap" above this is a typo or a way arou
 # than it has bytes, and can never return more output than the request limit.
 MAX_REQUEST_BYTES = 262_144
 MAX_OUTPUT_TOKENS = 65_536
-# A reservation that never settles (crash) stops counting once the day it was made in is over
-# AND it is older than this; any live call has long since timed out by then.
+# A hold that has not settled after this long belongs to a crashed call. It is never simply
+# dropped: it is converted to a charge of its worst case (UNKNOWN_BILLING). No call can still
+# be in flight by then, because the guard caps every call's timeout at MAX_TIMEOUT_S.
 RESERVATION_TTL_S = 3600
-# Statuses that can only mean the request was refused before inference: bad key, rate limit.
-# Every other HTTP error (notably 5xx) may have been billed.
-NOT_BILLED_STATUSES = (401, 403, 429)
-LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+MAX_TIMEOUT_S = 600.0
+# Statuses that can only mean the key was refused before inference. Every other HTTP error
+# (5xx, and 429 too: nothing guarantees a rate-limit answer is unbilled) may have been billed.
+NOT_BILLED_STATUSES = (401, 403)
 
 
 def _dec(v, what: str) -> Decimal:
@@ -142,8 +152,13 @@ class GuardConfig:
         return self.cost_nano(request_bytes(body), MAX_OUTPUT_TOKENS)
 
 
+def encode_body(body: dict) -> bytes:
+    """The one serialisation: what is measured for the reservation is what goes on the wire."""
+    return json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 def request_bytes(body: dict) -> int:
-    n = len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    n = len(encode_body(body))
     if n > MAX_REQUEST_BYTES:
         raise ValueError("Jev request is %d bytes; above %d it cannot be bounded and is refused"
                          % (n, MAX_REQUEST_BYTES))
@@ -184,6 +199,15 @@ class Ledger:
                 ts REAL NOT NULL DEFAULT 0)""")
             if "ts" not in [r[1] for r in db.execute("PRAGMA table_info(jev_calls)")]:
                 db.execute("ALTER TABLE jev_calls ADD COLUMN ts REAL NOT NULL DEFAULT 0")
+            # A ledger written before `ts` existed: take each row's time from `at`, so an old
+            # hold is aged from when it was made, not treated as made in 1970.
+            for rid, at in db.execute("SELECT id, at FROM jev_calls WHERE ts = 0").fetchall():
+                try:
+                    ts = datetime.fromisoformat(at).timestamp()
+                except ValueError:
+                    ts = self.now().timestamp()                 # unreadable: treat as just made
+                db.execute("UPDATE jev_calls SET ts = ? WHERE id = ?", (ts, rid))
+            db.execute("CREATE TABLE IF NOT EXISTS jev_meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL)")
             db.execute("CREATE INDEX IF NOT EXISTS jev_calls_day ON jev_calls(day)")
             db.execute("""CREATE TABLE IF NOT EXISTS jev_alerts (
                 day TEXT PRIMARY KEY, at TEXT NOT NULL, detail TEXT NOT NULL)""")
@@ -225,17 +249,38 @@ class Ledger:
         return Ledger._Tx(self._conn())
 
     def _committed(self, db, day: str) -> int:
-        """Today's settled cost and holds, plus any hold from an earlier day whose call may
-        still be in flight: a call that straddles midnight does not get a second budget."""
+        """Today's settled cost, plus EVERY unsettled hold whatever day it was made: a call
+        that straddles midnight does not get a second budget."""
         return db.execute(
             "SELECT COALESCE(SUM(COALESCE(cost_nano, reserved_nano)), 0) FROM jev_calls "
-            "WHERE day = ? OR (status = 'RESERVED' AND ts > ?)",
-            (day, self.now().timestamp() - RESERVATION_TTL_S)).fetchone()[0]
+            "WHERE day = ? OR status = 'RESERVED'", (day,)).fetchone()[0]
+
+    def _sweep(self, db) -> None:
+        """A hold older than the TTL is a crashed call: charge it its worst case, in the day
+        it was made. It is converted, never forgotten."""
+        db.execute("UPDATE jev_calls SET status = 'UNKNOWN_BILLING', cost_nano = reserved_nano, "
+                   "served_by = 'jev', detail = 'never settled: charged the worst case' "
+                   "WHERE status = 'RESERVED' AND ts < ?",
+                   (self.now().timestamp() - RESERVATION_TTL_S,))
+
+    def bound_factor(self) -> int:
+        """Thousandths by which reservations are scaled: 1000 unless the provider was ever
+        seen to bill more than a reservation."""
+        r = self._conn().execute("SELECT v FROM jev_meta WHERE k = 'bound_factor'").fetchone()
+        return max(1000, r[0]) if r else 1000
+
+    def raise_bound(self, reserved_nano: int, cost_nano: int) -> int:
+        need = -(-cost_nano * self.bound_factor() // max(reserved_nano, 1)) + 100   # +10% margin
+        with self._tx() as db:
+            db.execute("INSERT INTO jev_meta(k, v) VALUES ('bound_factor', ?) "
+                       "ON CONFLICT(k) DO UPDATE SET v = MAX(v, excluded.v)", (need,))
+        return self.bound_factor()
 
     def reserve(self, caller: str, worst_nano: int, cap_nano: int, request_bytes: int):
         """-> (call id, None) when it fits under the cap, else (None, committed nano-USD)."""
         day = self.day()
         with self._tx() as db:
+            self._sweep(db)
             spent = self._committed(db, day)
             if spent + worst_nano > cap_nano:
                 return None, spent
@@ -248,10 +293,12 @@ class Ledger:
 
     def settle(self, call_id: int, status: str, cost_nano: int, input_tokens: int | None,
                output_tokens: int | None, detail: str = "") -> None:
+        """The cost lands in the day the call SETTLES in: a call that started before midnight
+        and finished after it is spend of the new day, not a free ride on the old one."""
         with self._tx() as db:
-            db.execute("UPDATE jev_calls SET status = ?, cost_nano = ?, input_tokens = ?, "
+            db.execute("UPDATE jev_calls SET day = ?, status = ?, cost_nano = ?, input_tokens = ?, "
                        "output_tokens = ?, served_by = 'jev', detail = ? WHERE id = ?",
-                       (status, cost_nano, input_tokens, output_tokens, detail[:300], call_id))
+                       (self.day(), status, cost_nano, input_tokens, output_tokens, detail[:300], call_id))
 
     def blocked(self, caller: str, worst_nano: int, request_bytes: int, served_by: str,
                 detail: str) -> bool:
@@ -269,16 +316,17 @@ class Ledger:
         day = self.day()
         db = self._conn()
         committed = self._committed(db, day)
+        held = db.execute("SELECT COALESCE(SUM(reserved_nano), 0) FROM jev_calls "
+                          "WHERE status = 'RESERVED'").fetchone()[0]
         r = db.execute(
-            "SELECT 0, "
-            "COALESCE(SUM(CASE WHEN status = 'RESERVED' THEN reserved_nano END), 0), "
+            "SELECT 0, 0, "
             "COALESCE(SUM(status IN ('OK', 'UNKNOWN_BILLING', 'NOT_BILLED', 'RESERVED')), 0), "
             "COALESCE(SUM(status = 'BLOCKED'), 0), COALESCE(SUM(input_tokens), 0), "
             "COALESCE(SUM(status = 'UNKNOWN_BILLING'), 0) FROM jev_calls WHERE day = ?",
             (day,)).fetchone()
         alert = db.execute("SELECT at FROM jev_alerts WHERE day = ?", (day,)).fetchone()
         return {"day": day, "cap_usd": usd(cap_nano), "spent_usd": usd(committed),
-                "remaining_usd": usd(max(cap_nano - committed, 0)), "in_flight_usd": usd(r[1]),
+                "remaining_usd": usd(max(cap_nano - committed, 0)), "in_flight_usd": usd(held),
                 "paid_calls": r[2], "blocked_calls": r[3], "input_tokens": r[4],
                 "unknown_billing_calls": r[5], "cap_tripped_at": alert[0] if alert else None,
                 "resets_in_s": self.seconds_to_reset(), "ledger": str(self.path)}
@@ -305,7 +353,7 @@ def _post(url: str, key: str | None, body: dict, timeout: float) -> dict:
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = "Bearer " + key
-    r = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers=headers)
+    r = urllib.request.Request(url, data=encode_body(body), method="POST", headers=headers)
     try:
         with _OPENER.open(r, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -331,15 +379,19 @@ def laya_fallback() -> Callable[[dict, float], dict] | None:
 
 
 def url_fallback(url: str) -> Callable[[dict, float], dict] | None:
-    """A Jev-compatible endpoint ON THIS MACHINE. Anything else could be a paid service (or a
-    proxy to one) that the cap does not see, so only a loopback address is accepted, and
-    `_post` does not follow redirects."""
+    """A Jev-compatible endpoint ON THIS MACHINE. Anything else could be a paid service that
+    the cap does not see, so only a LITERAL loopback IP is accepted (a name such as
+    `localhost` can be re-pointed by a hosts file or DNS), and `_post` follows no redirect."""
     if not url:
         return None
     u = urllib.parse.urlsplit(url)
-    if u.scheme not in ("http", "https") or (u.hostname or "").lower() not in LOOPBACK_HOSTS:
-        raise ValueError("fallback_url must be a loopback http(s) address (127.0.0.1, localhost, "
-                         "::1): a fallback has to be free and local")
+    try:
+        loopback = ipaddress.ip_address(u.hostname or "").is_loopback
+    except ValueError:
+        loopback = False
+    if u.scheme not in ("http", "https") or not loopback:
+        raise ValueError("fallback_url must be http(s) to a literal loopback IP (127.0.0.1 or "
+                         "[::1]): a fallback has to be free and local")
     return lambda body, timeout: _post(url, None, body, timeout)
 
 
@@ -396,7 +448,8 @@ class Guard:
 
     def call(self, body: dict, *, caller: str = "unknown", timeout: float = 20.0) -> Served:
         nbytes = request_bytes(body)                            # refuses an unboundable request
-        worst = self.cfg.worst_case_nano(body)
+        worst = -(-self.cfg.worst_case_nano(body) * self.ledger.bound_factor() // 1000)
+        timeout = min(float(timeout), MAX_TIMEOUT_S)            # no call outlives its hold's TTL
         call_id, spent = self.ledger.reserve(caller, worst, self.cfg.cap_nano, nbytes)
         if call_id is None:
             return self._blocked(body, caller, worst, nbytes, spent, timeout)
@@ -420,10 +473,12 @@ class Guard:
         if all(type(t) is int and t >= 0 for t in (tin, tout)):
             cost = self.cfg.cost_nano(tin, tout)
             self.ledger.settle(call_id, "OK", cost, tin, tout)
-            if cost > worst:                                    # the bound was wrong: say so loudly
+            if cost > worst:        # the provider billed past the bound: widen it for good, loudly
+                factor = self.ledger.raise_bound(worst, cost)
                 self._alert({"event": "jev_reservation_exceeded", "caller": caller,
                              "reserved_usd": usd(worst), "cost_usd": usd(cost),
-                             "request_bytes": nbytes, "input_tokens": tin, "output_tokens": tout})
+                             "request_bytes": nbytes, "input_tokens": tin, "output_tokens": tout,
+                             "reservations_now_scaled_by": factor / 1000})
         else:                                                   # answered, usage absent or malformed
             cost = worst
             self.ledger.settle(call_id, "UNKNOWN_BILLING", worst, None, None, "no usable usage in response")

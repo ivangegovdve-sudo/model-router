@@ -115,17 +115,18 @@ and same answer as `https://api.typesafe.ai/v1/systemone` (`{model, state, quest
   `JEV_GUARD_TZ`, `JEV_FALLBACK`, `JEV_FALLBACK_URL`, `JEV_ALERT_URL`, `JEV_GUARD_LEDGER`.
 * **Cost:** TypeSafe's published price -- $0.042 per million input tokens, output free
   (jev-1.13.0) -- applied to the `usage` each answer returns. Integer nano-USD, never a guess.
-  A call with unknown billing (timeout, any HTTP error except 401/403/429, no usable `usage`)
+  A call with unknown billing (timeout, any HTTP error except 401/403, no usable `usage`)
   is charged its worst case, never $0. The price cannot be configured below the published one
   and the cap cannot be set above $100: no config or env value turns the cap off.
 * **How it holds:** each call reserves its worst case (one input token per request byte, plus
   the API's 64k output limit at the output price) in one `BEGIN IMMEDIATE` transaction on
   `<state>/jev_spend.sqlite3`, then settles to the actual cost. Concurrent callers and separate
   processes share the ledger; a crash keeps the hold; a call still in flight at midnight keeps
-  counting against the new day until it settles. A request above 256 KB cannot be bounded and
+  counting until it settles, and its cost lands in the day it settles in; a hold older than 1h is
+  converted to a charge of its worst case, never dropped. A request above 256 KB cannot be bounded and
   is refused (HTTP 413).
 * **At the cap** the paid call is not made. `fallback = "laya"` (in-process, `pip install
-  modelrouter[laya]`) or `"url"` (a Jev-compatible endpoint on loopback only; redirects are not followed) answers for free: HTTP 200,
+  modelrouter[laya]`) or `"url"` (a Jev-compatible endpoint on a literal loopback IP only; redirects are not followed) answers for free: HTTP 200,
   `guard.served_by = "fallback:..."`, `guard.blocked = true`. With `"defer"`, or if the
   fallback fails: HTTP 429 `{error.code: "jev_daily_cap_reached"}` with `Retry-After` =
   seconds to local midnight.
