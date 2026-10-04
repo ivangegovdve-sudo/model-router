@@ -123,14 +123,16 @@ and same answer as `https://api.typesafe.ai/v1/systemone` (`{model, state, quest
   plus the API's 64k output limit at the output price) in one `BEGIN IMMEDIATE` transaction on
   `<state>/jev_spend.sqlite3`, then settles to the actual cost. Concurrent callers and separate
   processes share the ledger; a crash keeps the hold; a call still in flight at midnight keeps
-  counting until it settles, and its cost lands in the day it settles in; a hold older than 1h is
-  converted to a charge of its worst case, never dropped. Each call has a hard 600s wall-clock
-  deadline, after which it is charged its worst case.
+  counting until it settles, and its cost lands in the day it settles in. A caller waits at most
+  600s (wall clock); past that it gets a timeout while the call's hold stays, and the call
+  settles itself when it returns. A hold whose process died (no heartbeat for 1h) is converted
+  to a charge of its worst case, never dropped. A request above 256 KB cannot be bounded and is
+  refused (HTTP 413).
 * **Limit:** the bound rests on the provider billing no more than that. No client can stop a
   provider billing more than it was sent; if a settlement ever exceeds its reservation the guard
   alerts (`jev_reservation_exceeded`) and widens every in-flight hold and later reservation by
-  the observed ratio in the same transaction. The exposure is the calls on the wire at that moment. A request above 256 KB cannot be bounded and
-  is refused (HTTP 413).
+  the observed ratio in the same transaction. The exposure is the calls on the wire at that
+  moment.
 * **At the cap** the paid call is not made. `fallback = "laya"` (in-process, `pip install
   modelrouter[laya]`) or `"url"` (a Jev-compatible endpoint on a literal loopback IP only; redirects are not followed) answers for free: HTTP 200,
   `guard.served_by = "fallback:..."`, `guard.blocked = true`. With `"defer"`, or if the
