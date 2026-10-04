@@ -35,8 +35,9 @@ same transaction, widens every hold still in flight and every later reservation 
 observed ratio (persisted). The exposure is then the calls already on the wire at that
 moment -- nothing new is admitted on the old bound.
 
-A call has a hard wall-clock deadline (MAX_TIMEOUT_S). When it passes, the call is charged
-its worst case and the caller gets TimeoutError, whatever the transport is still doing.
+A caller waits at most a hard wall-clock deadline (MAX_TIMEOUT_S). Past it the caller gets
+TimeoutError while the call's hold stays in place; the call still settles itself when it
+returns, and its late result is still checked against the bound.
 
 When the cap would be crossed the paid call is NOT made. The call is answered by the free
 local System-1 fallback (Laya in-process, or a Jev-compatible local URL) when one is
@@ -89,10 +90,11 @@ REQUEST_OVERHEAD_TOKENS = 1024
 QUESTION_OVERHEAD_TOKENS = 64
 # A hold that has not settled after this long belongs to a crashed process. It is never simply
 # dropped: it is converted to a charge of its worst case (UNKNOWN_BILLING) in the day the sweep
-# runs. No call of a live process is still held by then: the guard enforces MAX_TIMEOUT_S as a
-# hard wall-clock deadline and charges the worst case itself when it passes.
+# runs. A row the sweep converted is terminal: a late result can raise its charge, never lower
+# it. The TTL is far above MAX_TIMEOUT_S, the longest any transport is asked to wait.
 RESERVATION_TTL_S = 3600
 MAX_TIMEOUT_S = 600.0
+DEADLINE_GRACE_S = 2.0              # the transport's own timeout gets this long to fire first
 # Statuses that can only mean the key was refused before inference. Every other HTTP error
 # (5xx, and 429 too: nothing guarantees a rate-limit answer is unbilled) may have been billed.
 NOT_BILLED_STATUSES = (401, 403)
@@ -272,57 +274,73 @@ class Ledger:
             "SELECT COALESCE(SUM(COALESCE(cost_nano, reserved_nano)), 0) FROM jev_calls "
             "WHERE day = ? OR status = 'RESERVED'", (day,)).fetchone()[0]
 
-    def _sweep(self, db) -> None:
+    def _sweep(self, db, now: datetime) -> None:
         """A hold older than the TTL belongs to a crashed process: charge it its worst case,
         in TODAY's budget (the day the sweep runs). It is converted, never forgotten, and it
         never leaves the current day's count by being converted."""
         db.execute("UPDATE jev_calls SET day = ?, status = 'UNKNOWN_BILLING', cost_nano = reserved_nano, "
                    "served_by = 'jev', detail = 'never settled: charged the worst case' "
                    "WHERE status = 'RESERVED' AND ts < ?",
-                   (self.day(), self.now().timestamp() - RESERVATION_TTL_S))
+                   (now.date().isoformat(), now.timestamp() - RESERVATION_TTL_S))
 
-    def bound_factor(self) -> int:
+    def bound_factor(self, db=None) -> int:
         """Thousandths by which reservations are scaled: 1000 unless the provider was ever
         seen to bill more than a reservation."""
-        r = self._conn().execute("SELECT v FROM jev_meta WHERE k = 'bound_factor'").fetchone()
+        r = (db or self._conn()).execute("SELECT v FROM jev_meta WHERE k = 'bound_factor'").fetchone()
         return max(1000, r[0]) if r else 1000
 
+    def reserve(self, caller: str, base_nano: int, cap_nano: int, request_bytes: int):
+        """-> (call id, reserved nano-USD, None) when it fits under the cap,
+        else (None, what it would have reserved, committed nano-USD).
 
-    def reserve(self, caller: str, worst_nano: int, cap_nano: int, request_bytes: int):
-        """-> (call id, None) when it fits under the cap, else (None, committed nano-USD)."""
-        day = self.day()
+        Everything the decision reads is read under the one write lock, from one clock
+        snapshot: the day, the sweep, the bound factor and the committed spend. A factor
+        widened by another process a moment ago, or a hold swept across midnight, cannot be
+        missed by a value read earlier."""
         with self._tx() as db:
-            self._sweep(db)
+            now = self.now()
+            day = now.date().isoformat()
+            self._sweep(db, now)
+            worst = -(-base_nano * self.bound_factor(db) // 1000)
             spent = self._committed(db, day)
-            if spent + worst_nano > cap_nano:
-                return None, spent
+            if spent + worst > cap_nano:
+                return None, worst, spent
             cur = db.execute(
                 "INSERT INTO jev_calls(day, at, caller, status, reserved_nano, request_bytes, ts) "
                 "VALUES (?, ?, ?, 'RESERVED', ?, ?, ?)",
-                (day, self.now().isoformat(timespec="seconds"), caller, worst_nano, request_bytes,
-                 self.now().timestamp()))
-            return cur.lastrowid, None
+                (day, now.isoformat(timespec="seconds"), caller, worst, request_bytes, now.timestamp()))
+            return cur.lastrowid, worst, None
 
     def settle(self, call_id: int, status: str, cost_nano: int, input_tokens: int | None,
-               output_tokens: int | None, detail: str = "") -> None:
-        """The cost lands in the day the call SETTLES in: a call that started before midnight
-        and finished after it is spend of the new day, not a free ride on the old one.
+               output_tokens: int | None, detail: str = "") -> int | None:
+        """A held call's cost lands in the day it SETTLES in: a call that started before
+        midnight and finished after it is spend of the new day, not a free ride on the old.
+
+        A row that is no longer held (the sweep already charged it) is terminal: a late result
+        can raise its charge, never lower it and never move it to another day.
 
         -> the new bound factor (thousandths) when this settlement exceeded its reservation,
         else None. In that case, in this same transaction, every hold still in flight is
         widened by the observed ratio and so is every later reservation: nothing is admitted
         on a bound that has just been shown to be wrong."""
         with self._tx() as db:
-            row = db.execute("SELECT reserved_nano FROM jev_calls WHERE id = ?", (call_id,)).fetchone()
-            db.execute("UPDATE jev_calls SET day = ?, status = ?, cost_nano = ?, input_tokens = ?, "
-                       "output_tokens = ?, served_by = 'jev', detail = ? WHERE id = ?",
-                       (self.day(), status, cost_nano, input_tokens, output_tokens, detail[:300], call_id))
-            reserved = row[0] if row else 0
+            row = db.execute("SELECT status, reserved_nano FROM jev_calls WHERE id = ?", (call_id,)).fetchone()
+            if row is None:
+                return None
+            held, reserved = row[0] == "RESERVED", row[1]
+            if held:
+                db.execute("UPDATE jev_calls SET day = ?, status = ?, cost_nano = ?, input_tokens = ?, "
+                           "output_tokens = ?, served_by = 'jev', detail = ? WHERE id = ?",
+                           (self.day(), status, cost_nano, input_tokens, output_tokens, detail[:300], call_id))
+            else:
+                db.execute("UPDATE jev_calls SET cost_nano = MAX(COALESCE(cost_nano, 0), ?), "
+                           "input_tokens = COALESCE(?, input_tokens), output_tokens = COALESCE(?, output_tokens), "
+                           "detail = substr(COALESCE(detail, '') || ' | late result: ' || ?, 1, 300) WHERE id = ?",
+                           (cost_nano, input_tokens, output_tokens, status, call_id))
             if not reserved or cost_nano <= reserved:
                 return None
             ratio = -(-cost_nano * 1000 // reserved) + 100          # thousandths, +10% margin
-            cur = db.execute("SELECT v FROM jev_meta WHERE k = 'bound_factor'").fetchone()
-            factor = -(-max(1000, cur[0] if cur else 1000) * ratio // 1000)
+            factor = -(-self.bound_factor(db) * ratio // 1000)
             db.execute("INSERT INTO jev_meta(k, v) VALUES ('bound_factor', ?) "
                        "ON CONFLICT(k) DO UPDATE SET v = excluded.v", (factor,))
             db.execute("UPDATE jev_calls SET reserved_nano = (reserved_nano * ? + 999) / 1000 "
@@ -477,20 +495,44 @@ class Guard:
 
     def call(self, body: dict, *, caller: str = "unknown", timeout: float = 20.0) -> Served:
         nbytes = request_bytes(body)                            # refuses an unboundable request
-        worst = -(-self.cfg.worst_case_nano(body) * self.ledger.bound_factor() // 1000)
-        timeout = min(float(timeout), MAX_TIMEOUT_S)            # no call outlives its hold's TTL
-        call_id, spent = self.ledger.reserve(caller, worst, self.cfg.cap_nano, nbytes)
+        timeout = min(float(timeout), MAX_TIMEOUT_S)
+        call_id, worst, spent = self.ledger.reserve(caller, self.cfg.worst_case_nano(body),
+                                                    self.cfg.cap_nano, nbytes)
         if call_id is None:
             return self._blocked(body, caller, worst, nbytes, spent, timeout)
-        # From here every path settles the reservation: nothing sent -> NOT_BILLED; sent and
-        # anything but a clean answer with usage -> charged the worst case.
+        # The paid call runs in its own thread, which also SETTLES it, whenever it finishes.
+        # The caller waits a hard wall-clock deadline (a socket timeout is only an inactivity
+        # timeout, and an injected transport can ignore it). Past the deadline the caller gets
+        # TimeoutError and the hold simply STAYS: the call is still counted, its late result is
+        # still settled and still checked against the bound. A call that never returns is
+        # charged its worst case by the sweep.
+        box: dict = {}
+
+        def work():
+            try:
+                box["served"] = self._paid(call_id, body, caller, worst, nbytes, timeout)
+            except BaseException as exc:                        # noqa: BLE001 -- re-raised below
+                box["err"] = exc
+        t = threading.Thread(target=work, daemon=True, name="jev-call-%d" % call_id)
+        t.start()
+        t.join(timeout + DEADLINE_GRACE_S)
+        if t.is_alive():
+            raise TimeoutError("Jev call passed its %.0fs wall-clock deadline; its hold of $%s stays "
+                               "until it settles" % (timeout, usd(worst)))
+        if "err" in box:
+            raise box["err"]
+        return box["served"]
+
+    def _paid(self, call_id: int, body: dict, caller: str, worst: int, nbytes: int, timeout: float) -> Served:
+        """Make the reserved call and settle it. Every path settles: nothing sent ->
+        NOT_BILLED; sent and anything but a clean answer with usage -> the worst case."""
         sent = False
         try:
             key = self.get_key()
             if not key:
                 raise RuntimeError("no TypeSafe key readable (by name)")
             sent = True
-            resp = self._deadline(lambda: self._post(key, body, timeout), timeout)
+            resp = self._post(key, body, timeout)
         except BaseException as exc:
             free = not sent or (isinstance(exc, HttpStatus) and exc.code in NOT_BILLED_STATUSES)
             self.ledger.settle(call_id, "NOT_BILLED" if free else "UNKNOWN_BILLING",
@@ -511,28 +553,6 @@ class Guard:
             cost = worst
             self.ledger.settle(call_id, "UNKNOWN_BILLING", worst, None, None, "no usable usage in response")
         return Served(resp, "jev", usd(cost), False, self.ledger.status(self.cfg.cap_nano))
-
-    @staticmethod
-    def _deadline(fn: Callable[[], dict], seconds: float) -> dict:
-        """Run the transport under a hard wall-clock deadline. A socket timeout is only an
-        inactivity timeout (a server can drip bytes for ever) and an injected transport can
-        ignore it; this cannot be outlived. Past the deadline the caller raises TimeoutError,
-        which charges the worst case; whatever the transport returns later is discarded."""
-        box: dict = {}
-
-        def run():
-            try:
-                box["ok"] = fn()
-            except BaseException as exc:                        # noqa: BLE001 -- re-raised below
-                box["err"] = exc
-        t = threading.Thread(target=run, daemon=True, name="jev-call")
-        t.start()
-        t.join(seconds)
-        if t.is_alive():
-            raise TimeoutError("Jev call passed its %.0fs wall-clock deadline" % seconds)
-        if "err" in box:
-            raise box["err"]
-        return box["ok"]
 
     def _blocked(self, body, caller, worst, nbytes, spent, timeout) -> Served:
         why = ("daily Jev cap $%s reached: $%s committed today, this call could cost up to $%s"

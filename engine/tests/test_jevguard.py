@@ -450,7 +450,7 @@ def test_a_call_settled_after_midnight_is_spend_of_the_new_day(tmp_path):
     clock.t = clock.t.replace(hour=23, minute=59, second=59)
     g = guard(tmp_path, paid, cap="0.15", clock=clock)
     worst = g.cfg.worst_case_nano(BODY)
-    held, _ = g.ledger.reserve("straddler", worst, g.cfg.cap_nano, 1)
+    held, _, _ = g.ledger.reserve("straddler", worst, g.cfg.cap_nano, 1)
     clock.t += timedelta(seconds=5)                               # 00:00:04, and it lands now
     g.ledger.settle(held, "OK", worst, 500, 0)
     st = g.status()
@@ -540,26 +540,6 @@ def test_the_bound_covers_what_the_live_api_billed():
     assert cfg.worst_case_nano(tiny) >= cfg.cost_nano(269, 0) * 4          # 4x the measured overhead
 
 
-def test_a_live_call_past_its_deadline_is_charged_and_cannot_be_outlived(tmp_path, monkeypatch):
-    import time
-    monkeypatch.setattr(jevguard, "MAX_TIMEOUT_S", 0.2)
-    release = threading.Event()
-
-    def drip(key, body, t):                                       # a transport that ignores its timeout
-        release.wait(10)
-        return {"answers": {}, "usage": {"input_tokens": 1, "output_tokens": 0}}
-    g = guard(tmp_path, drip, cap="0.15")
-    t0 = time.time()
-    with pytest.raises(TimeoutError):
-        g.call(BODY, timeout=3600)
-    assert time.time() - t0 < 5
-    st = g.status()                                               # charged now, while still "live"
-    assert D(st["spent_usd"]) == PER_CALL and st["unknown_billing_calls"] == 1 and st["in_flight_usd"] == "0"
-    with pytest.raises(CapReached):                               # so it cannot make room for another
-        g.call(BODY)
-    release.set()
-
-
 def test_a_swept_hold_is_charged_to_the_day_of_the_sweep(tmp_path):
     clock = Clock()
     clock.t = clock.t.replace(hour=23, minute=30)
@@ -578,9 +558,9 @@ def test_an_overshoot_widens_the_holds_already_in_flight_in_the_same_transaction
     alerts = []
     g = guard(tmp_path, Paid(input_tokens=10 ** 9), cap="100", alerts=alerts)
     base = g.cfg.worst_case_nano(BODY)
-    a, _ = g.ledger.reserve("in-flight-a", base, g.cfg.cap_nano, 1)
-    b, _ = g.ledger.reserve("in-flight-b", base, g.cfg.cap_nano, 1)
-    c, _ = g.ledger.reserve("overshooter", base, g.cfg.cap_nano, 1)
+    a, _, _ = g.ledger.reserve("in-flight-a", base, g.cfg.cap_nano, 1)
+    b, _, _ = g.ledger.reserve("in-flight-b", base, g.cfg.cap_nano, 1)
+    c, _, _ = g.ledger.reserve("overshooter", base, g.cfg.cap_nano, 1)
     factor = g.ledger.settle(c, "OK", 3 * base, 3, 0)             # billed 3x its reservation
     assert factor >= 3000 and g.ledger.bound_factor() == factor
     held = [r[0] for r in g.ledger._conn().execute(
@@ -591,3 +571,80 @@ def test_an_overshoot_widens_the_holds_already_in_flight_in_the_same_transaction
     other.call(BODY)
     last = other.ledger._conn().execute("SELECT reserved_nano FROM jev_calls ORDER BY id DESC LIMIT 1").fetchone()[0]
     assert last >= 3 * base
+
+
+# ---- fourth review round ---------------------------------------------------------------------
+def test_a_call_past_its_deadline_keeps_its_hold_and_settles_itself_late(tmp_path, monkeypatch):
+    import time
+    monkeypatch.setattr(jevguard, "MAX_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(jevguard, "DEADLINE_GRACE_S", 0.1)
+    release, sent, alerts = threading.Event(), [], []
+
+    def drip(key, body, t):                                       # a transport that ignores its timeout
+        sent.append(1)
+        release.wait(20)
+        return {"answers": {}, "usage": {"input_tokens": 3 * BOUND, "output_tokens": 0}}   # and overbills
+    g = guard(tmp_path, drip, cap="0.15", alerts=alerts)
+    t0 = time.time()
+    with pytest.raises(TimeoutError):
+        g.call(BODY, timeout=3600)
+    assert time.time() - t0 < 5 and sent == [1]
+    st = g.status()                                               # still HELD: not settled, not dropped
+    assert D(st["in_flight_usd"]) == PER_CALL == D(st["spent_usd"]) and st["unknown_billing_calls"] == 0
+    with pytest.raises(CapReached):                               # so it cannot make room for another
+        g.call(BODY)
+    assert sent == [1]                                            # the blocked call sent nothing
+    release.set()                                                 # the late answer arrives
+    for _ in range(100):
+        if g.status()["in_flight_usd"] == "0":
+            break
+        time.sleep(0.05)
+    st = g.status()
+    assert D(st["spent_usd"]) == 3 * PER_CALL and st["in_flight_usd"] == "0"       # settled by the worker
+    assert [a["event"] for a in alerts if a["event"] != "jev_daily_cap_tripped"] == ["jev_reservation_exceeded"]
+    assert g.ledger.bound_factor() >= 3000                        # the late overbilling was detected
+
+
+def test_the_bound_factor_is_read_under_the_reservation_lock(tmp_path):
+    g = guard(tmp_path, Paid(), cap="100")
+    base = g.cfg.worst_case_nano(BODY)
+    stale = g.ledger.bound_factor()                               # what a caller read a moment ago
+    other = guard(tmp_path, Paid(), cap="100")                    # another process widens it meanwhile
+    c, reserved, _ = other.ledger.reserve("overshooter", base, other.cfg.cap_nano, 1)
+    other.ledger.settle(c, "OK", 3 * base, 3, 0)
+    cid, reserved, _ = g.ledger.reserve("late-reader", base, g.cfg.cap_nano, 1)
+    assert stale == 1000 and reserved >= 3 * base                 # the fresh factor, not the stale one
+    assert g.ledger._conn().execute("SELECT reserved_nano FROM jev_calls WHERE id = ?", (cid,)).fetchone()[0] == reserved
+
+
+def test_reserve_reads_the_day_after_the_sweep_from_one_clock_snapshot(tmp_path):
+    clock = Clock()
+    clock.t = clock.t.replace(hour=23, minute=59, second=59)
+    g = guard(tmp_path, Paid(), cap="0.15", clock=clock)
+    clock.t -= timedelta(hours=2)
+    g.ledger.reserve("crashed", g.cfg.worst_case_nano(BODY), g.cfg.cap_nano, 1)     # an old hold
+    clock.t += timedelta(hours=2)
+    ticks = []
+
+    def ticking():                                                # midnight passes during reserve()
+        ticks.append(1)
+        return clock.t + timedelta(seconds=2 * (len(ticks) - 1))
+    g.ledger._now = ticking
+    cid, worst, spent = g.ledger.reserve("at-midnight", g.cfg.worst_case_nano(BODY), g.cfg.cap_nano, 1)
+    assert len(ticks) == 1                                        # one snapshot for sweep + day + insert
+    assert cid is None and spent == worst                         # the swept hold counted in ITS day's sum
+
+
+def test_a_swept_row_is_terminal_a_late_result_cannot_lower_or_move_its_charge(tmp_path):
+    clock = Clock()
+    g = guard(tmp_path, Paid(), cap="100", clock=clock)
+    worst = g.cfg.worst_case_nano(BODY)
+    cid, _, _ = g.ledger.reserve("slow", worst, g.cfg.cap_nano, 1)
+    clock.t += timedelta(minutes=61)
+    g.ledger.reserve("trigger-sweep", worst, g.cfg.cap_nano, 1)
+    clock.t += timedelta(days=1)
+    assert g.ledger.settle(cid, "OK", 10, 5, 0) is None           # a cheap late result
+    row = g.ledger._conn().execute("SELECT day, status, cost_nano, detail FROM jev_calls WHERE id = ?", (cid,)).fetchone()
+    assert row[:3] == ("2026-10-04", "UNKNOWN_BILLING", worst) and "late result: OK" in row[3]
+    assert g.ledger.settle(cid, "OK", 2 * worst, 9, 0)            # a late result ABOVE it does raise it
+    assert g.ledger._conn().execute("SELECT cost_nano FROM jev_calls WHERE id = ?", (cid,)).fetchone()[0] == 2 * worst
