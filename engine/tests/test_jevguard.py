@@ -27,10 +27,11 @@ def nbytes(body):
     return len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
-# A price that makes one BODY call cost about 4 cents, so a test crosses the cap in a few
+# A price that makes one BODY call cost about 8 cents, so a test crosses the cap in a few
 # calls. The fake bills one token per request byte: the most a real request can be billed.
-PRICE = "200"
-PER_CALL = D(nbytes(BODY)) * D(PRICE) / 10 ** 6
+PRICE = "50"
+BOUND = nbytes(BODY) + jevguard.REQUEST_OVERHEAD_TOKENS + jevguard.QUESTION_OVERHEAD_TOKENS
+PER_CALL = D(BOUND) * D(PRICE) / 10 ** 6
 
 
 class Paid:
@@ -44,7 +45,8 @@ class Paid:
         self.calls += 1
         r = {"model": "jev-1.13.0", "answers": ANSWER}
         if self.usage:
-            r["usage"] = {"input_tokens": self.input_tokens or nbytes(body), "output_tokens": 18}
+            full = nbytes(body) + jevguard.REQUEST_OVERHEAD_TOKENS + jevguard.QUESTION_OVERHEAD_TOKENS * len(body["questions"])
+            r["usage"] = {"input_tokens": self.input_tokens or full, "output_tokens": 18}
         return r
 
 
@@ -213,7 +215,7 @@ def test_the_seat_advisor_stops_paying_at_the_cap_and_keeps_deciding(tmp_path):
         seat = "sail:Qwen/Qwen3-32B"
         r["answers"] = {"seat": {"choice": seat, "probabilities": {seat: 0.95}}}
         return r
-    g = guard(tmp_path, post, cap="0.30")
+    g = guard(tmp_path, post, cap="0.12")
     adv = jev.make_advisor(lambda: "k", guard=g)
     first = resolve(SeatRequest(task="t"), _pool(), configured_policy="cheapest", advisor=adv)
     second = resolve(SeatRequest(task="t"), _pool(), configured_policy="cheapest", advisor=adv)
@@ -246,7 +248,7 @@ def gateway(tmp_path):
     p = tmp_path / "c.toml"
     p.write_text('[secrets]\nsource="env"\n[providers.openrouter]\nsecret="NOPE"\n'
                  '[server]\nno_auth=true\n[policy]\ndashboard_url=""\n'
-                 '[jev]\nenabled=true\ndaily_cap_usd=0.25\nusd_per_mtok_in=200\nfallback="defer"\n'
+                 '[jev]\nenabled=true\ndaily_cap_usd=0.20\nusd_per_mtok_in=50\nfallback="defer"\n'
                  '[local]\nollama_url="http://127.0.0.1:9"\n', encoding="utf-8")
     cfg = config.load(p)
     cfg.state_dir = tmp_path
@@ -265,7 +267,7 @@ def test_gateway_serves_jev_then_returns_429_at_the_cap(gateway):
     assert blocked.status_code == 429 and blocked.json()["error"]["code"] == "jev_daily_cap_reached"
     assert int(blocked.headers["Retry-After"]) > 0 and paid.calls == 2
     spend = client.get("/v1/systemone/spend").json()
-    assert D(spend["spent_usd"]) == 2 * PER_CALL <= D("0.25") and spend["blocked_calls"] == 1
+    assert D(spend["spent_usd"]) == 2 * PER_CALL <= D("0.20") and spend["blocked_calls"] == 1
 
 
 def test_gateway_falls_back_to_the_free_model_at_the_cap(gateway):
@@ -358,7 +360,7 @@ def test_every_failure_after_the_reservation_settles_it(tmp_path):
 def test_the_reservation_bounds_any_answer_the_api_can_give(tmp_path):
     cfg = GuardConfig(usd_per_mtok_in="0.042", usd_per_mtok_out="3")
     n = jevguard.request_bytes(BODY)
-    assert cfg.worst_case_nano(BODY) == cfg.cost_nano(n, jevguard.MAX_OUTPUT_TOKENS)
+    assert cfg.worst_case_nano(BODY) == cfg.cost_nano(BOUND, jevguard.MAX_OUTPUT_TOKENS)
     assert cfg.worst_case_nano(BODY) >= cfg.cost_nano(n, 50_000)          # a very long answer
     with pytest.raises(ValueError):                                       # too large to bound
         cfg.worst_case_nano({"state": "x" * (jevguard.MAX_REQUEST_BYTES + 1), "questions": {}})
@@ -404,6 +406,7 @@ def test_the_fallback_must_be_loopback_and_redirects_are_not_followed(tmp_path):
 
     class Redirector(BaseHTTPRequestHandler):
         def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
             self.send_response(307)
             self.send_header("Location", "http://127.0.0.1:%d/paid" % target.server_address[1])
             self.end_headers()
@@ -455,22 +458,6 @@ def test_a_call_settled_after_midnight_is_spend_of_the_new_day(tmp_path):
     with pytest.raises(CapReached):                               # the new day already carries it
         g.call(BODY)
     assert paid.calls == 0
-
-
-def test_an_old_hold_is_charged_not_forgotten_and_a_live_one_is_never_dropped(tmp_path):
-    clock, paid = Clock(), Paid()
-    clock.t = clock.t.replace(hour=23, minute=30)
-    g = guard(tmp_path, paid, cap="0.15", clock=clock)
-    g.ledger.reserve("crashed", g.cfg.worst_case_nano(BODY), g.cfg.cap_nano, 1)
-    clock.t += timedelta(minutes=59)                              # 00:29 next day, 59 min old: held
-    assert D(g.status()["in_flight_usd"]) == PER_CALL
-    with pytest.raises(CapReached):
-        g.call(BODY)
-    clock.t += timedelta(minutes=2)                               # past the TTL: converted to a charge
-    assert g.call(BODY).served_by == "jev"
-    rows = g.ledger._conn().execute("SELECT day, status, cost_nano FROM jev_calls WHERE caller = 'crashed'").fetchall()
-    assert rows == [("2026-10-04", "UNKNOWN_BILLING", g.cfg.worst_case_nano(BODY))]   # charged to its own day
-    assert g.cfg.worst_case_nano(BODY) > 0 and jevguard.MAX_TIMEOUT_S < jevguard.RESERVATION_TTL_S
 
 
 def test_the_guard_caps_the_timeout_so_no_call_outlives_its_hold(tmp_path):
@@ -530,21 +517,77 @@ def test_what_is_measured_is_what_is_sent(monkeypatch):
     assert len(sent["data"]) == jevguard.request_bytes(body) and json.loads(sent["data"]) == body
 
 
-def test_a_provider_billing_past_the_bound_widens_every_later_reservation(tmp_path):
-    alerts = []
-    g = guard(tmp_path, Paid(input_tokens=3 * nbytes(BODY)), cap="100", alerts=alerts)
-    base = g.cfg.worst_case_nano(BODY)
-    g.call(BODY)                                                  # billed 3x the bound
-    assert alerts[0]["event"] == "jev_reservation_exceeded" and alerts[0]["reservations_now_scaled_by"] >= 3
-    again = guard(tmp_path, Paid(input_tokens=3 * nbytes(BODY)), cap="100", alerts=alerts)   # persisted
-    again.call(BODY)
-    reserved = again.ledger._conn().execute("SELECT reserved_nano FROM jev_calls ORDER BY id DESC LIMIT 1").fetchone()[0]
-    assert reserved >= 3 * base and len(alerts) == 1              # now covered: no second overshoot
-
-
 def test_only_a_literal_loopback_ip_is_a_fallback():
     for bad in ("http://localhost:8080/x", "http://LOCALHOST/x", "http://my-laya/x", "http://[::2]/x"):
         with pytest.raises(ValueError):
             jevguard.url_fallback(bad)
     assert jevguard.url_fallback("http://127.0.0.1:8660/v1/systemone")
     assert jevguard.url_fallback("http://[::1]:8660/v1/systemone")
+
+
+# ---- third review round ----------------------------------------------------------------------
+def test_the_bound_covers_what_the_live_api_billed():
+    """Every (request bytes, questions, billed input tokens) triple measured live on 2026-10-04.
+    The first two are tiny requests the bare one-token-per-byte bound did NOT cover."""
+    cfg = GuardConfig()
+    live = [(90, 1, 269), (124, 1, 303), (726, 16, 404), (1270, 16, 948), (3261, 1, 1060),
+            (3975, 8, 1256), (5621, 24, 1704), (2278, 1, 1173), (2058, 1, 1021), (1824, 1, 891)]
+    for nb, nq, billed in live:
+        bound = nb + jevguard.REQUEST_OVERHEAD_TOKENS + jevguard.QUESTION_OVERHEAD_TOKENS * nq
+        assert billed <= bound, (nb, nq, billed)
+    tiny = {"model": "jev-latest", "state": "x", "questions": {"q0": {"type": "noul", "instructions": "ok?"}}}
+    assert jevguard.request_bytes(tiny) == 90
+    assert cfg.worst_case_nano(tiny) >= cfg.cost_nano(269, 0) * 4          # 4x the measured overhead
+
+
+def test_a_live_call_past_its_deadline_is_charged_and_cannot_be_outlived(tmp_path, monkeypatch):
+    import time
+    monkeypatch.setattr(jevguard, "MAX_TIMEOUT_S", 0.2)
+    release = threading.Event()
+
+    def drip(key, body, t):                                       # a transport that ignores its timeout
+        release.wait(10)
+        return {"answers": {}, "usage": {"input_tokens": 1, "output_tokens": 0}}
+    g = guard(tmp_path, drip, cap="0.15")
+    t0 = time.time()
+    with pytest.raises(TimeoutError):
+        g.call(BODY, timeout=3600)
+    assert time.time() - t0 < 5
+    st = g.status()                                               # charged now, while still "live"
+    assert D(st["spent_usd"]) == PER_CALL and st["unknown_billing_calls"] == 1 and st["in_flight_usd"] == "0"
+    with pytest.raises(CapReached):                               # so it cannot make room for another
+        g.call(BODY)
+    release.set()
+
+
+def test_a_swept_hold_is_charged_to_the_day_of_the_sweep(tmp_path):
+    clock = Clock()
+    clock.t = clock.t.replace(hour=23, minute=30)
+    g = guard(tmp_path, Paid(), cap="0.15", clock=clock)
+    g.ledger.reserve("crashed", g.cfg.worst_case_nano(BODY), g.cfg.cap_nano, 1)
+    clock.t += timedelta(minutes=61)                              # 00:31 next day, past the TTL
+    with pytest.raises(CapReached):                               # converted INTO today: still counts
+        g.call(BODY)
+    row = g.ledger._conn().execute("SELECT day, status FROM jev_calls WHERE caller = 'crashed'").fetchone()
+    assert row == ("2026-10-05", "UNKNOWN_BILLING")
+    clock.t += timedelta(days=1)                                  # it is spend of that day only
+    assert g.call(BODY).served_by == "jev"
+
+
+def test_an_overshoot_widens_the_holds_already_in_flight_in_the_same_transaction(tmp_path):
+    alerts = []
+    g = guard(tmp_path, Paid(input_tokens=10 ** 9), cap="100", alerts=alerts)
+    base = g.cfg.worst_case_nano(BODY)
+    a, _ = g.ledger.reserve("in-flight-a", base, g.cfg.cap_nano, 1)
+    b, _ = g.ledger.reserve("in-flight-b", base, g.cfg.cap_nano, 1)
+    c, _ = g.ledger.reserve("overshooter", base, g.cfg.cap_nano, 1)
+    factor = g.ledger.settle(c, "OK", 3 * base, 3, 0)             # billed 3x its reservation
+    assert factor >= 3000 and g.ledger.bound_factor() == factor
+    held = [r[0] for r in g.ledger._conn().execute(
+        "SELECT reserved_nano FROM jev_calls WHERE status = 'RESERVED' ORDER BY id")]
+    assert len(held) == 2 and all(h >= 3 * base for h in held)   # both live holds widened at once
+    assert D(g.status()["spent_usd"]) * 10 ** 9 >= 3 * base + 2 * 3 * base
+    other = guard(tmp_path, Paid(), cap="100")                    # another process: sees the factor
+    other.call(BODY)
+    last = other.ledger._conn().execute("SELECT reserved_nano FROM jev_calls ORDER BY id DESC LIMIT 1").fetchone()[0]
+    assert last >= 3 * base

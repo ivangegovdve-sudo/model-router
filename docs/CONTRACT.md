@@ -119,11 +119,17 @@ and same answer as `https://api.typesafe.ai/v1/systemone` (`{model, state, quest
   is charged its worst case, never $0. The price cannot be configured below the published one
   and the cap cannot be set above $100: no config or env value turns the cap off.
 * **How it holds:** each call reserves its worst case (one input token per request byte, plus
-  the API's 64k output limit at the output price) in one `BEGIN IMMEDIATE` transaction on
+  1024 tokens per request and 64 per question for the prompt the API adds -- measured ~250 --
+  plus the API's 64k output limit at the output price) in one `BEGIN IMMEDIATE` transaction on
   `<state>/jev_spend.sqlite3`, then settles to the actual cost. Concurrent callers and separate
   processes share the ledger; a crash keeps the hold; a call still in flight at midnight keeps
   counting until it settles, and its cost lands in the day it settles in; a hold older than 1h is
-  converted to a charge of its worst case, never dropped. A request above 256 KB cannot be bounded and
+  converted to a charge of its worst case, never dropped. Each call has a hard 600s wall-clock
+  deadline, after which it is charged its worst case.
+* **Limit:** the bound rests on the provider billing no more than that. No client can stop a
+  provider billing more than it was sent; if a settlement ever exceeds its reservation the guard
+  alerts (`jev_reservation_exceeded`) and widens every in-flight hold and later reservation by
+  the observed ratio in the same transaction. The exposure is the calls on the wire at that moment. A request above 256 KB cannot be bounded and
   is refused (HTTP 413).
 * **At the cap** the paid call is not made. `fallback = "laya"` (in-process, `pip install
   modelrouter[laya]`) or `"url"` (a Jev-compatible endpoint on a literal loopback IP only; redirects are not followed) answers for free: HTTP 200,

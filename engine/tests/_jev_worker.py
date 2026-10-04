@@ -1,14 +1,15 @@
 """A separate PROCESS hammering the shared Jev ledger (used by test_jevguard).
 
 argv: ledger path, cap, price, calls. Prints how many paid calls this process made.
-The fake upstream bills one token per request byte, the most a real request can cost.
+The fake upstream bills the full reservation bound, the most a real request can cost.
 """
 import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from modelrouter.jevguard import CapReached, Guard, GuardConfig, request_bytes  # noqa: E402
+from modelrouter.jevguard import (QUESTION_OVERHEAD_TOKENS, REQUEST_OVERHEAD_TOKENS,  # noqa: E402
+                                  CapReached, Guard, GuardConfig, request_bytes)
 
 ledger, cap, price, calls = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 BODY = {"model": "jev-latest", "state": {"t": "x" * 400},
@@ -19,7 +20,8 @@ paid = 0
 def post(key, body, timeout):
     global paid
     paid += 1
-    return {"answers": {}, "usage": {"input_tokens": request_bytes(body), "output_tokens": 18}}
+    full = request_bytes(body) + REQUEST_OVERHEAD_TOKENS + QUESTION_OVERHEAD_TOKENS * len(body["questions"])
+    return {"answers": {}, "usage": {"input_tokens": full, "output_tokens": 18}}
 
 
 g = Guard(GuardConfig(cap_usd=cap, usd_per_mtok_in=price, ledger=Path(ledger), fallback="defer"),
