@@ -111,11 +111,11 @@ def test_a_failing_fallback_defers_and_never_pays(tmp_path):
     assert paid.calls == 0
 
 
-def test_the_cap_resets_at_local_midnight_and_persists_across_processes(tmp_path):
+def test_the_cap_resets_at_local_midnight_and_is_read_from_the_ledger_not_memory(tmp_path):
     clock, paid = Clock(), Paid()
     g = guard(tmp_path, paid, cap="0.15", clock=clock)
     g.call(BODY)
-    again = guard(tmp_path, paid, cap="0.15", clock=clock)       # a second process, same ledger
+    again = guard(tmp_path, paid, cap="0.15", clock=clock)       # a second Guard, same ledger file
     with pytest.raises(CapReached):
         again.call(BODY)
     clock.t += timedelta(hours=11, minutes=59)                    # 23:59 local: still today
@@ -146,14 +146,6 @@ def test_an_http_refusal_is_not_billed(tmp_path):
     with pytest.raises(HttpStatus):
         g.call(BODY)
     assert g.status()["spent_usd"] == "0"
-
-
-def test_the_reservation_is_an_upper_bound_on_the_real_cost(tmp_path):
-    # 2026-10-01, glass-mem ledger: 2,150,541 state chars were billed as 961,466 input tokens.
-    # One token per UTF-8 byte is therefore a safe ceiling, also for Cyrillic (2 bytes a letter).
-    cfg = GuardConfig()
-    body = {"state": "Ж" * 1000, "questions": {"q": {"type": "noul", "instructions": "да?"}}}
-    assert cfg.worst_case_nano(body) >= cfg.cost_nano(2000, 0)
 
 
 def test_concurrent_callers_cannot_jointly_overshoot_the_cap(tmp_path):
@@ -231,8 +223,12 @@ def test_the_seat_advisor_stops_paying_at_the_cap_and_keeps_deciding(tmp_path):
 
 
 def test_an_unguarded_paid_advisor_is_refused():
-    with pytest.raises(ValueError):
-        jev.make_advisor(lambda: "k")
+    with pytest.raises(TypeError):
+        jev.make_advisor(lambda: "k")                                # no guard: no advisor
+    with pytest.raises(TypeError):
+        jev.make_advisor(lambda: "k", guard=None)
+    with pytest.raises(TypeError):                                   # the old test-only bypass is gone
+        jev.make_advisor(lambda: "k", post=lambda key, body, t: {})
 
 
 def test_the_advisor_payload_does_not_send_price_facts_twice():
@@ -294,3 +290,175 @@ def test_gateway_forwards_only_model_state_questions_and_rejects_bad_bodies(gate
     client.post("/v1/systemone", json={**BODY, "api_key": "leak", "debug": {"big": "x" * 5000}})
     assert set(seen[0]) == {"model", "state", "questions"}
     assert client.post("/v1/systemone", json={"state": "s"}).status_code == 400
+
+
+# ---- findings of the cross-family review (Codex, PR #8) -------------------------------------
+def test_a_5xx_may_have_been_billed_and_is_charged_the_worst_case(tmp_path):
+    def five_hundred(key, body, t):
+        raise HttpStatus(500)
+    g = guard(tmp_path, five_hundred)
+    with pytest.raises(HttpStatus):
+        g.call(BODY)
+    st = g.status()
+    assert D(st["spent_usd"]) == PER_CALL and st["unknown_billing_calls"] == 1
+    for code in jevguard.NOT_BILLED_STATUSES:                    # refused before inference: free
+        def refused(key, body, t, code=code):
+            raise HttpStatus(code)
+        g2 = guard(tmp_path / str(code), refused)
+        with pytest.raises(HttpStatus):
+            g2.call(BODY)
+        assert g2.status()["spent_usd"] == "0"
+
+
+def test_repeated_5xx_cannot_buy_unlimited_calls(tmp_path):
+    sent = []
+
+    def five_hundred(key, body, t):
+        sent.append(1)
+        raise HttpStatus(502)
+    g = guard(tmp_path, five_hundred, cap="0.50")
+    for _ in range(30):
+        with pytest.raises((HttpStatus, CapReached)):
+            g.call(BODY)
+    assert len(sent) == int(D("0.50") / PER_CALL) and D(g.status()["spent_usd"]) <= D("0.50")
+
+
+def test_the_price_cannot_be_configured_below_the_published_one_nor_the_cap_absurdly_high(monkeypatch):
+    for bad in ({"usd_per_mtok_in": "0"}, {"usd_per_mtok_in": "0.0419"}, {"usd_per_mtok_in": "NaN"},
+                {"usd_per_mtok_out": "-1"}, {"cap_usd": "1e100"}, {"cap_usd": "100.01"},
+                {"cap_usd": "Infinity"}):
+        with pytest.raises(ValueError):
+            GuardConfig(**bad)
+    monkeypatch.setenv("JEV_USD_PER_MTOK_IN", "0")               # the env cannot make calls free
+    with pytest.raises(ValueError):
+        GuardConfig.from_env()
+    assert GuardConfig(cap_usd="100", usd_per_mtok_in="0.05").cost_nano(10 ** 6, 0) == 50_000_000
+
+
+def test_a_call_in_flight_across_midnight_counts_against_the_new_day(tmp_path):
+    clock, paid = Clock(), Paid()
+    clock.t = clock.t.replace(hour=23, minute=59, second=59)
+    g = guard(tmp_path, paid, cap="0.15", clock=clock)
+    held, _ = g.ledger.reserve("slow-call", g.cfg.worst_case_nano(BODY), g.cfg.cap_nano, 1)
+    assert held
+    clock.t += timedelta(seconds=2)                               # 00:00:01: the call is still out
+    assert g.status()["day"] == "2026-10-05" and D(g.status()["spent_usd"]) == PER_CALL
+    with pytest.raises(CapReached):                               # 0.105 held + 0.105 > 0.15
+        g.call(BODY)
+    assert paid.calls == 0
+    g.ledger.settle(held, "OK", g.cfg.cost_nano(10, 0), 10, 0)    # it lands, billed to its own day
+    assert g.call(BODY).served_by == "jev" and paid.calls == 1
+
+
+def test_a_crashed_reservation_stops_counting_after_its_day_and_the_ttl(tmp_path):
+    clock = Clock()
+    g = guard(tmp_path, Paid(), cap="0.15", clock=clock)
+    g.ledger.reserve("crashed", g.cfg.worst_case_nano(BODY), g.cfg.cap_nano, 1)
+    clock.t += timedelta(hours=11)                                # same day: still held
+    with pytest.raises(CapReached):
+        g.call(BODY)
+    clock.t += timedelta(hours=2)                                 # next day and past the TTL
+    assert g.call(BODY).served_by == "jev"
+
+
+def test_every_failure_after_the_reservation_settles_it(tmp_path):
+    def no_key():
+        raise OSError("vault unreachable")
+    paid = Paid()
+    cfg = GuardConfig(cap_usd="1", usd_per_mtok_in=PRICE, ledger=tmp_path / "l.sqlite3", fallback="defer")
+    g = Guard(cfg, no_key, post=paid, fallback=None, now=Clock(), alert=lambda e: None)
+    with pytest.raises(OSError):
+        g.call(BODY)
+    st = g.status()                                               # nothing sent: free, not stranded
+    assert paid.calls == 0 and st["spent_usd"] == "0" and st["in_flight_usd"] == "0"
+
+    for usage in ("lots", {"input_tokens": "9", "output_tokens": 1}, {"input_tokens": True, "output_tokens": 1},
+                  {"input_tokens": -5, "output_tokens": 0}, None):
+        d = tmp_path / str(abs(hash(str(usage))))
+        g2 = guard(d, lambda key, body, t, u=usage: {"answers": {}, "usage": u})
+        g2.call(BODY)
+        st = g2.status()
+        assert D(st["spent_usd"]) == PER_CALL and st["unknown_billing_calls"] == 1 and st["in_flight_usd"] == "0"
+
+
+def test_the_reservation_bounds_any_answer_the_api_can_give(tmp_path):
+    cfg = GuardConfig(usd_per_mtok_in="0.042", usd_per_mtok_out="3")
+    n = jevguard.request_bytes(BODY)
+    assert cfg.worst_case_nano(BODY) == cfg.cost_nano(n, jevguard.MAX_OUTPUT_TOKENS)
+    assert cfg.worst_case_nano(BODY) >= cfg.cost_nano(n, 50_000)          # a very long answer
+    with pytest.raises(ValueError):                                       # too large to bound
+        cfg.worst_case_nano({"state": "x" * (jevguard.MAX_REQUEST_BYTES + 1), "questions": {}})
+    alerts = []
+    g = guard(tmp_path, Paid(input_tokens=10 ** 6), alerts=alerts)        # upstream bills past the bound
+    g.call(BODY)
+    assert alerts and alerts[0]["event"] == "jev_reservation_exceeded"
+    with pytest.raises(CapReached):                                       # and the cap now holds the line
+        g.call(BODY)
+
+
+def test_separate_processes_share_one_cap(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+    worker = Path(__file__).with_name("_jev_worker.py")
+    ledger = tmp_path / "shared.sqlite3"
+    procs = [subprocess.Popen([sys.executable, str(worker), str(ledger), "0.50", PRICE, "6"],
+                              stdout=subprocess.PIPE, text=True) for _ in range(4)]
+    paid = sum(json.loads(p.communicate(timeout=120)[0])["paid"] for p in procs)
+    assert all(p.returncode == 0 for p in procs)
+    n = int(D("0.50") / PER_CALL)
+    assert paid == n                                              # 24 attempts, 4 processes, n paid
+    st = Guard(GuardConfig(cap_usd="0.50", usd_per_mtok_in=PRICE, ledger=ledger, fallback="defer"),
+               lambda: "k", fallback=None).status()
+    assert D(st["spent_usd"]) == n * PER_CALL <= D("0.50") and st["blocked_calls"] == 24 - n
+
+
+def test_the_fallback_must_be_loopback_and_redirects_are_not_followed(tmp_path):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    for bad in ("https://api.typesafe.ai/v1/systemone", "http://proxy.internal:8080/x",
+                "http://127.0.0.1.evil.example/x", "ftp://127.0.0.1/x", "http://10.0.0.5/x"):
+        with pytest.raises(ValueError):
+            jevguard.url_fallback(bad)
+        with pytest.raises(ValueError):
+            GuardConfig(fallback="url", fallback_url=bad)
+    hits = []
+
+    class Target(BaseHTTPRequestHandler):
+        def do_POST(self):
+            hits.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    target = HTTPServer(("127.0.0.1", 0), Target)
+
+    class Redirector(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(307)
+            self.send_header("Location", "http://127.0.0.1:%d/paid" % target.server_address[1])
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    red = HTTPServer(("127.0.0.1", 0), Redirector)
+    for srv in (target, red):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    fb = jevguard.url_fallback("http://127.0.0.1:%d/v1/systemone" % red.server_address[1])
+    with pytest.raises(HttpStatus) as e:
+        fb(BODY, 5.0)
+    assert e.value.code == 307 and hits == []                    # the redirect target was never called
+    g = guard(tmp_path, Paid(), cap="0", fallback=fb)
+    with pytest.raises(CapReached):                               # fallback failed: deferred, not paid
+        g.call(BODY)
+    target.shutdown()
+    red.shutdown()
+
+
+def test_gateway_refuses_a_request_too_large_to_bound(gateway):
+    client, paid, _ = gateway
+    big = {**BODY, "state": "x" * (jevguard.MAX_REQUEST_BYTES + 1)}
+    r = client.post("/v1/systemone", json=big)
+    assert r.status_code == 413 and r.json()["error"]["code"] == "jev_request_too_large" and paid.calls == 0

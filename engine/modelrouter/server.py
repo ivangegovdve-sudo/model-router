@@ -215,6 +215,8 @@ def build(cfg: Config) -> FastAPI:
             served = await run_in_threadpool(
                 lambda: app.state.jev_guard.call(out, caller=(x_jev_caller or "gateway")[:60],
                                                  timeout=60.0))
+        except ValueError as exc:                               # too large to bound
+            return _error(413, "jev_request_too_large", str(exc))
         except jevguard.CapReached as exc:
             r = _error(429, "jev_daily_cap_reached", str(exc), guard=exc.status)
             r.headers["Retry-After"] = str(exc.retry_after_s)

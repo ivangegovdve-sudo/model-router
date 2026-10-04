@@ -61,15 +61,14 @@ def build_request(req: SeatRequest, eligible: list[Seat]) -> dict:
     }
 
 
-def make_advisor(get_key: Callable[[], str], *, min_prob: float = 0.6, timeout: float = 4.0,
-                 post: Callable[[str, dict, float], dict] | None = None,
-                 guard: Guard | None = None):
+def make_advisor(get_key: Callable[[], str], *, guard: Guard, min_prob: float = 0.6,
+                 timeout: float = 4.0):
     """-> advisor(req, eligible) -> (Seat | None, info).
 
-    `guard` is the spend-capped door to the paid API and is what the server passes. `post`
-    alone is for tests (an injected fake); a real paid call without a guard is refused."""
-    if guard is None and post is None:
-        raise ValueError("an unguarded paid Jev call is refused: pass guard=jevguard.Guard(...)")
+    `guard` is the spend-capped door to the paid API and the only way a call is made: there
+    is no unguarded path. Tests inject their fake transport into the Guard."""
+    if not isinstance(guard, Guard):
+        raise TypeError("make_advisor needs a jevguard.Guard: an unguarded paid Jev call is refused")
 
     def advise(req: SeatRequest, eligible: list[Seat]):
         key = get_key()
@@ -78,11 +77,8 @@ def make_advisor(get_key: Callable[[], str], *, min_prob: float = 0.6, timeout: 
         body = build_request(req, eligible)
         served_by = "jev"
         try:
-            if guard is not None:
-                served = guard.call(body, caller="modelrouter:seats", timeout=timeout)
-                resp, served_by = served.response, served.served_by
-            else:
-                resp = post(key, body, timeout)
+            served = guard.call(body, caller="modelrouter:seats", timeout=timeout)
+            resp, served_by = served.response, served.served_by
             ans = resp["answers"]["seat"]
             pick, prob = ans["choice"], float(ans["probabilities"][ans["choice"]])
         except CapReached as exc:                      # no paid call was made
