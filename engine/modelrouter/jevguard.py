@@ -132,8 +132,6 @@ class GuardConfig:
         if self.usd_per_mtok_in < PRICE_IN_FLOOR or self.usd_per_mtok_out < PRICE_OUT_FLOOR:
             raise ValueError("Jev prices cannot be set below TypeSafe's published $%s in / $%s out "
                              "per Mtok" % (PRICE_IN_FLOOR, PRICE_OUT_FLOOR))
-        if self.usd_per_mtok_out != 0:
-            raise ValueError("output pricing is not supported; usd_per_mtok_out must be 0")
         if self.cap_usd > MAX_CAP_USD:
             raise ValueError("daily_cap_usd above $%s is refused" % MAX_CAP_USD)
         if self.fallback == "url":
@@ -348,21 +346,21 @@ class Ledger:
             return cur.lastrowid, worst, None
 
     def settle(self, call_id: int, status: str, cost_nano: int, input_tokens: int | None,
-                   output_tokens: int | None, detail: str = "") -> tuple[int | None, int]:
+                   output_tokens: int | None, detail: str = "") -> int | None:
         """A held call's cost lands in the day it SETTLES in: a call that started before
         midnight and finished after it is spend of the new day, not a free ride on the old.
-        
+
         A row that is no longer held (the sweep already charged it) is terminal: a late result
         can raise its charge, never lower it and never move it to another day.
-        
-        -> (new bound factor (thousandths) if exceeded, settled cost (nano-USD)).
-        In that case, in this same transaction, every hold still in flight is
+
+        -> the new bound factor (thousandths) when the settled cost exceeded its reservation,
+        else None. In that case, in this same transaction, every hold still in flight is
         widened by the observed ratio and so is every later reservation: nothing is admitted
         on a bound that has just been shown to be wrong."""
         with self._tx() as db:
             row = db.execute("SELECT status, reserved_nano FROM jev_calls WHERE id = ?", (call_id,)).fetchone()
             if row is None:
-                return None, 0
+                return None
             held, reserved = row[0] == "RESERVED", row[1]
             if status == "UNKNOWN_BILLING":
                 # "worst case" means the hold as it stands NOW: it may have been widened since
@@ -378,14 +376,14 @@ class Ledger:
                            "detail = substr(COALESCE(detail, '') || ' | late result: ' || ?, 1, 300) WHERE id = ?",
                            (cost_nano, input_tokens, output_tokens, status, call_id))
             if not reserved or cost_nano <= reserved:
-                return None, cost_nano
+                return None
             ratio = -(-cost_nano * 1000 // reserved) + 100          # thousandths, +10% margin
             factor = -(-self.bound_factor(db) * ratio // 1000)
             db.execute("INSERT INTO jev_meta(k, v) VALUES ('bound_factor', ?) "
                        "ON CONFLICT(k) DO UPDATE SET v = excluded.v", (factor,))
             db.execute("UPDATE jev_calls SET reserved_nano = (reserved_nano * ? + 999) / 1000 "
                        "WHERE status = 'RESERVED'", (ratio,))
-            return factor, cost_nano
+            return factor
 
 
 
@@ -614,7 +612,7 @@ class Guard:
         tin, tout = (u.get("input_tokens"), u.get("output_tokens")) if isinstance(u, dict) else (None, None)
         if all(type(t) is int and t >= 0 for t in (tin, tout)):
             cost = self.cfg.cost_nano(tin, tout)
-            factor, cost = self.ledger.settle(call_id, "OK", cost, tin, tout)
+            factor = self.ledger.settle(call_id, "OK", cost, tin, tout)
             if factor:              # the provider billed past the bound: widened for good, loudly
                 self._alert({"event": "jev_reservation_exceeded", "caller": caller,
                              "reserved_usd": usd(worst), "cost_usd": usd(cost),
@@ -622,7 +620,7 @@ class Guard:
                              "reservations_now_scaled_by": factor / 1000})
         else:                                                   # answered, usage absent or malformed
             cost = worst
-            factor, cost = self.ledger.settle(call_id, "UNKNOWN_BILLING", worst, None, None, "no usable usage in response")
+            factor = self.ledger.settle(call_id, "UNKNOWN_BILLING", worst, None, None, "no usable usage in response")
         return Served(resp, "jev", usd(cost), False, self.ledger.status(self.cfg.cap_nano))
 
     def _blocked(self, body, caller, worst, nbytes, spent, timeout) -> Served:
