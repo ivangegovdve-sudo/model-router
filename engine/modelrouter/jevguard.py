@@ -595,8 +595,6 @@ class Guard:
         return box["served"]
 
     def _paid(self, call_id: int, body: dict, caller: str, worst: int, nbytes: int, timeout: float) -> Served:
-
-    def _paid(self, call_id: int, body: dict, caller: str, worst: int, nbytes: int, timeout: float) -> Served:
         """Make the reserved call and settle it. Every path settles: nothing sent ->
         NOT_BILLED; sent and anything but a clean answer with usage -> the worst case."""
         sent = False
