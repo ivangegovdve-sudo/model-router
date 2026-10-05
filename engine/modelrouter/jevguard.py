@@ -346,15 +346,15 @@ class Ledger:
             return cur.lastrowid, worst, None
 
     def settle(self, call_id: int, status: str, cost_nano: int, input_tokens: int | None,
-                   output_tokens: int | None, detail: str = "") -> int | None:
+                       output_tokens: int | None, detail: str = "") -> int | tuple[int, int]:
         """A held call's cost lands in the day it SETTLES in: a call that started before
         midnight and finished after it is spend of the new day, not a free ride on the old.
-
+        
         A row that is no longer held (the sweep already charged it) is terminal: a late result
         can raise its charge, never lower it and never move it to another day.
-
-        -> the new bound factor (thousandths) when the settled cost exceeded its reservation,
-        else None. In that case, in this same transaction, every hold still in flight is
+        
+        -> (charged_nano, new_bound_factor) if the settled cost exceeded its reservation,
+        else (charged_nano, None). In that case, in this same transaction, every hold still in flight is
         widened by the observed ratio and so is every later reservation: nothing is admitted
         on a bound that has just been shown to be wrong."""
         with self._tx() as db:
@@ -376,14 +376,14 @@ class Ledger:
                            "detail = substr(COALESCE(detail, '') || ' | late result: ' || ?, 1, 300) WHERE id = ?",
                            (cost_nano, input_tokens, output_tokens, status, call_id))
             if not reserved or cost_nano <= reserved:
-                return None
+                return cost_nano, None
             ratio = -(-cost_nano * 1000 // reserved) + 100          # thousandths, +10% margin
             factor = -(-self.bound_factor(db) * ratio // 1000)
             db.execute("INSERT INTO jev_meta(k, v) VALUES ('bound_factor', ?) "
                        "ON CONFLICT(k) DO UPDATE SET v = excluded.v", (factor,))
             db.execute("UPDATE jev_calls SET reserved_nano = (reserved_nano * ? + 999) / 1000 "
                        "WHERE status = 'RESERVED'", (ratio,))
-            return factor
+            return cost_nano, factor
 
 
 
@@ -458,7 +458,7 @@ def _post_no_proxy(url: str, key: str | None, body: dict, timeout: float) -> dic
     if key:
         headers["Authorization"] = "Bearer " + key
     r = urllib.request.Request(url, data=encode_body(body), method="POST", headers=headers)
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
     try:
         with opener.open(r, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -539,17 +539,19 @@ class Guard:
         return s
 
     def _default_alert(self, event: dict) -> None:
-        log.error("JEV GUARD ALERT %s: %s", event.get("event"), json.dumps(event))
-        try:
-            with open(self.cfg.ledger.with_name("jev_guard_alerts.jsonl"), "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(event) + "\n")
-        except OSError as exc:
-            log.error("could not write the cap alert file: %s", type(exc).__name__)
-        if self.cfg.alert_url:
+        def _do():
+            log.error("JEV GUARD ALERT %s: %s", event.get("event"), json.dumps(event))
             try:
-                _post(self.cfg.alert_url, None, event, 5.0)
-            except Exception as exc:                            # an alert never breaks a call
-                log.error("cap alert webhook failed: %s", type(exc).__name__)
+                with open(self.cfg.ledger.with_name("jev_guard_alerts.jsonl"), "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(event) + "\n")
+            except OSError as exc:
+                log.error("could not write the cap alert file: %s", type(exc).__name__)
+            if self.cfg.alert_url:
+                try:
+                    _post(self.cfg.alert_url, None, event, 5.0)
+                except Exception as exc:                            # an alert never breaks a call
+                    log.error("cap alert webhook failed: %s", type(exc).__name__)
+        threading.Thread(target=_do, daemon=True).start()
 
     def call(self, body: dict, *, caller: str = "unknown", timeout: float = 20.0) -> Served:
         body = json.loads(json.dumps(body))                            # snapshot request before reserving
@@ -612,15 +614,21 @@ class Guard:
         tin, tout = (u.get("input_tokens"), u.get("output_tokens")) if isinstance(u, dict) else (None, None)
         if all(type(t) is int and t >= 0 for t in (tin, tout)):
             cost = self.cfg.cost_nano(tin, tout)
-            factor = self.ledger.settle(call_id, "OK", cost, tin, tout)
+            result = self.ledger.settle(call_id, "OK", cost, tin, tout)
+            cost, factor = result if isinstance(result, tuple) else (result, None)
             if factor:              # the provider billed past the bound: widened for good, loudly
                 self._alert({"event": "jev_reservation_exceeded", "caller": caller,
                              "reserved_usd": usd(worst), "cost_usd": usd(cost),
                              "request_bytes": nbytes, "input_tokens": tin, "output_tokens": tout,
                              "reservations_now_scaled_by": factor / 1000})
         else:                                                   # answered, usage absent or malformed
-            cost = worst
-            factor = self.ledger.settle(call_id, "UNKNOWN_BILLING", worst, None, None, "no usable usage in response")
+            result = self.ledger.settle(call_id, "UNKNOWN_BILLING", worst, None, None, "no usable usage in response")
+            cost, factor = result if isinstance(result, tuple) else (result, None)
+            if factor:
+                self._alert({"event": "jev_reservation_exceeded", "caller": caller,
+                             "reserved_usd": usd(worst), "cost_usd": usd(cost),
+                             "request_bytes": nbytes, "input_tokens": tin, "output_tokens": tout,
+                             "reservations_now_scaled_by": factor / 1000})
         return Served(resp, "jev", usd(cost), False, self.ledger.status(self.cfg.cap_nano))
 
     def _blocked(self, body, caller, worst, nbytes, spent, timeout) -> Served:
@@ -650,7 +658,13 @@ class Guard:
                     finally:
                         self.ledger.alive(call_id, False)
                 t = threading.Thread(target=work, daemon=True)
-                t.start()
+                self.ledger.alive(call_id, True)
+                try:
+                    t.start()
+                except RuntimeError as exc:
+                    self.ledger.alive(call_id, False)
+                    self.ledger.settle(call_id, "NOT_BILLED", 0, None, None, "worker startup failed: %s" % exc)
+                    raise
                 t.join(timeout)
                 if t.is_alive():
                     raise TimeoutError("Paid call (after midnight re-check) passed its %.0fs deadline" % timeout)
