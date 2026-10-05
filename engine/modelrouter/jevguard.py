@@ -405,8 +405,8 @@ class Ledger:
     def status(self, cap_nano: int) -> dict:
         day = self.day()
         db = self._conn()
-        with self.ledger._tx() as tx:
-            self.ledger._sweep(tx, self.ledger.now())
+        with self._tx() as tx:
+            self._sweep(tx, self.now())
         committed = self._committed(db, day)
         held = db.execute("SELECT COALESCE(SUM(reserved_nano), 0) FROM jev_calls "
                            "WHERE status = 'RESERVED'").fetchone()[0]
