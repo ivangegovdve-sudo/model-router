@@ -71,9 +71,6 @@ def make_advisor(get_key: Callable[[], str], *, guard: Guard, min_prob: float = 
         raise TypeError("make_advisor needs a jevguard.Guard: an unguarded paid Jev call is refused")
 
     def advise(req: SeatRequest, eligible: list[Seat]):
-        key = get_key()
-        if not key:
-            return None, {"used": False, "why": "no TypeSafe key readable"}
         body = build_request(req, eligible)
         served_by = "jev"
         try:
@@ -83,7 +80,7 @@ def make_advisor(get_key: Callable[[], str], *, guard: Guard, min_prob: float = 
             pick, prob = ans["choice"], float(ans["probabilities"][ans["choice"]])
         except CapReached as exc:                      # no paid call was made
             return None, {"used": False, "why": "jev daily cap reached, paid call not made; "
-                                                 "deterministic order kept (resets in %ds)" % exc.retry_after_s}
+                                                  "deterministic order kept (resets in %ds)" % exc.retry_after_s}
         except Exception as exc:                       # fail open
             return None, {"used": False, "why": "jev call failed: %s" % type(exc).__name__}
         by = {s.seat: s for s in eligible[:MAX_SEATS]}      # only seats Jev was shown

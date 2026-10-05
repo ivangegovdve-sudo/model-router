@@ -132,6 +132,8 @@ class GuardConfig:
         if self.usd_per_mtok_in < PRICE_IN_FLOOR or self.usd_per_mtok_out < PRICE_OUT_FLOOR:
             raise ValueError("Jev prices cannot be set below TypeSafe's published $%s in / $%s out "
                              "per Mtok" % (PRICE_IN_FLOOR, PRICE_OUT_FLOOR))
+        if self.usd_per_mtok_out != 0:
+            raise ValueError("output pricing is not supported; usd_per_mtok_out must be 0")
         if self.cap_usd > MAX_CAP_USD:
             raise ValueError("daily_cap_usd above $%s is refused" % MAX_CAP_USD)
         if self.fallback == "url":
@@ -250,7 +252,7 @@ class Ledger:
     def seconds_to_reset(self) -> int:
         n = self.now()
         nxt = (n + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        return max(1, int((nxt - n).total_seconds()))
+        return max(1, int((nxt.timestamp() - n.timestamp())))
 
     def _conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "c", None)
@@ -346,21 +348,21 @@ class Ledger:
             return cur.lastrowid, worst, None
 
     def settle(self, call_id: int, status: str, cost_nano: int, input_tokens: int | None,
-               output_tokens: int | None, detail: str = "") -> int | None:
+                   output_tokens: int | None, detail: str = "") -> tuple[int | None, int]:
         """A held call's cost lands in the day it SETTLES in: a call that started before
         midnight and finished after it is spend of the new day, not a free ride on the old.
-
+        
         A row that is no longer held (the sweep already charged it) is terminal: a late result
         can raise its charge, never lower it and never move it to another day.
-
-        -> the new bound factor (thousandths) when this settlement exceeded its reservation,
-        else None. In that case, in this same transaction, every hold still in flight is
+        
+        -> (new bound factor (thousandths) if exceeded, settled cost (nano-USD)).
+        In that case, in this same transaction, every hold still in flight is
         widened by the observed ratio and so is every later reservation: nothing is admitted
         on a bound that has just been shown to be wrong."""
         with self._tx() as db:
             row = db.execute("SELECT status, reserved_nano FROM jev_calls WHERE id = ?", (call_id,)).fetchone()
             if row is None:
-                return None
+                return None, 0
             held, reserved = row[0] == "RESERVED", row[1]
             if status == "UNKNOWN_BILLING":
                 # "worst case" means the hold as it stands NOW: it may have been widened since
@@ -376,14 +378,17 @@ class Ledger:
                            "detail = substr(COALESCE(detail, '') || ' | late result: ' || ?, 1, 300) WHERE id = ?",
                            (cost_nano, input_tokens, output_tokens, status, call_id))
             if not reserved or cost_nano <= reserved:
-                return None
+                return None, cost_nano
             ratio = -(-cost_nano * 1000 // reserved) + 100          # thousandths, +10% margin
             factor = -(-self.bound_factor(db) * ratio // 1000)
             db.execute("INSERT INTO jev_meta(k, v) VALUES ('bound_factor', ?) "
                        "ON CONFLICT(k) DO UPDATE SET v = excluded.v", (factor,))
             db.execute("UPDATE jev_calls SET reserved_nano = (reserved_nano * ? + 999) / 1000 "
                        "WHERE status = 'RESERVED'", (ratio,))
-            return factor
+            return factor, cost_nano
+
+
+
 
     def blocked(self, caller: str, worst_nano: int, request_bytes: int, served_by: str,
                 detail: str) -> bool:
@@ -400,12 +405,14 @@ class Ledger:
     def status(self, cap_nano: int) -> dict:
         day = self.day()
         db = self._conn()
+        with self.ledger._tx() as tx:
+            self.ledger._sweep(tx, self.ledger.now())
         committed = self._committed(db, day)
         held = db.execute("SELECT COALESCE(SUM(reserved_nano), 0) FROM jev_calls "
-                          "WHERE status = 'RESERVED'").fetchone()[0]
+                           "WHERE status = 'RESERVED'").fetchone()[0]
         r = db.execute(
             "SELECT 0, 0, "
-            "COALESCE(SUM(status IN ('OK', 'UNKNOWN_BILLING', 'NOT_BILLED', 'RESERVED')), 0), "
+            "COALESCE(SUM(status IN ('OK', 'UNKNOWN_BILLING')), 0), "
             "COALESCE(SUM(status = 'BLOCKED'), 0), COALESCE(SUM(input_tokens), 0), "
             "COALESCE(SUM(status = 'UNKNOWN_BILLING'), 0) FROM jev_calls WHERE day = ?",
             (day,)).fetchone()
@@ -415,6 +422,7 @@ class Ledger:
                 "paid_calls": r[2], "blocked_calls": r[3], "input_tokens": r[4],
                 "unknown_billing_calls": r[5], "cap_tripped_at": alert[0] if alert else None,
                 "resets_in_s": self.seconds_to_reset(), "ledger": str(self.path)}
+
 
 
 class HttpStatus(RuntimeError):
@@ -441,6 +449,20 @@ def _post(url: str, key: str | None, body: dict, timeout: float) -> dict:
     r = urllib.request.Request(url, data=encode_body(body), method="POST", headers=headers)
     try:
         with _OPENER.open(r, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise HttpStatus(exc.code) from None
+
+
+def _post_no_proxy(url: str, key: str | None, body: dict, timeout: float) -> dict:
+    """POST JSON, bypassing all system proxies."""
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    r = urllib.request.Request(url, data=encode_body(body), method="POST", headers=headers)
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(r, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise HttpStatus(exc.code) from None
@@ -477,7 +499,7 @@ def url_fallback(url: str) -> Callable[[dict, float], dict] | None:
     if u.scheme not in ("http", "https") or not loopback:
         raise ValueError("fallback_url must be http(s) to a literal loopback IP (127.0.0.1 or "
                          "[::1]): a fallback has to be free and local")
-    return lambda body, timeout: _post(url, None, body, timeout)
+    return lambda body, timeout: _post_no_proxy(url, None, body, timeout)
 
 
 @dataclass
@@ -532,10 +554,11 @@ class Guard:
                 log.error("cap alert webhook failed: %s", type(exc).__name__)
 
     def call(self, body: dict, *, caller: str = "unknown", timeout: float = 20.0) -> Served:
-        nbytes = request_bytes(body)                            # refuses an unboundable request
+        body = json.loads(json.dumps(body))                            # snapshot request before reserving
+        nbytes = request_bytes(body)                                  # refuses an unboundable request
         timeout = min(float(timeout), MAX_TIMEOUT_S)
         call_id, worst, spent = self.ledger.reserve(caller, self.cfg.worst_case_nano(body),
-                                                    self.cfg.cap_nano, nbytes)
+                                                     self.cfg.cap_nano, nbytes)
         if call_id is None:
             return self._blocked(body, caller, worst, nbytes, spent, timeout)
         # The paid call runs in its own thread, which also SETTLES it, whenever it finishes.
@@ -546,6 +569,7 @@ class Guard:
         # is kept fresh, so the sweep never converts a call that can still send; only a hold
         # whose process died goes stale and is charged its worst case.
         box: dict = {}
+        deadline = datetime.now(self.ledger._tz) + timedelta(seconds=timeout) if self.ledger._tz else datetime.now().astimezone() + timedelta(seconds=timeout)
 
         def work():
             try:
@@ -556,14 +580,21 @@ class Guard:
                 self.ledger.alive(call_id, False)               # settled: nothing left to keep fresh
         t = threading.Thread(target=work, daemon=True, name="jev-call-%d" % call_id)
         self.ledger.alive(call_id, True)                        # before it starts: never swept while alive
-        t.start()
+        try:
+            t.start()
+        except RuntimeError as exc:                            # process cannot create another thread
+            self.ledger.alive(call_id, False)
+            self.ledger.settle(call_id, "NOT_BILLED", 0, None, None, "worker startup failed: %s" % exc)
+            raise
         t.join(timeout)
         if t.is_alive():
             raise TimeoutError("Jev call passed its %.0fs wall-clock deadline; its hold of $%s stays "
-                               "until it settles" % (timeout, usd(worst)))
+                                "until it settles" % (timeout, usd(worst)))
         if "err" in box:
             raise box["err"]
         return box["served"]
+
+    def _paid(self, call_id: int, body: dict, caller: str, worst: int, nbytes: int, timeout: float) -> Served:
 
     def _paid(self, call_id: int, body: dict, caller: str, worst: int, nbytes: int, timeout: float) -> Served:
         """Make the reserved call and settle it. Every path settles: nothing sent ->
@@ -585,7 +616,7 @@ class Guard:
         tin, tout = (u.get("input_tokens"), u.get("output_tokens")) if isinstance(u, dict) else (None, None)
         if all(type(t) is int and t >= 0 for t in (tin, tout)):
             cost = self.cfg.cost_nano(tin, tout)
-            factor = self.ledger.settle(call_id, "OK", cost, tin, tout)
+            factor, cost = self.ledger.settle(call_id, "OK", cost, tin, tout)
             if factor:              # the provider billed past the bound: widened for good, loudly
                 self._alert({"event": "jev_reservation_exceeded", "caller": caller,
                              "reserved_usd": usd(worst), "cost_usd": usd(cost),
@@ -593,24 +624,77 @@ class Guard:
                              "reservations_now_scaled_by": factor / 1000})
         else:                                                   # answered, usage absent or malformed
             cost = worst
-            self.ledger.settle(call_id, "UNKNOWN_BILLING", worst, None, None, "no usable usage in response")
+            factor, cost = self.ledger.settle(call_id, "UNKNOWN_BILLING", worst, None, None, "no usable usage in response")
         return Served(resp, "jev", usd(cost), False, self.ledger.status(self.cfg.cap_nano))
 
     def _blocked(self, body, caller, worst, nbytes, spent, timeout) -> Served:
+        # Recheck admission in case midnight passed between reserve() and _blocked()
+        call_id, worst, spent = self.ledger.reserve(caller, self.cfg.worst_case_nano(body),
+                                                     self.cfg.cap_nano, nbytes)
+        if call_id is not None:
+            # We are no longer blocked; let the call proceed to the paid path.
+            # Since we're already in _blocked(), we can't easily jump back to call(),
+            # so we'll manually perform the paid call logic here or return a special value.
+            # However, the most robust way is to just call self.call() recursively 
+            # (with a flag to avoid infinite loop, though we just reserved, so it should pass).
+            # But self.call() will try to reserve again.
+            # Instead, let's just use _paid() directly since we have a reservation.
+            self.ledger.alive(call_id, True)
+            try:
+                # We must wrap this in a thread to maintain the same timeout/deadline behavior
+                # and avoid blocking the caller if we were to do it synchronously.
+                # But _blocked is called synchronously from call().
+                # To keep it simple and consistent with call(), we just use the same thread logic.
+                box: dict = {}
+                def work():
+                    try:
+                        box["served"] = self._paid(call_id, body, caller, worst, nbytes, timeout)
+                    except BaseException as exc:
+                        box["err"] = exc
+                    finally:
+                        self.ledger.alive(call_id, False)
+                t = threading.Thread(target=work, daemon=True)
+                t.start()
+                t.join(timeout)
+                if t.is_alive():
+                    raise TimeoutError("Paid call (after midnight re-check) passed its %.0fs deadline" % timeout)
+                if "err" in box:
+                    raise box["err"]
+                return box["served"]
+            except Exception as exc:
+                # If it fails, we still record the block as we were technically "blocked"
+                # from the original attempt, but since we actually tried a paid call,
+                # we should probably just let the exception propagate.
+                raise
+
         why = ("daily Jev cap $%s reached: $%s committed today, this call could cost up to $%s"
                % (self.cfg.cap_usd, usd(spent), usd(worst)))
         served_by = self.fallback_name if self.fallback else "deferred"
         if self.ledger.blocked(caller, worst, nbytes, served_by, why):
             self._alert({"event": "jev_daily_cap_tripped", "at": self.ledger.now().isoformat(timespec="seconds"),
-                         "caller": caller, "detail": why, "action": served_by,
-                         **self.ledger.status(self.cfg.cap_nano)})
+                           "caller": caller, "detail": why, "action": served_by,
+                           **self.ledger.status(self.cfg.cap_nano)})
         st = self.ledger.status(self.cfg.cap_nano)
         if not self.fallback:
             raise CapReached(why + "; no free fallback configured, call deferred",
-                             self.ledger.seconds_to_reset(), st)
+                               self.ledger.seconds_to_reset(), st)
         try:
-            resp = self.fallback(body, timeout)
+            box: dict = {}
+            def work():
+                try:
+                    box["resp"] = self.fallback(body, timeout)
+                except Exception as exc:
+                    box["err"] = exc
+            t = threading.Thread(target=work, daemon=True)
+            t.start()
+            t.join(timeout)
+            if t.is_alive():
+                raise TimeoutError("Fallback call passed its %.0fs wall-clock deadline" % timeout)
+            if "err" in box:
+                raise box["err"]
+            resp = box["resp"]
         except Exception as exc:
             raise CapReached("%s; free fallback failed (%s), call deferred" % (why, type(exc).__name__),
-                             self.ledger.seconds_to_reset(), st) from exc
+                               self.ledger.seconds_to_reset(), st) from exc
         return Served(resp, self.fallback_name, "0", True, st)
+
