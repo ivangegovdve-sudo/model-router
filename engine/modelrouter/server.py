@@ -1,6 +1,7 @@
-"""HTTP: the OpenAI-compatible face, plus the legibility endpoints.
+"""HTTP: OpenAI-shaped Chat Completions and Responses endpoints, plus legibility routes.
 
     POST /v1/chat/completions      model "auto" routes; "provider:model" is judged alone
+    POST /v1/responses             text/function Responses API translated through the same router
     GET  /v1/models                "auto" and every live seat
     GET  /health                   no auth; what is configured, what is missing
     GET  /router/setup             the setup surface: keys by NAME, sources, problems
@@ -17,6 +18,7 @@ server refuses to start, unless bound to loopback with no_auth = true.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import secrets as pysecrets
 import shutil
@@ -35,6 +37,7 @@ from .clientkeys import ClientKeys, Refusal, worst_case
 from .router import LANES, MAX_ATTEMPTS, Router, estimate_tokens, lane_of
 from .secrets import Keyring
 from .store import Store
+from .responses import (chat_completion_to_response, responses_stream, responses_to_chat)
 
 log = logging.getLogger("modelrouter.server")
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
@@ -105,8 +108,8 @@ def build(cfg: Config) -> FastAPI:
     def auth(who=Depends(principal)) -> None:
         """Operator-only routes: probes spend money, decisions show every caller's traffic."""
         if who[0] != "admin":
-            raise HTTPException(403, "caller keys can use /v1/chat/completions, /v1/models and "
-                                     "/v1/usage only")
+            raise HTTPException(403, "caller keys can use /v1/chat/completions, /v1/responses, "
+                                     "/v1/models and /v1/usage only")
 
     def ceiling(h: str | None) -> float | None:
         if not h:
@@ -220,20 +223,9 @@ def build(cfg: Config) -> FastAPI:
     def observations(seat: str):
         return store.observations(seat)
 
-    @app.post("/v1/chat/completions")
-    async def chat(request: Request, who=Depends(principal),
-                   user_agent: str | None = Header(default=None),
-                   x_router_max_usd_per_m: str | None = Header(default=None),
-                   x_router_lane: str | None = Header(default=None),
-                   x_router_session: str | None = Header(default=None),
-                   x_router_ensemble: str | None = Header(default=None),
-                   x_router_answer_tokens: str | None = Header(default=None)):
-        try:
-            req = await request.json()
-        except ValueError:
-            return _error(400, "invalid_request", "body is not JSON")
-        if not isinstance(req.get("messages"), list) or not req["messages"]:
-            return _error(400, "invalid_request", "`messages` must be a non-empty list")
+    async def _route_chat(req: dict, who, user_agent, x_router_max_usd_per_m,
+                          x_router_lane, x_router_session, x_router_ensemble,
+                          x_router_answer_tokens):
         lim = ceiling(x_router_max_usd_per_m)
         client = (user_agent or "")[:80]
         key, held = None, Decimal(0)
@@ -274,10 +266,12 @@ def build(cfg: Config) -> FastAPI:
                 return _abstain(routed)
             if key:
                 it = _settling(it, key, held, routed)
-            return StreamingResponse(it, media_type="text/event-stream",
-                                     headers={"X-Router-Decision": routed.decision_id,
-                                              "X-Router-Seat": routed.choice.seat or "",
-                                              "Cache-Control": "no-cache"})
+            response = StreamingResponse(it, media_type="text/event-stream",
+                                         headers={"X-Router-Decision": routed.decision_id,
+                                                  "X-Router-Seat": routed.choice.seat or "",
+                                                  "Cache-Control": "no-cache"})
+            response.routed = routed
+            return response
         routed = await run_in_threadpool(lambda: router.route(req, client=client, ceiling=lim,
                                                                  lane=lane, session=session,
                                                                  answer_tokens=answer))
@@ -312,6 +306,64 @@ def build(cfg: Config) -> FastAPI:
             headers["X-Router-Key-Charged"] = str(charged)
             headers["X-Router-Key-Remaining"] = str(left.remaining)
         return JSONResponse(body, headers=headers)
+
+    @app.post("/v1/chat/completions")
+    async def chat(request: Request, who=Depends(principal),
+                   user_agent: str | None = Header(default=None),
+                   x_router_max_usd_per_m: str | None = Header(default=None),
+                   x_router_lane: str | None = Header(default=None),
+                   x_router_session: str | None = Header(default=None),
+                   x_router_ensemble: str | None = Header(default=None),
+                   x_router_answer_tokens: str | None = Header(default=None)):
+        try:
+            req = await request.json()
+        except ValueError:
+            return _error(400, "invalid_request", "body is not JSON")
+        if not isinstance(req, dict) or not isinstance(req.get("messages"), list) or not req["messages"]:
+            return _error(400, "invalid_request", "`messages` must be a non-empty list")
+        return await _route_chat(req, who, user_agent, x_router_max_usd_per_m,
+                                 x_router_lane, x_router_session, x_router_ensemble,
+                                 x_router_answer_tokens)
+
+    @app.post("/v1/responses")
+    async def responses(request: Request, who=Depends(principal),
+                        user_agent: str | None = Header(default=None),
+                        x_router_max_usd_per_m: str | None = Header(default=None),
+                        x_router_lane: str | None = Header(default=None),
+                        x_router_session: str | None = Header(default=None),
+                        x_router_ensemble: str | None = Header(default=None),
+                        x_router_answer_tokens: str | None = Header(default=None)):
+        try:
+            body = await request.json()
+        except ValueError:
+            return _error(400, "invalid_request", "body is not JSON")
+        if not isinstance(body, dict):
+            return _error(400, "invalid_request", "body must be a JSON object")
+        try:
+            chat_req = responses_to_chat(body)
+        except ValueError as exc:
+            return _error(400, "invalid_request", str(exc))
+        routed_response = await _route_chat(chat_req, who, user_agent, x_router_max_usd_per_m,
+                                            x_router_lane, x_router_session, x_router_ensemble,
+                                            x_router_answer_tokens)
+        if isinstance(routed_response, StreamingResponse):
+            seat = routed_response.headers.get("X-Router-Seat") or str(body.get("model") or "auto")
+            model = seat.split(":", 1)[1] if ":" in seat else seat
+            headers = {name: value for name, value in routed_response.headers.items()
+                       if name.lower().startswith("x-router-") or name.lower() == "cache-control"}
+            return StreamingResponse(responses_stream(routed_response.body_iterator, body, model,
+                                                        getattr(routed_response, "routed", None)),
+                                     media_type="text/event-stream", headers=headers)
+        if routed_response.status_code != 200:
+            return routed_response
+        try:
+            completion = json.loads(routed_response.body)
+        except (TypeError, ValueError):
+            return _error(502, "invalid_upstream_response", "upstream response was not valid JSON")
+        response_body = chat_completion_to_response(completion, body)
+        headers = {name: value for name, value in routed_response.headers.items()
+                   if name.lower().startswith("x-router-")}
+        return JSONResponse(response_body, headers=headers)
 
     def _exact(doc: dict):
         r = doc.get("result") or {}

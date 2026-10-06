@@ -68,6 +68,188 @@ def chat(client, **kw):
     return client.post("/v1/chat/completions", json=body)
 
 
+def _responses_chat_payload(*, content=None, tool_calls=None):
+    message = {"role": "assistant", "content": content, "tool_calls": tool_calls}
+    return {"id": "chatcmpl-test", "object": "chat.completion", "model": "meta-llama/Llama-3.3-70B-Instruct",
+            "choices": [{"index": 0, "message": message,
+                         "finish_reason": "tool_calls" if tool_calls else "stop"}],
+            "usage": {"prompt_tokens": 34, "completion_tokens": 9, "total_tokens": 43}}
+
+
+def _script_calls(monkeypatch, payloads):
+    requests = []
+
+    def call(provider, model, key, req, *, max_tokens, timeout=180, window=None):
+        requests.append((req, max_tokens))
+        result = P.extract(provider, model, payloads.pop(0))
+        result.latency_s = 0.01
+        return result
+
+    monkeypatch.setattr(P, "call", call)
+    return requests
+
+
+def _shell_tool():
+    return {"type": "function", "name": "shell", "description": "Run a shell command.",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}, "strict": True}
+
+
+def test_responses_shell_tool_call_and_output_round_trip(app, monkeypatch):
+    client, _ = app
+    assert "/v1/responses" in client.get("/openapi.json").json()["paths"]
+    client.post("/router/probe", json={"cheapest": 3})
+    calls = _script_calls(monkeypatch, [
+        _responses_chat_payload(tool_calls=[{"id": "call_shell_01", "type": "function",
+                                             "function": {"name": "shell",
+                                                          "arguments": '{"command":"printf ready"}'}}]),
+        _responses_chat_payload(content="The command printed ready."),
+    ])
+    tools = [_shell_tool()]
+
+    first = client.post("/v1/responses", json={
+        "model": "auto", "instructions": "You are a careful coding agent.",
+        "input": "Run printf ready in the shell.", "tools": tools,
+        "tool_choice": {"type": "function", "name": "shell"}, "max_output_tokens": 80,
+    })
+
+    assert first.status_code == 200, first.text
+    response = first.json()
+    assert response["object"] == "response" and response["status"] == "completed"
+    function_call = next(item for item in response["output"] if item["type"] == "function_call")
+    assert function_call["call_id"] == "call_shell_01"
+    assert function_call["name"] == "shell"
+    assert function_call["arguments"] == '{"command":"printf ready"}'
+    assert calls[0][0]["messages"] == [
+        {"role": "developer", "content": "You are a careful coding agent."},
+        {"role": "user", "content": "Run printf ready in the shell."},
+    ]
+    assert calls[0][0]["tools"] == [{"type": "function", "function": {
+        "name": "shell", "description": "Run a shell command.",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}},
+                       "required": ["command"]}, "strict": True,
+    }}]
+    assert calls[0][1] == 80
+
+    second = client.post("/v1/responses", json={
+        "model": "auto", "instructions": "You are a careful coding agent.",
+        "input": [
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "Run printf ready in the shell."}]},
+            {"type": "function_call", "id": function_call["id"], "call_id": "call_shell_01",
+             "name": "shell", "arguments": '{"command":"printf ready"}'},
+            {"type": "function_call_output", "call_id": "call_shell_01", "output": "ready\n"},
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "Tell me what the command printed."}]},
+        ],
+        "tools": tools, "max_output_tokens": 80,
+    })
+
+    assert second.status_code == 200, second.text
+    assert second.json()["output"][0]["content"][0]["text"] == "The command printed ready."
+    assert calls[1][0]["messages"] == [
+        {"role": "developer", "content": "You are a careful coding agent."},
+        {"role": "user", "content": "Run printf ready in the shell."},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call_shell_01", "type": "function",
+            "function": {"name": "shell", "arguments": '{"command":"printf ready"}'},
+        }]},
+        {"role": "tool", "tool_call_id": "call_shell_01", "content": "ready\n"},
+        {"role": "user", "content": "Tell me what the command printed."},
+    ]
+
+
+def test_responses_compacted_history_keeps_tool_calls_without_current_tool_definition(app, monkeypatch):
+    client, _ = app
+    client.post("/router/probe", json={"cheapest": 3})
+    calls = _script_calls(monkeypatch, [_responses_chat_payload(content="The saved output says ready.")])
+
+    response = client.post("/v1/responses", json={
+        "model": "auto", "input": [
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "I ran the command."}]},
+            # Auto-compaction can leave a historical shell call in context after the
+            # current tool set has changed. Historical calls are transcript data, not
+            # instructions for this endpoint to dispatch or validate locally.
+            {"type": "function_call", "id": "fc_compacted", "call_id": "call_old_shell",
+             "name": "shell", "arguments": '{"command":"cat result.txt"}'},
+            {"type": "function_call_output", "call_id": "call_old_shell",
+             "output": "ready\n"},
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "Use that result to answer."}]},
+        ],
+        "tools": [{"type": "function", "name": "read_file", "parameters": {
+            "type": "object", "properties": {"path": {"type": "string"}}}}],
+    })
+
+    assert response.status_code == 200, response.text
+    assert "unknown tool" not in response.text.lower()
+    messages = calls[0][0]["messages"]
+    assert messages[1]["tool_calls"][0]["function"]["name"] == "shell"
+    assert messages[2] == {"role": "tool", "tool_call_id": "call_old_shell", "content": "ready\n"}
+    assert calls[0][0]["tools"][0]["function"]["name"] == "read_file"
+
+
+def test_responses_stream_emits_shell_tool_call_events(app, monkeypatch):
+    client, _ = app
+    client.post("/router/probe", json={"cheapest": 3})
+    chunks = [
+        {"choices": [{"index": 0, "delta": {"content": "Running the shell."},
+                      "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_stream_shell",
+           "type": "function", "function": {"name": "shell", "arguments": '{"command":'}}]},
+           "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0,
+           "function": {"arguments": '"printf ready"}'}}]}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        {"choices": [], "usage": {"prompt_tokens": 34, "completion_tokens": 9, "total_tokens": 43}},
+    ]
+
+    def stream(provider, model, key, req, *, max_tokens, on_done, timeout=180, window=None):
+        def events():
+            try:
+                for chunk in chunks:
+                    yield ("data: " + json.dumps(chunk) + "\n\n").encode()
+                yield b"data: [DONE]\n\n"
+            finally:
+                on_done(P.Result(True, 200, provider, model, tool_calls=1, prompt_tokens=34,
+                                 completion_tokens=9, latency_s=0.01, detail="ok"))
+        return events()
+
+    monkeypatch.setattr(P, "stream", stream)
+    response = client.post("/v1/responses", json={
+        "model": "auto", "input": "Run printf ready in the shell.", "tools": [_shell_tool()],
+        "tool_choice": {"type": "function", "name": "shell"}, "max_output_tokens": 80,
+        "stream": True,
+    })
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+    assert events[0]["type"] == "response.created"
+    assert events[-1]["type"] == "response.completed"
+    function_call = next(item for item in events[-1]["response"]["output"]
+                         if item["type"] == "function_call")
+    assert events[-1]["response"]["output"][0]["content"][0]["text"] == "Running the shell."
+    assert any(event["type"] == "response.output_text.delta" for event in events)
+    assert function_call["call_id"] == "call_stream_shell"
+    assert function_call["name"] == "shell"
+    assert function_call["arguments"] == '{"command":"printf ready"}'
+    assert any(event["type"] == "response.function_call_arguments.delta" for event in events)
+
+
+def test_responses_rejects_unavailable_previous_response_state(app):
+    client, up = app
+    up.calls.clear()
+    response = client.post("/v1/responses", json={
+        "model": "auto", "previous_response_id": "resp_from_another_request",
+        "input": "Continue from the previous response.",
+    })
+    assert response.status_code == 400
+    assert "send the full input history" in response.json()["error"]["message"]
+    assert up.calls == []
+
+
 def test_unmeasured_roster_abstains_loudly(app):
     client, up = app
     r = chat(client, max_tokens=16)

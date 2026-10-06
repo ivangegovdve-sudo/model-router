@@ -1,8 +1,8 @@
 # Calling the router
 
-One OpenAI-compatible endpoint. You send a chat request; the router picks the model that
-answers it for the lowest expected cost, calls it, and tells you what it picked, why, and
-what you were charged.
+One model-router API with Chat Completions and a text/function-tool Responses path. You send
+a request; the router picks a model, calls it, and tells you what it picked, why, and what
+you were charged.
 
 **Base URL:** `https://chloe.blumenkraft.cloud/modelrouter/v1`
 **Key:** sent to you separately. It starts with `mr_`. Treat it like a password.
@@ -15,7 +15,11 @@ Python (`pip install openai`):
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="https://chloe.blumenkraft.cloud/modelrouter/v1", api_key="mr_...")
+client = OpenAI(
+    base_url="https://chloe.blumenkraft.cloud/modelrouter/v1",
+    api_key="mr_...",
+    default_headers={"X-Router-Lane": "background"},
+)
 r = client.chat.completions.create(
     model="auto",
     max_tokens=300,
@@ -29,11 +33,19 @@ curl:
 ```bash
 curl https://chloe.blumenkraft.cloud/modelrouter/v1/chat/completions \
   -H "Authorization: Bearer mr_..." -H "Content-Type: application/json" \
+  -H "X-Router-Lane: background" \
   -d '{"model":"auto","max_tokens":300,"messages":[{"role":"user","content":"Explain tides in two sentences."}]}'
 ```
 
-Any OpenAI-compatible tool works the same way: set its base URL and API key to the two
-values above and use model `auto`. Streaming (`stream: true`) is supported.
+The API exposes these routes only; it does not promise that every OpenAI API feature or
+client works. Automated tests use FastAPI's test client. The repository has no direct tests
+for the official OpenAI Python or Node SDKs, or Codex CLI. A September 30, 2026 Codex CLI
+0.159 test used a local adapter before native Responses support was added.
+
+For a Responses API request, use `model="auto"` and set `X-Router-Lane: background` for a
+long coding task. Text input and function tools are supported; include the full conversation
+history on each call. Hosted tools, multimodal input, `previous_response_id`, and background
+polling are not supported.
 
 ## Choosing how it routes
 
@@ -41,7 +53,7 @@ values above and use model `auto`. Streaming (`stream: true`) is supported.
 |---|---|
 | `model: "auto"` | someone is waiting: fastest-enough, cheapest answer |
 | `model: "auto:batch"` (or `auto:background`) | nobody is waiting: cheaper, slower capacity |
-| `model: "provider:model"`, e.g. `sail:google/gemma-4-31B-it` | that model only (list: `GET /v1/models`) |
+| `model: "provider:model"` | that model only; copy a current id from `GET /v1/models` |
 | header `X-Router-Answer-Tokens: 5` | "the answer is about this long" — sharpens the cost choice for short answers |
 | header `X-Router-Session: <any id>` | keeps a conversation on one provider while its prompt cache is warm (cheaper) |
 
@@ -51,9 +63,11 @@ answer in, and if it has to raise it, it says so.
 
 ## What you get back
 
-A normal chat completion, plus a `router` field:
+Both endpoints include routing details in a `router` field. Chat Completions returns a chat
+completion; Responses returns a Responses-shaped object with `message` and `function_call`
+output items. The router fields are:
 ```
-seat               the model that answered, e.g. "ionet:mistralai/Mistral-Nemo-Instruct-2407"
+seat               the model that answered, e.g. "provider:current-model-id"
 because            why it was chosen over the others
 charged_usd        what this call took from your budget
 key_remaining_usd  what is left
