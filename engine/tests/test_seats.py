@@ -133,11 +133,20 @@ def test_exclude_seats():
 
 
 # ---- Jev: advises among eligible seats only, fails open ---------------------------------
+def _adv(post, key="k", **kw):
+    """An advisor behind a real Guard (its own throwaway ledger) with a fake transport."""
+    import tempfile
+    from pathlib import Path
+
+    from modelrouter import jevguard
+    g = jevguard.Guard(jevguard.GuardConfig(ledger=Path(tempfile.mkdtemp()) / "jev.sqlite3", fallback="defer"),
+                       lambda: key, post=post, fallback=None, alert=lambda e: None)
+    return jev.make_advisor(lambda: key, guard=g, **kw)
+
+
 def advisor_returning(choice, prob):
-    return jev.make_advisor(
-        lambda: "k", min_prob=0.6,
-        post=lambda key, body, t: {"answers": {"seat": {
-            "choice": choice, "confidence": prob, "probabilities": {choice: prob}}}})
+    return _adv(lambda key, body, t: {"answers": {"seat": {
+            "choice": choice, "confidence": prob, "probabilities": {choice: prob}}}}, min_prob=0.6)
 
 
 def test_jev_can_switch_to_a_stronger_eligible_seat():
@@ -166,14 +175,14 @@ def test_jev_in_free_only_only_sees_free_seats():
                                      "probabilities": {"local:llama3.1:8b": 0.9}}}}
     pool = POOL + [S("openrouter", "x/y:free", "0", "free")]
     resolve(SeatRequest(task="t"), pool, configured_policy="free-only",
-            advisor=jev.make_advisor(lambda: "k", post=post))
+            advisor=_adv(post))
     assert set(seen) == {"local:llama3.1:8b", "openrouter:x/y:free"}
 
 
 def test_jev_failures_fail_open():
     def boom(key, body, t):
         raise TimeoutError
-    for adv in (jev.make_advisor(lambda: "k", post=boom), jev.make_advisor(lambda: "")):
+    for adv in (_adv(boom), _adv(boom, key="")):
         r = resolve(SeatRequest(task="t"), POOL, configured_policy="cheapest", advisor=adv)
         assert r.outcome is Outcome.SEAT and r.seat.provider == "sail" and r.jev["used"] is False
 
@@ -186,7 +195,7 @@ def test_jev_failures_fail_open():
 def test_jev_not_called_without_task_or_single_candidate():
     def never(key, body, t):
         raise AssertionError("called")
-    adv = jev.make_advisor(lambda: "k", post=never)
+    adv = _adv(never)
     resolve(SeatRequest(), POOL, configured_policy="cheapest", advisor=adv)
     resolve(SeatRequest(task="t"), POOL[:1], configured_policy="cheapest", advisor=adv)
 

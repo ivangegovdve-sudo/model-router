@@ -104,6 +104,51 @@ Response: `{outcome:"SEAT", policy, seat, provider, family, tier, cost_basis:
 decision_id}`. `considered` lists every seat with `QUALIFIES|EXCLUDED|UNKNOWN` and the reason.
 No seat: HTTP 422 `{type:"seat_unavailable", outcome:"UNAVAILABLE", because, considered[]}`.
 
+## `POST /v1/systemone` -- Jev behind the hard daily spend cap
+
+TypeSafe has no server-side budget, so the cap is enforced here, before each call. Same body
+and same answer as `https://api.typesafe.ai/v1/systemone` (`{model, state, questions}` ->
+`{model, answers, usage}`), plus `guard`. A caller that points here holds no TypeSafe key.
+
+* **Cap:** `[jev] daily_cap_usd` (default **$1.00**), reset at local midnight (`timezone`).
+  Env overrides: `JEV_DAILY_CAP_USD`, `JEV_USD_PER_MTOK_IN`, `JEV_USD_PER_MTOK_OUT`,
+  `JEV_GUARD_TZ`, `JEV_FALLBACK`, `JEV_FALLBACK_URL`, `JEV_ALERT_URL`, `JEV_GUARD_LEDGER`.
+* **Cost:** TypeSafe's published price -- $0.042 per million input tokens, output free
+  (jev-1.13.0) -- applied to the `usage` each answer returns. Integer nano-USD, never a guess.
+  A call with unknown billing (timeout, any HTTP error except 401/403, no usable `usage`)
+  is charged its worst case, never $0. The price cannot be configured below the published one
+  and the cap cannot be set above $100: no config or env value turns the cap off.
+* **How it holds:** each call reserves its worst case (one input token per request byte, plus
+  1024 tokens per request and 64 per question for the prompt the API adds -- measured ~250 --
+  plus the API's 64k output limit at the output price) in one `BEGIN IMMEDIATE` transaction on
+  `<state>/jev_spend.sqlite3`, then settles to the actual cost. Concurrent callers and separate
+  processes share the ledger; a crash keeps the hold; a call still in flight at midnight keeps
+  counting until it settles, and its cost lands in the day it settles in. A caller waits at most
+  600s (wall clock); past that it gets a timeout while the call's hold stays, and the call
+  settles itself when it returns. A hold whose process died (no heartbeat for 1h) is converted
+  to a charge of its worst case, never dropped. A request above 256 KB cannot be bounded and is
+  refused (HTTP 413).
+* **Limit:** the bound rests on the provider billing no more than that. No client can stop a
+  provider billing more than it was sent; if a settlement ever exceeds its reservation the guard
+  alerts (`jev_reservation_exceeded`) and widens every in-flight hold and later reservation by
+  the observed ratio in the same transaction. The exposure is the calls on the wire at that
+  moment.
+* **At the cap** the paid call is not made. `fallback = "laya"` (in-process, `pip install
+  modelrouter[laya]`) or `"url"` (a Jev-compatible endpoint on a literal loopback IP only; redirects are not followed) answers for free: HTTP 200,
+  `guard.served_by = "fallback:..."`, `guard.blocked = true`. With `"defer"`, or if the
+  fallback fails: HTTP 429 `{error.code: "jev_daily_cap_reached"}` with `Retry-After` =
+  seconds to local midnight.
+* **Alert:** the first block of a day logs `JEV DAILY CAP TRIPPED`, appends one line to
+  `<state>/jev_guard_alerts.jsonl`, and POSTs it to `alert_url` if set.
+
+`guard`: `{served_by, cost_usd, blocked, day, cap_usd, spent_usd, remaining_usd}`. Headers:
+`X-Jev-Served-By`, `X-Jev-Spent-Usd`, `X-Jev-Cap-Usd`. Optional request header `X-Jev-Caller`
+names the caller in the ledger. `GET /v1/systemone/spend` (or `modelrouter jev-spend`) reports
+today's spend, remaining, paid / blocked calls and when the cap tripped.
+
+The seat advisor above goes through the same guard: at the cap it makes no paid call and the
+deterministic order stands (`jev.why` says so).
+
 ## Legibility
 
 | Method | Path | Returns |

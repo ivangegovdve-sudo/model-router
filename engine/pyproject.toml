@@ -12,6 +12,7 @@ dependencies = [
 [project.optional-dependencies]
 mcp = ["mcp>=2.2,<3"]
 test = ["pytest>=8"]
+laya = ["laya>=0.3"]   # free local System-1 fallback when the Jev daily cap blocks a call
 
 [project.scripts]
 modelrouter = "modelrouter.cli:main"

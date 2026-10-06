@@ -6,6 +6,8 @@
     GET  /router/setup             the setup surface: keys by NAME, sources, problems
     GET  /router/roster            every candidate with the facts the decision reads
     POST /v1/seats/resolve         which seat fills a ROLE under a policy + family constraint
+    POST /v1/systemone             Jev (TypeSafe System One) behind the hard daily spend cap
+    GET  /v1/systemone/spend       today's Jev spend, cap, remaining, blocked calls
     POST /router/explain           the decision for a request, without making the call
     POST /router/probe             buy behavioural facts (spends money, capped)
     GET  /router/decisions         recent decisions
@@ -30,7 +32,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, jev, seats
+from . import __version__, jev, jevguard, seats
 from .config import Config, load
 from decimal import Decimal
 
@@ -181,9 +183,54 @@ def build(cfg: Config) -> FastAPI:
                 "dashboard": router.gather.dashboard_status, "seats": rows}
 
     jev_keys = Keyring(cfg.source, {"typesafe": cfg.jev_secret}, cfg.gcp_project)
+    # The one door to the paid TypeSafe API: the seat advisor and /v1/systemone both use it.
+    jev_guard = jevguard.Guard(cfg.guard_config(), lambda: jev_keys.get("typesafe"))
+    app.state.jev_guard = jev_guard
     advisor = (jev.make_advisor(lambda: jev_keys.get("typesafe"),
-                                min_prob=cfg.jev_min_probability)
+                                min_prob=cfg.jev_min_probability, guard=jev_guard)
                if cfg.jev_enabled else None)
+
+    @app.get("/v1/systemone/spend", dependencies=[Depends(auth)])
+    def systemone_spend():
+        return app.state.jev_guard.status()
+
+    @app.post("/v1/systemone", dependencies=[Depends(auth)])
+    async def systemone(request: Request, x_jev_caller: str | None = Header(default=None)):
+        """TypeSafe's POST /v1/systemone, same body and same answer, behind the daily cap.
+        A caller that points here instead of api.typesafe.ai holds no TypeSafe key and
+        cannot overspend: at the cap the free local fallback answers, or it gets a 429."""
+        if not cfg.jev_enabled:
+            return _error(503, "jev_disabled", "[jev] enabled = false in the router config")
+        try:
+            body = await request.json()
+        except ValueError:
+            return _error(400, "invalid_request", "body is not JSON")
+        if (not isinstance(body, dict) or not isinstance(body.get("questions"), dict)
+                or not body["questions"]):
+            return _error(400, "invalid_request", "`questions` must be a non-empty object")
+        # Only what System One reads leaves this machine: the model, the state, the questions.
+        out = {"model": body.get("model") or jev.MODEL, "state": body.get("state"),
+               "questions": body["questions"]}
+        try:
+            served = await run_in_threadpool(
+                lambda: app.state.jev_guard.call(out, caller=(x_jev_caller or "gateway")[:60],
+                                                 timeout=60.0))
+        except ValueError as exc:                               # too large to bound
+            return _error(413, "jev_request_too_large", str(exc))
+        except jevguard.CapReached as exc:
+            r = _error(429, "jev_daily_cap_reached", str(exc), guard=exc.status)
+            r.headers["Retry-After"] = str(exc.retry_after_s)
+            return r
+        except jevguard.HttpStatus as exc:
+            return _error(502, "jev_upstream_error", "TypeSafe answered %s" % exc)
+        except Exception as exc:
+            return _error(502, "jev_call_failed", "the Jev call failed: %s" % type(exc).__name__)
+        resp = (dict(served.response) if isinstance(served.response, dict)
+                else {"answers": served.response})
+        resp["guard"] = served.public()
+        return JSONResponse(resp, headers={"X-Jev-Served-By": served.served_by,
+                                           "X-Jev-Spent-Usd": served.status["spent_usd"],
+                                           "X-Jev-Cap-Usd": served.status["cap_usd"]})
 
     def pool_seats() -> list[seats.Seat]:
         out = [s for s in (seats.from_candidate(c) for c in router.gather.roster()) if s]
