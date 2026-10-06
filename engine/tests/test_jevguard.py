@@ -561,7 +561,8 @@ def test_an_overshoot_widens_the_holds_already_in_flight_in_the_same_transaction
     a, _, _ = g.ledger.reserve("in-flight-a", base, g.cfg.cap_nano, 1)
     b, _, _ = g.ledger.reserve("in-flight-b", base, g.cfg.cap_nano, 1)
     c, _, _ = g.ledger.reserve("overshooter", base, g.cfg.cap_nano, 1)
-    factor = g.ledger.settle(c, "OK", 3 * base, 3, 0)             # billed 3x its reservation
+    charged, factor = g.ledger.settle(c, "OK", 3 * base, 3, 0)    # billed 3x its reservation
+    assert charged == 3 * base
     assert factor >= 3000 and g.ledger.bound_factor() == factor
     held = [r[0] for r in g.ledger._conn().execute(
         "SELECT reserved_nano FROM jev_calls WHERE status = 'RESERVED' ORDER BY id")]
@@ -642,10 +643,12 @@ def test_a_swept_row_is_terminal_a_late_result_cannot_lower_or_move_its_charge(t
     clock.t += timedelta(minutes=61)
     g.ledger.reserve("trigger-sweep", worst, g.cfg.cap_nano, 1)
     clock.t += timedelta(days=1)
-    assert g.ledger.settle(cid, "OK", 10, 5, 0) is None           # a cheap late result
+    _, factor = g.ledger.settle(cid, "OK", 10, 5, 0)              # a cheap late result
+    assert factor is None
     row = g.ledger._conn().execute("SELECT day, status, cost_nano, detail FROM jev_calls WHERE id = ?", (cid,)).fetchone()
     assert row[:3] == ("2026-10-04", "UNKNOWN_BILLING", worst) and "late result: OK" in row[3]
-    assert g.ledger.settle(cid, "OK", 2 * worst, 9, 0)            # a late result ABOVE it does raise it
+    _, factor = g.ledger.settle(cid, "OK", 2 * worst, 9, 0)       # a late result ABOVE it does raise it
+    assert factor
     assert g.ledger._conn().execute("SELECT cost_nano FROM jev_calls WHERE id = ?", (cid,)).fetchone()[0] == 2 * worst
 
 
