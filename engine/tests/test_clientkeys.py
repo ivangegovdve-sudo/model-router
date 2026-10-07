@@ -48,6 +48,27 @@ def test_caller_key_makes_a_real_call_and_is_charged_its_actual_cost(env):
     assert u["recent_charges"][0]["basis"] == "computed"
 
 
+def test_caller_key_can_use_responses_and_cannot_overrun_its_cap(env):
+    admin, friend, ck, rec, value, up = env
+    response = friend.post("/v1/responses", json={
+        "model": "auto", "input": "Say hello.", "max_output_tokens": 16,
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["object"] == "response"
+    assert response.json()["output"][0]["content"][0]["text"] == "Ready"
+    charged = Decimal(response.headers["X-Router-Key-Charged"])
+    assert charged > 0
+    assert friend.get("/v1/usage").json()["calls"] == 1
+
+    up.calls.clear()
+    refused = friend.post("/v1/responses", json={
+        "model": "auto", "input": "Say hello.", "max_output_tokens": 4000,
+    })
+    assert refused.status_code == 402
+    assert refused.json()["error"]["type"] == "spend_cap_reached"
+    assert up.calls == []
+
+
 def test_a_call_that_could_overrun_the_cap_is_refused_before_any_provider_is_called(env):
     admin, friend, ck, rec, value, up = env
     up.calls.clear()

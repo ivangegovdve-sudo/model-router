@@ -1,5 +1,5 @@
 [Unit]
-Description=modelrouter - OpenAI-compatible proxy that decides on cost per completed answer
+Description=modelrouter - Chat Completions and Responses router with cost-aware decisions
 After=network-online.target
 Wants=network-online.target
 

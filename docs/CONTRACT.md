@@ -1,6 +1,6 @@
 # modelrouter — client contract (v1)
 
-One engine, three faces: the OpenAI-compatible proxy (which actually routes), the
+One engine, three faces: the OpenAI-shaped HTTP API (which actually routes), the
 Windows/Android app (which shows why), and the MCP server (which advises). The app and
 the MCP server are thin clients of the endpoints below; neither reimplements a decision,
 and neither ever holds a provider key.
@@ -15,7 +15,21 @@ is needed.
 | Method | Path | Returns |
 |---|---|---|
 | POST | `/v1/chat/completions` | OpenAI chat completion. `model: "auto"` routes; `model: "provider:model"` is judged alone and refused if it cannot serve the request. `stream: true` supported. |
+| POST | `/v1/responses` | Responses-shaped result for text input and function tools. Maps `input`, `instructions`, `max_output_tokens`, `function_call`, and `function_call_output` through the Chat Completions routing engine. Buffered and SSE responses supported. |
 | GET | `/v1/models` | `{object:"list", data:[{id:"auto"}, {id:"provider:model"}, ...]}` |
+
+**Responses scope.** The endpoint supports text messages and function tools. Historical function
+calls and their outputs are passed through by call ID; the server does not execute tools or
+require a historical tool name to appear in the current `tools` list. Each request must include
+its full input history. `previous_response_id`, Responses background polling, hosted tools, and
+multimodal input are unsupported; requests using them receive HTTP 400. Opaque reasoning input
+items are ignored. The response includes standard `message` / `function_call` output items plus
+a `router` extension.
+
+**Client coverage.** Automated tests use FastAPI's test client to exercise the HTTP contract.
+The repository does not currently test the official OpenAI Python SDK, Node SDK, or Codex CLI
+directly. The September 30, 2026 Codex CLI 0.159 report used a localhost adapter and predates
+this native `/v1/responses` route.
 
 Optional request headers: `X-Router-Max-Usd-Per-M` (price ceiling for one call),
 `X-Router-Answer-Tokens` (expected answer length — cost per answer is rate × tokens burned),
@@ -31,7 +45,9 @@ probe measures connection + prefill, not decode: AkashML answered one word in 0.
 `auto:batch` (or header `X-Router-Lane`) ignore latency and buy cheaper scheduling where a provider
 sells it — Sail's `balanced` / `flex` completion windows, sent as `metadata.completion_window` and
 priced from that window's rate card. A named `provider:model` skips the latency gate (the caller
-chose). An unknown lane is HTTP 400.
+chose). The `X-Router-Lane: background` header is the recommended lane for long coding requests;
+it bypasses the interactive latency gate. This is separate from Responses `background: true`,
+which would require polling and is not implemented. An unknown lane is HTTP 400.
 
 **max_tokens is a correctness parameter.** A reasoning model given less than its measured floor
 bills tokens and returns nothing, so the router never passes such a budget through. It prefers a
@@ -44,8 +60,8 @@ floor and the router decides once more, which may raise it again for the same mo
 A routed response is the upstream body unchanged plus one field:
 
 ```json
-"router": {"decision_id": "20260926T031754-29e8ba", "seat": "nous:mistralai/mistral-nemo",
-           "because": "lowest expected cost of 9 qualifying: $1.08e-05 expected ($0.02608/M measured); next venice:e2ee-qwen-2-5-7b-p at $2.14e-05 expected ($0.05165/M measured)",
+"router": {"decision_id": "20260926T031754-29e8ba", "seat": "provider:current-model-id",
+           "because": "lowest expected cost of qualifying seats; next provider:another-current-model",
            "cost_usd": 2.69e-07, "cost_basis": "billed", "attempts": 1}
 ```
 and headers `X-Router-Decision`, `X-Router-Seat` (streams carry only the headers).

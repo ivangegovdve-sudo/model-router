@@ -1,7 +1,7 @@
 [project]
 name = "modelrouter"
 version = "0.1.0"
-description = "OpenAI-compatible proxy that picks the model per request with a typed, legible decision -- or refuses."
+description = "Model router for Chat Completions and text/function Responses requests with typed, legible decisions."
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.110",

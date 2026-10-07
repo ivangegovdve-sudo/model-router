@@ -1,12 +1,13 @@
 # model-router
 
-An OpenAI-compatible proxy that picks the model for each request with a typed decision you
-can read — and refuses, loudly, when no model can serve the request honestly.
+An OpenAI-shaped HTTP API that routes Chat Completions and a text/function-tool subset of
+Responses requests using a typed decision you can read — and refuses when no model can
+serve the request honestly.
 
-Point any OpenAI client at `http://<host>:7480/v1`, ask for model `auto`, and the router
-chooses a model, forwards the call, and returns the response with a `router` field that says
-which model answered, why, and what it cost. Every decision is recorded: which models were
-considered, their live and measured prices, which were ruled out and on what fact.
+The router chooses a model, forwards the call, and returns routing details with the response.
+Every decision is recorded: which models were considered, their live and measured prices,
+which were ruled out and on what fact. This does not claim compatibility with every OpenAI
+API, feature, or client.
 
 ## Why price tables are not enough
 
@@ -132,19 +133,61 @@ Until something is measured, every request **abstains** — by design. `probe` b
 asks each model for a one-word answer at rising `max_tokens` (32, 256, 1024, 2048) until content
 appears, under a hard budget (`policy.probe_budget_usd`). Real traffic keeps refining the same facts.
 
-### Use it
+### Chat Completions
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:7480/v1", api_key="<router token>")
+client = OpenAI(
+    base_url="http://127.0.0.1:7480/v1",
+    api_key="<router token>",
+    default_headers={"X-Router-Lane": "background"},
+)
 r = client.chat.completions.create(model="auto", max_tokens=400,
                                    messages=[{"role": "user", "content": "..."}])
 print(r.choices[0].message.content, r.model_extra["router"])
 ```
 
-`model="provider:model"` (e.g. `akashml:meta-llama/Llama-3.3-70B-Instruct`) asks for one model; it
-is still judged, and refused if it cannot serve the request (for example a reasoning model given
-too small a `max_tokens`). Header `X-Router-Max-Usd-Per-M` lowers the price ceiling for one call.
+### Responses and coding agents
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:7480/v1",
+    api_key="<router token>",
+    default_headers={"X-Router-Lane": "background"},
+)
+r = client.responses.create(
+    model="auto",
+    input="Inspect the project and report the relevant files.",
+    max_output_tokens=1024,
+)
+print(r.output)
+```
+
+Use `X-Router-Lane: background` for longer coding requests. The default `interactive` lane
+excludes seats predicted to exceed the configured latency limit (8 seconds by default), and
+`max_output_tokens` contributes to that prediction. `background` removes that time gate and
+can choose cheaper scheduling windows when a provider offers them. This header selects a
+router lane; the Responses API's `background: true` polling mode is not supported.
+
+`/v1/responses` supports text messages and function tools, including returned `function_call`
+items and submitted `function_call_output` items. It forwards historical function calls as
+transcript data even when their tool is absent from the current tool list, so a compacted
+conversation does not trigger local tool-name dispatch. Send the full input history on every
+request: `previous_response_id` and server-side response polling are not supported. Built-in
+hosted tools and multimodal input are outside this compatibility surface.
+
+**Client coverage:** automated tests exercise the HTTP routes with FastAPI's test client;
+they do not run the official OpenAI Python or Node SDKs, or Codex CLI, against this server.
+Boris Lazarov's September 30, 2026 Codex CLI 0.159 test used a localhost adapter before this
+native endpoint existed, so it is not a direct Codex CLI verification of this implementation.
+
+`model="provider:model"` asks for one model; it is still judged and refused if it cannot serve
+the request. `GET /v1/models` lists the live roster, but a listed model may have unmeasured
+capabilities. Use `GET /router/roster` to inspect readiness facts, or `model="auto"` to route
+only among currently qualified seats. Header `X-Router-Max-Usd-Per-M` lowers the price ceiling
+for one call.
 
 ### See why
 

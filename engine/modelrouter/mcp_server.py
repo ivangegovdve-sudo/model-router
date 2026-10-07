@@ -22,7 +22,8 @@ URL = os.environ.get("MODELROUTER_URL", "http://127.0.0.1:7480").rstrip("/")
 mcp = MCPServer("modelrouter", instructions=(
     "Ask which model the router would choose for a request and why -- every candidate "
     "considered, its live and measured price, and the fact that decided. Advisory only: "
-    "to actually route, point an OpenAI-compatible client at the proxy with model 'auto'."))
+    "to route, send a supported /v1/chat/completions or /v1/responses request to the proxy "
+    "with model 'auto'. Responses support is limited to text and function tools."))
 
 
 def _client() -> httpx.Client:
