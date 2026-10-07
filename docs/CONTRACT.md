@@ -75,6 +75,51 @@ and headers `X-Router-Decision`, `X-Router-Seat` (streams carry only the headers
 | 502 | `routed_call_failed` | every attempt failed or came back **empty** (HTTP 200 with no content is a failure) |
 | 401 | — | missing/wrong router token |
 
+## Seat selection (consumers: Glass solver, councils)
+
+`POST /v1/seats/resolve` (operator token) answers "which provider/seat fills ROLE under POLICY
+and a cross-family constraint". It is advisory: it makes no inference call on the seat it
+returns. The caller then invokes the seat (`invoke`) itself, or via `/v1/chat/completions` with
+`model: "<seat>"` for router-proxied seats.
+
+```json
+{ "consumer": "glass-solver|private-council|public-council",
+  "role": "review|fix|rebase|council|general",
+  "policy": "free-only",                 // optional; may tighten the consumer's policy, never loosen
+  "exclude_families": ["openai"],        // the author's base-weight family
+  "exclude_seats": [], "need": {"tools": false, "min_context": 32000},
+  "max_usd_per_m": 5, "task": "bounded summary for Jev (data, not instructions)" }
+```
+
+Policy is **server config per consumer** (`[consumers.<name>] policy`). Defaults: `glass-solver`
+and `private-council` = `cheapest`; `public-council` = `free-only`. An unknown or mistyped consumer is
+HTTP 400 even when the request names a policy (fail-closed); `exclude_families` / `exclude_seats` must
+be lists of strings. The configured `policy.ceiling_usd_per_mtok` applies; a request's `max_usd_per_m`
+can only lower it. `invoke` in the response is an allowlist (`kind`, `base_url`, `model`, `command`)
+and never carries credentials.
+
+* **cheapest** -- pool order, then cheapest live price within the tier:
+  `sail` (0), `codex` (1), `antigravity` (2), `local` Ollama GPU (3), `openrouter` (4, last).
+  Providers outside the pool (akashml, venice, nous, ionet, groq) are never selected.
+* **free-only** -- only seats that are actually free: `:free` / $0 list models, and the local GPU.
+  A subscription seat (Codex, Antigravity) is a paid plan, so it is not free
+  (`seat_policy.free_only_allows_subscription = true` overrides). An unknown price is not free.
+  With no free seat the answer is **UNAVAILABLE** -- there is no paid fallback.
+* **Never selected, under any policy:** Claude (provider, family, or a Claude model id reached
+  through any provider) and Cerebras. Reserved for Dispatch chat and Chloe.
+* **Cross-family:** `exclude_families` removes every seat sharing base weights with the author
+  (a fine-tune shares its base's family; Gemma and Gemini are both `google`). A seat whose family
+  cannot be established is a conflict, not a pass.
+* **Jev** (TypeSafe System One, key = GCP SM `typesafe-api-key`) is the switching layer: given
+  `task`, it picks the cheapest *sufficient* seat among seats that already passed every hard
+  rule. It cannot add a seat or override a rule, applies only at probability >= 0.6, and any
+  failure keeps the deterministic order (`jev.used = false`, with `why`).
+
+Response: `{outcome:"SEAT", policy, seat, provider, family, tier, cost_basis:
+"list/measured|free|local-gpu|subscription", usd_per_mtok, invoke, because, jev, considered[],
+decision_id}`. `considered` lists every seat with `QUALIFIES|EXCLUDED|UNKNOWN` and the reason.
+No seat: HTTP 422 `{type:"seat_unavailable", outcome:"UNAVAILABLE", because, considered[]}`.
+
 ## Legibility
 
 | Method | Path | Returns |

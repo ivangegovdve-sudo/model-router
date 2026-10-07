@@ -1,0 +1,6 @@
+{
+  "order": ["sail", "codex", "antigravity", "local", "openrouter"],
+  "excluded": ["claude", "anthropic", "cerebras"],
+  "roles": ["review", "fix", "rebase", "council", "general"],
+  "policies": ["cheapest", "free-only"]
+}
