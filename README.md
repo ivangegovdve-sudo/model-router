@@ -250,11 +250,18 @@ Build the small Kotlin clients with JDK 17 and Android SDK 36:
 ```sh
 cd app
 ./gradlew :shared:desktopTest :desktopApp:packageUberJarForCurrentOS :androidApp:assembleDebug
-java -jar desktopApp/build/compose/jars/ModelRouter-linux-x64-1.0.0.jar
+java -jar desktopApp/build/compose/jars/ModelRouter-linux-x64-1.1.0.jar
 ```
 
 The JAR filename follows the build platform. Android uses the generated APK; Windows
 packaging remains available through `:desktopApp:packageMsi`.
+
+The verified Windows 1.1.0 installer is in the `modelrouter-msi` artifact of
+[this successful workflow](https://github.com/ivangegovdve-sudo/model-router/actions/runs/38259474822).
+Extract the MSI and run it; it installs for the current user and includes Java.
+Connect the app to your running Model Router service using its URL and bearer token.
+See [verification](docs/VERIFICATION.md) for the installer checksum and
+[seat-plan setup](docs/SEAT_PLANS.md) for exact model identities and PR author references.
 
 Full contract: [`docs/CONTRACT.md`](docs/CONTRACT.md).
 
