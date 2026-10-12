@@ -30,6 +30,7 @@ $result = [ordered]@{
     cleanExit = $false
 }
 $app = $null
+$launcher = $null
 $installer = $null
 $failure = $null
 
@@ -133,6 +134,7 @@ namespace ModelRouterSmoke {
             -WorkingDirectory $installedDirectory -PassThru `
             -RedirectStandardOutput (Join-Path $ReportDirectory 'app-stdout.log') `
             -RedirectStandardError (Join-Path $ReportDirectory 'app-stderr.log')
+        $launcher = $app
     } finally {
         $env:PATH = $savedPath
         foreach ($name in $savedJavaHomes.Keys) { Set-Item -LiteralPath ("Env:\{0}" -f $name) -Value $savedJavaHomes[$name] }
@@ -140,6 +142,13 @@ namespace ModelRouterSmoke {
 
     $startup = [Diagnostics.Stopwatch]::StartNew()
     do {
+        # jpackage relaunches after setting its runtime PATH. The child owns
+        # the GUI and JVM; the first PID owns only a message-only window.
+        if ($app.Id -eq $launcher.Id) {
+            $child = Get-CimInstance Win32_Process -Filter "ParentProcessId = $($launcher.Id)" |
+                Where-Object { $_.ExecutablePath -eq $executable } | Select-Object -First 1
+            if ($child) { $app = Get-Process -Id $child.ProcessId }
+        }
         $app.Refresh()
         if ($app.HasExited) { throw "Installed app exited during startup with code $($app.ExitCode)." }
         if ($app.MainWindowHandle -ne [IntPtr]::Zero) { break }
@@ -147,6 +156,8 @@ namespace ModelRouterSmoke {
     } while ($startup.Elapsed.TotalSeconds -lt 15)
     if ($app.MainWindowHandle -eq [IntPtr]::Zero) { throw 'No GUI window appeared within 15 seconds.' }
     $result.visibleWindow = $true
+    $result.launcherProcessId = $launcher.Id
+    $result.guiProcessId = $app.Id
     $jvm = @($app.Modules | Where-Object { $_.ModuleName -ieq 'jvm.dll' })
     $installedPrefix = $installedDirectory.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
     if ($jvm.Count -ne 1 -or -not $jvm[0].FileName.StartsWith(
@@ -166,6 +177,10 @@ namespace ModelRouterSmoke {
     if (-not $app.CloseMainWindow()) { throw 'Could not request a normal GUI close.' }
     if (-not $app.WaitForExit(10000)) { throw 'The GUI did not exit within ten seconds of a normal close.' }
     if ($app.ExitCode -ne 0) { throw "The GUI closed with exit code $($app.ExitCode)." }
+    if ($launcher.Id -ne $app.Id) {
+        if (-not $launcher.WaitForExit(10000)) { throw 'The jpackage launcher did not finish after its GUI closed.' }
+        if ($launcher.ExitCode -ne 0) { throw "The jpackage launcher closed with exit code $($launcher.ExitCode)." }
+    }
     $result.cleanExit = $true
     $result.status = 'passed'
 } catch {
@@ -173,7 +188,7 @@ namespace ModelRouterSmoke {
     $result.status = 'failed'
     $result.error = $_.Exception.Message
 } finally {
-    foreach ($process in @($app, $installer)) {
+    foreach ($process in @($app, $launcher, $installer)) {
         if ($process) {
             try {
                 if (-not $process.HasExited) { $process.Kill(); $process.WaitForExit(5000) | Out-Null }
