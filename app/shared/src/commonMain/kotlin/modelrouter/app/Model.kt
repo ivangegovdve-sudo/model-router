@@ -2,7 +2,13 @@ package modelrouter.app
 
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerialName
+import kotlinx.serialization.builtins.MapSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonTransformingSerializer
 
 /**
  * Contract v1 (docs/CONTRACT.md). This app is a thin client: every type here mirrors a
@@ -15,6 +21,17 @@ val RouterJson = Json {
     coerceInputValues = true
     explicitNulls = false
     encodeDefaults = true
+}
+
+/** Older servers return a scalar status when the dashboard is not configured. */
+object DashboardStatusSerializer : JsonTransformingSerializer<Map<String, JsonElement>>(
+    MapSerializer(String.serializer(), JsonElement.serializer()),
+) {
+    override fun transformDeserialize(element: JsonElement): JsonElement = when (element) {
+        is JsonObject -> element
+        JsonNull -> JsonObject(emptyMap())
+        else -> JsonObject(mapOf("status" to element))
+    }
 }
 
 // ---- /health --------------------------------------------------------------------------------
@@ -49,7 +66,9 @@ data class Setup(
     val keys: List<KeyInfo> = emptyList(),
     val auth: String = "",
     val dashboard: String = "",
-    @SerialName("dashboard_status") val dashboardStatus: Map<String, String> = emptyMap(),
+    @SerialName("dashboard_status")
+    @Serializable(with = DashboardStatusSerializer::class)
+    val dashboardStatus: Map<String, JsonElement> = emptyMap(),
     val ready: Boolean = false,
 )
 
@@ -77,9 +96,15 @@ data class Candidate(
     val model: String = "",
     @SerialName("provider_state") val providerState: String = "",
     @SerialName("provider_detail") val providerDetail: String = "",
-    val available: Boolean = false,
+    val available: Boolean? = null,
     @SerialName("context_length") val contextLength: Long? = null,
     @SerialName("supports_tools") val supportsTools: Boolean? = null,
+    @SerialName("supports_reasoning") val supportsReasoning: Boolean? = null,
+    @SerialName("reasoning_efforts") val reasoningEfforts: List<String>? = null,
+    @SerialName("supported_parameters") val supportedParameters: List<String>? = null,
+    @SerialName("input_modalities") val inputModalities: List<String>? = null,
+    @SerialName("output_modalities") val outputModalities: List<String>? = null,
+    @SerialName("supports_editing") val supportsEditing: Boolean? = null,
     @SerialName("list_prompt") val listPrompt: Double? = null,
     @SerialName("list_completion") val listCompletion: Double? = null,
     @SerialName("price_source") val priceSource: String = "",
@@ -96,11 +121,25 @@ data class Candidate(
 @Serializable
 data class RosterResponse(
     val providers: List<ProviderState> = emptyList(),
-    val dashboard: Map<String, String> = emptyMap(),
+    @Serializable(with = DashboardStatusSerializer::class)
+    val dashboard: Map<String, JsonElement> = emptyMap(),
     val seats: List<Candidate> = emptyList(),
 )
 
 // ---- Decision / Choice / Assessment / Attempt --------------------------------------------------
+
+/** Explicit routing constraints. Missing capability evidence remains UNKNOWN at the router. */
+@Serializable
+data class RouterRequirements(
+    val providers: List<String> = emptyList(),
+    @SerialName("model_types") val modelTypes: List<String> = emptyList(),
+    @SerialName("required_capabilities") val requiredCapabilities: List<String> = emptyList(),
+    @SerialName("thinking_level") val thinkingLevel: String? = null,
+    val editable: Boolean? = null,
+    @SerialName("tool_calls") val toolCalls: Boolean? = null,
+    @SerialName("min_context_tokens") val minContextTokens: Long? = null,
+    @SerialName("max_usd_per_mtok") val maxUsdPerMtok: Double? = null,
+)
 
 @Serializable
 data class Ask(
@@ -109,6 +148,7 @@ data class Ask(
     @SerialName("needs_tools") val needsTools: Boolean = false,
     @SerialName("ceiling_usd_per_mtok") val ceilingUsdPerMtok: Double? = null,
     val stream: Boolean = false,
+    val lane: String? = null,
 )
 
 @Serializable
@@ -121,6 +161,9 @@ data class Facts(
     @SerialName("roster_size") val rosterSize: Int? = null,
     @SerialName("unknown_not_listed") val unknownNotListed: Int? = null,
     @SerialName("free_tier_not_listed") val freeTierNotListed: Int? = null,
+    val lane: String? = null,
+    @SerialName("request_features") val requestFeatures: Map<String, JsonElement> = emptyMap(),
+    @SerialName("router_requirements") val requirements: RouterRequirements? = null,
 )
 
 @Serializable
@@ -135,6 +178,17 @@ data class Assessment(
 )
 
 @Serializable
+data class Confidence(
+    val level: String = "",
+    val basis: String = "",
+    val evidence: List<String> = emptyList(),
+    @SerialName("unknown_count") val unknownCount: Int? = null,
+    @SerialName("sample_count") val sampleCount: Int? = null,
+    /** Only a backend-supplied calibrated probability belongs here; a level is not a percentage. */
+    val probability: Double? = null,
+)
+
+@Serializable
 data class Choice(
     val outcome: String = "ABSTAIN",
     val because: String = "",
@@ -142,6 +196,7 @@ data class Choice(
     @SerialName("max_tokens") val maxTokens: Int? = null,
     @SerialName("expected_usd") val expectedUsd: Double? = null,
     val unknown: List<String> = emptyList(),
+    val confidence: Confidence? = null,
     val facts: Facts = Facts(),
     val considered: List<Assessment> = emptyList(),
 ) {
@@ -193,7 +248,8 @@ data class Decision(
     @SerialName("earlier_decisions") val earlierDecisions: List<Choice> = emptyList(),
     val attempts: List<Attempt> = emptyList(),
     val providers: List<ProviderState> = emptyList(),
-    val dashboard: Map<String, String> = emptyMap(),
+    @Serializable(with = DashboardStatusSerializer::class)
+    val dashboard: Map<String, JsonElement> = emptyMap(),
     val status: String = "",
     @SerialName("elapsed_s") val elapsedS: Double? = null,
     val result: DecisionResult = DecisionResult(),
@@ -220,7 +276,8 @@ data class DecisionRow(
 data class ExplainResponse(
     val choice: Choice = Choice(),
     val providers: List<ProviderState> = emptyList(),
-    val dashboard: Map<String, String> = emptyMap(),
+    @Serializable(with = DashboardStatusSerializer::class)
+    val dashboard: Map<String, JsonElement> = emptyMap(),
 )
 
 @Serializable
@@ -231,5 +288,6 @@ data class ExplainRequest(
     val model: String = "auto",
     val messages: List<ExplainMessage>,
     @SerialName("max_tokens") val maxTokens: Int? = null,
-    val tools: List<kotlinx.serialization.json.JsonElement>? = null,
+    val tools: List<JsonElement>? = null,
+    @SerialName("router_requirements") val routerRequirements: RouterRequirements? = null,
 )

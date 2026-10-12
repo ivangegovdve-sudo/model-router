@@ -34,10 +34,12 @@ from .config import Config, load
 from decimal import Decimal
 
 from .clientkeys import ClientKeys, Refusal, worst_case
-from .router import LANES, MAX_ATTEMPTS, Router, estimate_tokens, lane_of
+from .router import LANES, MAX_ATTEMPTS, Router, ask_from, estimate_tokens, lane_of
+from .requirements import finite_price
 from .secrets import Keyring
 from .store import Store
 from .responses import (chat_completion_to_response, responses_stream, responses_to_chat)
+from .seats import SeatUnavailable, resolve_seat
 
 log = logging.getLogger("modelrouter.server")
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
@@ -111,13 +113,24 @@ def build(cfg: Config) -> FastAPI:
             raise HTTPException(403, "caller keys can use /v1/chat/completions, /v1/responses, "
                                      "/v1/models and /v1/usage only")
 
+    @app.post("/v1/seats/resolve", dependencies=[Depends(auth)])
+    async def seat_resolve(request: Request):
+        """openDashboard 2.0's advisory seat contract; no inference or charge."""
+        try:
+            raw = await request.json()
+            return await run_in_threadpool(resolve_seat, router, raw)
+        except SeatUnavailable as exc:
+            raise HTTPException(422, exc.detail) from exc
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     def ceiling(h: str | None) -> float | None:
         if not h:
             return None
         try:
-            return float(h)
-        except ValueError:
-            raise HTTPException(400, "X-Router-Max-Usd-Per-M must be a number")
+            return float(finite_price(float(h), "X-Router-Max-Usd-Per-M"))
+        except (ValueError, OverflowError):
+            raise HTTPException(400, "X-Router-Max-Usd-Per-M must be a finite nonnegative number")
 
     def setup() -> dict:
         ks = [k.__dict__ for k in keys.status()]
@@ -186,13 +199,13 @@ def build(cfg: Config) -> FastAPI:
                       x_router_lane: str | None = Header(default=None),
                       x_router_session: str | None = Header(default=None),
                       x_router_answer_tokens: str | None = Header(default=None)):
-        req = await request.json()
         try:
+            req = await request.json()
             lane = lane_of(req, x_router_lane)
+            return await run_in_threadpool(router.explain, req, ceiling(x_router_max_usd_per_m), lane,
+                                           x_router_session, _int_header(x_router_answer_tokens))
         except ValueError as exc:
-            raise HTTPException(400, str(exc))
-        return await run_in_threadpool(router.explain, req, ceiling(x_router_max_usd_per_m), lane,
-                                       x_router_session, _int_header(x_router_answer_tokens))
+            return _error(400, "invalid_request", str(exc))
 
     @app.post("/router/probe", dependencies=[Depends(auth)])
     async def probe(request: Request):
@@ -227,6 +240,16 @@ def build(cfg: Config) -> FastAPI:
                           x_router_lane, x_router_session, x_router_ensemble,
                           x_router_answer_tokens):
         lim = ceiling(x_router_max_usd_per_m)
+        try:
+            lane = lane_of(req, x_router_lane)
+            ask_from(req, lim)
+        except ValueError as exc:
+            return _error(400, "invalid_request", str(exc))
+        answer = _int_header(x_router_answer_tokens)
+        if x_router_ensemble:
+            return _error(501, "not_enabled", "ensemble routing (k cheap models from different "
+                          "families + a verifier) is a reserved hook: the experiment that "
+                          "decides whether it pays has not run")
         client = (user_agent or "")[:80]
         key, held = None, Decimal(0)
         if who[0] == "client":
@@ -245,17 +268,8 @@ def build(cfg: Config) -> FastAPI:
                     MAX_ATTEMPTS, key.max_usd_per_mtok))
             except Refusal as r:
                 return _error(r.status, r.code, r.message)
-        try:
-            lane = lane_of(req, x_router_lane)
-        except ValueError as exc:
-            return _error(400, "invalid_request", str(exc))
-        if x_router_ensemble:
-            return _error(501, "not_enabled", "ensemble routing (k cheap models from different "
-                          "families + a verifier) is a reserved hook: the experiment that "
-                          "decides whether it pays has not run")
         # Conversation identity for prompt-cache warmth: explicit header, else OpenAI `user`.
         session = (x_router_session or str(req.get("user") or "") or None)
-        answer = _int_header(x_router_answer_tokens)
         if req.get("stream"):
             routed, it = await run_in_threadpool(
                 lambda: router.route_stream(req, client=client, ceiling=lim, lane=lane,
@@ -296,7 +310,9 @@ def build(cfg: Config) -> FastAPI:
                           "because": routed.choice.because,
                           "cost_usd": routed.doc["result"]["cost_usd"],
                           "cost_basis": routed.doc["result"]["cost_basis"],
-                          "attempts": len(routed.doc["attempts"])}
+                          "attempts": len(routed.doc["attempts"]),
+                          "confidence": routed.choice.confidence,
+                          "request_features": routed.choice.facts.get("request_features", {})}
         headers = {"X-Router-Decision": routed.decision_id,
                    "X-Router-Seat": routed.choice.seat or ""}
         if key:

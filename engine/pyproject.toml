@@ -10,7 +10,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=2.2,<3"]
+mcp = ["mcp>=1.26,<3"]
+mcp1 = ["mcp>=1.26,<2"]
+mcp2 = ["mcp>=2.2,<3"]
 test = ["pytest>=8"]
 
 [project.scripts]

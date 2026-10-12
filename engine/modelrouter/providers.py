@@ -152,6 +152,12 @@ class Listing:
     windows: dict[str, tuple[Decimal, Decimal, Decimal]] | None = None  # window -> (p, c, cached)
     blocked: str = ""               # the catalogue itself says this key cannot use it
     read_at: float | None = None    # when these prices were read
+    supported_parameters: tuple[str, ...] | None = None
+    input_modalities: tuple[str, ...] | None = None
+    output_modalities: tuple[str, ...] | None = None
+    reasoning_efforts: tuple[str, ...] | None = None
+    supports_editing: bool | None = None
+    family: str | None = None  # explicit provider-declared base-weight family, never id namespace
 
 
 def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
@@ -159,6 +165,8 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
     out: list[Listing] = []
     for m in rows:
         blocked_why = ""
+        params = ins = outs = efforts = None
+        editing = m.get("supports_editing") if isinstance(m.get("supports_editing"), bool) else None
         mid = str(m.get("id") or "")
         if not mid:
             continue
@@ -176,10 +184,15 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
                     _per_m(p.get("input_cache_read"))
                 params = m.get("supported_parameters")
                 tools = None if params is None else ("tools" in params)
-                reasoning = None if params is None else ("reasoning" in params
-                                                         or "include_reasoning" in params)
+                # Controllable reasoning is positive evidence; absent controls do not
+                # establish that a model cannot reason by default.
+                reasoning = m.get("supports_reasoning") if isinstance(m.get("supports_reasoning"), bool) \
+                    else True if isinstance(params, list) and set(params) & {
+                        "reasoning", "include_reasoning", "reasoning_effort"} else None
                 arch = m.get("architecture") or {}
                 outs = arch.get("output_modalities")
+                ins = arch.get("input_modalities")
+                efforts = m.get("reasoning_efforts")
             else:
                 pr, co, ca = _per_m(p.get("input")), _per_m(p.get("output")), \
                     _per_m(p.get("input_cache_read"))
@@ -187,6 +200,8 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
                 tools = None if feats is None else ("tools" in feats)
                 reasoning = None if feats is None else ("reasoning" in feats)
                 outs = m.get("output_modalities")
+                ins = m.get("input_modalities")
+                params = m.get("supported_parameters")
             ctx = m.get("context_length")
             text_out = None if outs is None else ("text" in outs)
         elif shape == "ionet":
@@ -198,6 +213,9 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
             tools = m.get("supports_tools")
             reasoning = m.get("supports_reasoning")
             outs = m.get("output_modalities")
+            ins = m.get("input_modalities")
+            params = m.get("supported_parameters")
+            efforts = m.get("reasoning_efforts")
             text_out = None if outs is None else ("text" in outs)
             if m.get("higher_tier_required") is True:
                 tier = m.get("min_access_tier")
@@ -214,6 +232,11 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
             tools = caps.get("supportsFunctionCalling")
             reasoning = caps.get("supportsReasoning")
             text_out = m.get("type", "text") == "text"
+            if caps.get("supportsVision") is not None:
+                ins = ["text", "image"] if caps["supportsVision"] else ["text"]
+            outs = ["text"] if text_out else None
+            params = m.get("supported_parameters")
+            efforts = m.get("reasoning_efforts")
         else:
             pr = co = ca = None
             ctx = m.get("context_length")
@@ -225,8 +248,15 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
             ctx = int(ctx) if ctx is not None else None
         except (TypeError, ValueError):
             ctx = None
+        def known_strings(value):
+            return tuple(value) if isinstance(value, list) and all(
+                isinstance(v, str) for v in value) else None
         out.append(Listing(provider, mid, pr, co, ca, ctx, tools, reasoning, text_out,
-                           blocked=blocked_why))
+                           blocked=blocked_why, supported_parameters=known_strings(params),
+                           input_modalities=known_strings(ins), output_modalities=known_strings(outs),
+                           reasoning_efforts=known_strings(efforts), supports_editing=editing,
+                           family=(m.get("model_family") or m.get("family"))
+                               if isinstance(m.get("model_family") or m.get("family"), str) else None))
     return out
 
 
@@ -342,13 +372,16 @@ def extract(provider: str, model: str, payload: dict) -> Result:
 def _body(provider: str, model: str, req: dict, max_tokens: int | None,
           window: str | None = None) -> dict:
     body = {k: v for k, v in req.items() if k not in ("model", "max_tokens",
-                                                      "max_completion_tokens")}
+                                                      "max_completion_tokens", "router_requirements")}
     body["model"] = model
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
     if window and PROVIDERS.get(provider, {}).get("windows"):
         # The lane travels with the call: priced at this window, so scheduled in it.
         body["metadata"] = {**(body.get("metadata") or {}), "completion_window": window}
+    if provider in ("openrouter", "nous") and "reasoning_effort" in body:
+        # These providers use OpenRouter's documented reasoning object.
+        body["reasoning"] = {**(body.get("reasoning") or {}), "effort": body.pop("reasoning_effort")}
     if provider == "openrouter":
         body["usage"] = {"include": True}      # ask for the billed cost
     elif provider == "venice" and "venice_parameters" not in body:

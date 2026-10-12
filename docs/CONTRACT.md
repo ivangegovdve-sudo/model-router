@@ -5,6 +5,49 @@ Windows/Android app (which shows why), and the MCP server (which advises). The a
 the MCP server are thin clients of the endpoints below; neither reimplements a decision,
 and neither ever holds a provider key.
 
+## Requirements and confidence
+
+Optional request-body `router_requirements` applies consistently to Chat Completions,
+Responses and `/router/explain`. The engine validates the whole object before any
+inference or caller-budget reservation. Router controls are not forwarded upstream.
+
+| Field | Type / values | Effect when set |
+|---|---|---|
+| `providers` | string array | Allowed provider identifiers. Empty means any. |
+| `model_types` | array: `text`, `reasoning`, `vision` | Match at least one type using explicit modality/reasoning evidence. |
+| `required_capabilities` | array: `tools`, `reasoning`, `structured_output`, `editing` | Require every selected capability. |
+| `thinking_level` | `none`, `low`, `medium`, `high`, or null | Require explicit effort-control support; forward the selected effort. |
+| `editable` | true / false / null | Require / exclude / ignore explicit code/content editing capability. |
+| `tool_calls` | true / false / null | Require / exclude / ignore tool-call capability. False conflicts with supplied tools. |
+| `min_context_tokens` | positive integer or null | Require at least this context capacity, also accounting for the actual request. |
+| `max_usd_per_mtok` | finite nonnegative number or null | Lower the effective per-million price ceiling. Operator policy cannot be raised. |
+
+Unknown evidence needed by an active filter yields an UNKNOWN candidate. Known
+unsupported evidence yields EXCLUDED. Editing means editing code/content; it does
+not assert availability of weights or fine tuning. `vision` filters advertised
+image-input capability; this API still accepts the documented text/function input
+surface only. Disabled UI filters are omitted. Native effort settings are validated
+too; a caller cannot bypass a thinking filter with an unsupported native setting.
+Native `reasoning` accepts only optional `effort`. Other controls such as `enabled`,
+`max_tokens`, `exclude` or `summary` return HTTP 400 consistently across supported
+request paths.
+
+Each `Choice` additionally returns `confidence` with `level`, `basis`, `evidence`,
+`unknown_count`, nullable `sample_count`, and nullable `probability`. Levels describe
+heuristic evidence completeness. `probability` is null because there is no calibrated
+success estimate. Facts contain normalized `router_requirements`, counts of unknown
+candidates, and `request_features`: prompt token estimate/basis, message count,
+role counts, tool count, requested effort and context needed. Decisions retain these
+features without saving prompt text or tool schemas. A roster candidate additionally
+exposes nullable `supported_parameters`, `input_modalities`, `output_modalities`,
+`supports_reasoning`, `reasoning_efforts`, `supports_editing`, `observation_count`,
+and explicit `family` evidence. Empty `reasoning_efforts` establishes reasoning
+support with unnamed levels; null means unknown.
+
+`POST /v1/seats/resolve` is an operator-authenticated, no-inference advisory route for
+openDashboard 2.0. Its consumer policies, tier and family constraints, invocation
+shape and strict free-only refusal are described in [dashboard integration](OPENDASHBOARD.md).
+
 Base URL: wherever the operator runs `modelrouter serve` (default `http://127.0.0.1:7480`).
 Auth: `Authorization: Bearer <router token>` on every route except `/health`. The token's
 value lives in the operator's secret store; with `no_auth = true` (loopback only) no header
