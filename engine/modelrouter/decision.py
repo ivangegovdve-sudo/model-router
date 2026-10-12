@@ -152,6 +152,8 @@ class Candidate:
     reasoning_efforts: tuple[str, ...] | None = None
     observation_count: int | None = None
     family: str | None = None                    # explicit base-weight family; never a name guess
+    weights_id: str | None = None                # exact weights, shared by declared aliases
+    identity_evidence_id: str | None = None       # evidence establishing that exact identity
 
 
 @dataclass(frozen=True)

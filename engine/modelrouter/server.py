@@ -23,6 +23,7 @@ import logging
 import secrets as pysecrets
 import shutil
 from pathlib import Path
+from urllib.parse import quote
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -40,6 +41,7 @@ from .secrets import Keyring
 from .store import Store
 from .responses import (chat_completion_to_response, responses_stream, responses_to_chat)
 from .seats import SeatUnavailable, resolve_seat
+from .seat_plans import SeatPlanError, SeatPlanManager
 
 log = logging.getLogger("modelrouter.server")
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
@@ -71,6 +73,8 @@ def build(cfg: Config) -> FastAPI:
                          cfg.gcp_project)
     app = FastAPI(title="modelrouter", version=__version__)
     app.state.router = router
+    plans = SeatPlanManager(router)
+    app.state.seat_plans = plans
     client_keys = ClientKeys(cfg.state_dir / "modelrouter.sqlite3")
     app.state.client_keys = client_keys
 
@@ -121,6 +125,44 @@ def build(cfg: Config) -> FastAPI:
             return await run_in_threadpool(resolve_seat, router, raw)
         except SeatUnavailable as exc:
             raise HTTPException(422, exc.detail) from exc
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    async def plan_body(request: Request) -> dict:
+        try:
+            raw = await request.json()
+        except ValueError as exc:
+            raise HTTPException(400, "body is not JSON") from exc
+        if not isinstance(raw, dict):
+            raise HTTPException(400, "body must be a JSON object")
+        return raw
+
+    @app.get("/v1/seat-plans/templates", dependencies=[Depends(auth)])
+    def plan_templates():
+        return plans.templates()
+
+    @app.post("/v1/seat-plans/resolve", dependencies=[Depends(auth)])
+    async def plan_resolve(request: Request):
+        try:
+            return await plans.resolve(await plan_body(request), "admin")
+        except SeatPlanError as exc:
+            raise HTTPException(exc.status_code, exc.detail) from exc
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/v1/seat-plans/{plan_id}", dependencies=[Depends(auth)])
+    def plan_get(plan_id: str):
+        try:
+            return plans.get(plan_id, "admin")
+        except SeatPlanError as exc:
+            raise HTTPException(exc.status_code, exc.detail) from exc
+
+    @app.post("/v1/seat-plans/{plan_id}/reselect", dependencies=[Depends(auth)])
+    async def plan_reselect(plan_id: str, request: Request):
+        try:
+            return await plans.reselect(plan_id, await plan_body(request), "admin")
+        except SeatPlanError as exc:
+            raise HTTPException(exc.status_code, exc.detail) from exc
         except (ValueError, TypeError) as exc:
             raise HTTPException(400, str(exc)) from exc
 
@@ -238,7 +280,7 @@ def build(cfg: Config) -> FastAPI:
 
     async def _route_chat(req: dict, who, user_agent, x_router_max_usd_per_m,
                           x_router_lane, x_router_session, x_router_ensemble,
-                          x_router_answer_tokens):
+                          x_router_answer_tokens, expected_weights_id=None):
         lim = ceiling(x_router_max_usd_per_m)
         try:
             lane = lane_of(req, x_router_lane)
@@ -273,7 +315,8 @@ def build(cfg: Config) -> FastAPI:
         if req.get("stream"):
             routed, it = await run_in_threadpool(
                 lambda: router.route_stream(req, client=client, ceiling=lim, lane=lane,
-                                            session=session, answer_tokens=answer))
+                                            session=session, answer_tokens=answer,
+                                            expected_weights_id=expected_weights_id))
             if it is None:
                 if key:
                     client_keys.release(key, held)
@@ -288,7 +331,8 @@ def build(cfg: Config) -> FastAPI:
             return response
         routed = await run_in_threadpool(lambda: router.route(req, client=client, ceiling=lim,
                                                                  lane=lane, session=session,
-                                                                 answer_tokens=answer))
+                                                                 answer_tokens=answer,
+                                                                 expected_weights_id=expected_weights_id))
         charged = None
         if key:
             if not routed.doc["attempts"]:
@@ -300,11 +344,13 @@ def build(cfg: Config) -> FastAPI:
             return _abstain(routed)
         res = routed.result
         if routed.status != "ANSWERED" or res is None or res.body is None:
-            return _error(502, "routed_call_failed",
+            response = _error(502, "routed_call_failed",
                           "every routed attempt failed or returned no content: " +
                           "; ".join("%s -> %s" % (a["seat"], a["detail"])
                                     for a in routed.doc["attempts"]),
                           decision_id=routed.decision_id)
+            response.routed = routed
+            return response
         body = dict(res.body)
         body["router"] = {"decision_id": routed.decision_id, "seat": routed.choice.seat,
                           "because": routed.choice.because,
@@ -321,7 +367,75 @@ def build(cfg: Config) -> FastAPI:
             body["router"]["key_remaining_usd"] = str(left.remaining)
             headers["X-Router-Key-Charged"] = str(charged)
             headers["X-Router-Key-Remaining"] = str(left.remaining)
-        return JSONResponse(body, headers=headers)
+        response = JSONResponse(body, headers=headers)
+        response.routed = routed
+        return response
+
+    @app.post("/v1/seat-plans/{plan_id}/slots/{slot_id:path}/chat/completions",
+              dependencies=[Depends(auth)])
+    async def plan_chat(plan_id: str, slot_id: str, request: Request):
+        try:
+            envelope = await plan_body(request)
+            incoming = envelope.get("request")
+            if not isinstance(incoming, dict) or not isinstance(incoming.get("messages"), list) or not incoming["messages"]:
+                raise HTTPException(400, "request.messages must be a nonempty list")
+            req, assignment = await plans.prepare_invoke(plan_id, slot_id, envelope, "admin")
+        except SeatPlanError as exc:
+            raise HTTPException(exc.status_code, exc.detail) from exc
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        version = envelope["version"]
+        receipt = {"plan_id": plan_id, "version": version, "slot_id": slot_id,
+                   "seat": assignment["seat"], "weights_id": assignment["weights_id"],
+                   "identity_evidence_id": assignment.get("identity_evidence_id"),
+                   "execution_id": assignment["execution_id"],
+                   "context": envelope.get("context", {})}
+
+        def finish(routed=None, status="FAILED"):
+            safe = dict(receipt)
+            if routed is not None:
+                safe.update({"decision_id": routed.decision_id,
+                             "executed_seat": routed.choice.seat,
+                             **routed.doc.get("result", {})})
+                status = "ANSWERED" if routed.doc.get("status") == "ANSWERED" else "FAILED"
+            plans.record_execution(plan_id, slot_id, "admin", version=version,
+                                   status=status, decision_id=safe.get("decision_id"), receipt=safe)
+
+        try:
+            lim = assignment.get("effective_ceiling")
+            response = await _route_chat(
+                req, ("admin", None), "seat-plan:" + plan_id,
+                str(lim) if lim is not None else None, assignment.get("lane", "background"),
+                None, None, None, expected_weights_id=assignment["weights_id"])
+        except BaseException:
+            await run_in_threadpool(finish)
+            raise
+        routed = getattr(response, "routed", None)
+        plan_headers = {"X-Router-Plan": plan_id, "X-Router-Plan-Version": str(version),
+                        "X-Router-Execution": assignment["execution_id"],
+                        "X-Router-Slot": quote(slot_id, safe="-._~:/@"),
+                        "X-Router-Weights": quote(assignment["weights_id"] or "", safe="-._~:/@")}
+        if isinstance(response, StreamingResponse):
+            async def observed_stream():
+                try:
+                    async for chunk in response.body_iterator:
+                        yield chunk
+                finally:
+                    await run_in_threadpool(finish, routed)
+            headers = {key: value for key, value in response.headers.items()
+                       if key.lower() != "content-length"}
+            return StreamingResponse(observed_stream(), media_type="text/event-stream",
+                                     headers={**headers, **plan_headers})
+        await run_in_threadpool(finish, routed)
+        response.headers.update(plan_headers)
+        if response.status_code == 200:
+            body = json.loads(response.body)
+            receipt["executed_seat"] = routed.choice.seat if routed else None
+            body.setdefault("router", {})["seat_plan"] = receipt
+            headers = {key: value for key, value in response.headers.items()
+                       if key.lower() != "content-length"}
+            return JSONResponse(body, headers=headers)
+        return response
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request, who=Depends(principal),
@@ -409,10 +523,13 @@ def build(cfg: Config) -> FastAPI:
                        "every eligible model's provider is at its measured concurrency cap: "
                        + ch.because, decision_id=routed.decision_id)
             r.headers["Retry-After"] = "1"
+            r.routed = routed
             return r
-        return _error(422, "router_abstained",
+        response = _error(422, "router_abstained",
                       "no model can serve this request honestly: " + ch.because,
                       decision_id=routed.decision_id, unknown=list(ch.unknown))
+        response.routed = routed
+        return response
 
     return app
 

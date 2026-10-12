@@ -44,13 +44,19 @@ import modelrouter.app.RouterApi
 import modelrouter.app.RouterSettings
 import modelrouter.app.SettingsStore
 import modelrouter.app.ExplainForm
+import modelrouter.app.GoalTemplates
+import modelrouter.app.applyGoalDefaults
+import modelrouter.app.SeatPlanDraft
+import modelrouter.app.SeatPlanTemplates
+import modelrouter.app.SeatPlanResponse
+import modelrouter.app.SeatPlanTemplate
 
-enum class Screen { Decisions, Roster, Explain, Setup }
+enum class Screen { Decisions, Roster, Explain, SeatPlan, Setup }
 
 /** Screen state and every server call. Holds no token beyond [settings]. */
 class AppController(private val store: SettingsStore?, private val scope: CoroutineScope) {
     var settings by mutableStateOf(store?.load() ?: RouterSettings())
-    var screen by mutableStateOf(Screen.Decisions)
+    var screen by mutableStateOf(Screen.Explain)
     val storageNote: String get() = store?.storageNote ?: "No settings store"
 
     var decisions by mutableStateOf<List<DecisionRow>>(emptyList())
@@ -92,6 +98,23 @@ class AppController(private val store: SettingsStore?, private val scope: Corout
     var explainRoster by mutableStateOf<modelrouter.app.RosterResponse?>(null)
     var explainRosterError by mutableStateOf<String?>(null)
     var explainRosterLoading by mutableStateOf(false)
+    var selectedGoal by mutableStateOf("code-review")
+    var goalEdited by mutableStateOf<Set<String>>(emptySet())
+    var connection by mutableStateOf<modelrouter.app.Health?>(null)
+    var connectionError by mutableStateOf<String?>(null)
+
+    var planDraft by mutableStateOf(SeatPlanDraft())
+    var planTemplates by mutableStateOf<SeatPlanTemplates?>(null)
+    var planTemplatesError by mutableStateOf<String?>(null)
+    var planTemplatesLoading by mutableStateOf(false)
+    var planResult by mutableStateOf<SeatPlanResponse?>(null)
+    var planError by mutableStateOf<String?>(null)
+    var planLoading by mutableStateOf(false)
+    var planSubmittedRequest by mutableStateOf<modelrouter.app.SeatPlanRequest?>(null)
+    var explainRevision by mutableStateOf(0)
+    var explainResultRevision by mutableStateOf<Int?>(null)
+
+    init { setExplainForm(applyGoalDefaults(explainForm(), GoalTemplates.first())) }
 
     private fun api() = RouterApi(settings)
     private fun describe(t: Throwable): String = (t.message ?: t::class.simpleName ?: "error").take(400)
@@ -103,6 +126,7 @@ class AppController(private val store: SettingsStore?, private val scope: Corout
         explainResult = null; selectedDecision = null; selectedId = null
         decisionsError = null; rosterError = null; setupError = null; explainRosterError = null
         explainSeat = null; explainProviders = emptyList()
+        connection = null; connectionError = null; planTemplates = null; planTemplatesError = null; planResult = null
     }
 
     suspend fun testConnection(s: RouterSettings): String {
@@ -156,6 +180,34 @@ class AppController(private val store: SettingsStore?, private val scope: Corout
         finally { api.close(); explainRosterLoading = false }
     }
 
+    fun loadConnection() = scope.launch {
+        connectionError = null
+        val api = api()
+        try { connection = api.health() } catch (t: Throwable) { connection = null; connectionError = describe(t) }
+        finally { api.close() }
+    }
+
+    fun loadPlanTemplates() = scope.launch {
+        planTemplatesLoading = true; planTemplatesError = null
+        val api = api()
+        try { planTemplates = api.planTemplates() } catch (t: Throwable) { planTemplatesError = describe(t) }
+        finally { api.close(); planTemplatesLoading = false }
+    }
+
+    fun choosePlanTemplate(template: SeatPlanTemplate) { planDraft = planDraft.applyTemplate(template) }
+
+    fun resolvePlan() = scope.launch {
+        planLoading = true; planError = null; planResult = null
+        val api = api()
+        try {
+            val request = planDraft.request()
+            planSubmittedRequest = request
+            planResult = api.resolvePlan(request)
+        }
+        catch (t: Throwable) { planError = describe(t) }
+        finally { api.close(); planLoading = false }
+    }
+
     fun explainForm() = ExplainForm(
         prompt = explainPrompt, seat = explainSeat, lane = explainLane,
         maxTokens = explainMaxTokens, includeTool = explainNeedsTools,
@@ -165,6 +217,29 @@ class AppController(private val store: SettingsStore?, private val scope: Corout
         toolCalls = explainToolCalls, minContextTokens = explainMinContext,
         maxUsdPerMtok = explainMaxPrice,
     )
+
+    fun setExplainForm(form: ExplainForm, editedField: String? = null) {
+        if (form != explainForm()) explainRevision++
+        explainPrompt = form.prompt; explainSeat = form.seat; explainLane = form.lane
+        explainMaxTokens = form.maxTokens; explainNeedsTools = form.includeTool
+        explainFiltersEnabled = form.filtersEnabled; explainProviders = form.providers
+        explainModelTypes = form.modelTypes; explainCapabilities = form.capabilities
+        explainThinkingLevel = form.thinkingLevel; explainEditable = form.editable
+        explainToolCalls = form.toolCalls; explainMinContext = form.minContextTokens
+        explainMaxPrice = form.maxUsdPerMtok
+        editedField?.let { goalEdited = goalEdited + it }
+    }
+
+    fun chooseGoal(id: String) {
+        GoalTemplates.firstOrNull { it.id == id }?.let { setExplainForm(applyGoalDefaults(explainForm(), it, goalEdited)); selectedGoal = id }
+    }
+
+    fun resetGoalFilters() {
+        val goal = GoalTemplates.first { it.id == selectedGoal }
+        val current = explainForm()
+        setExplainForm(goal.defaults.copy(prompt = current.prompt, seat = current.seat, includeTool = current.includeTool))
+        goalEdited = goalEdited.intersect(setOf("prompt", "seat", "includeTool"))
+    }
 
     // Kept for the desktop screenshot tour; UI uses the complete form below.
     fun runExplain(prompt: String, maxTokens: Int?, needsTools: Boolean) {
@@ -177,7 +252,9 @@ class AppController(private val store: SettingsStore?, private val scope: Corout
         val api = api()
         try {
             val form = explainForm()
+            val revision = explainRevision
             explainResult = api.explain(form.request(), lane = form.lane)
+            explainResultRevision = revision
         } catch (t: Throwable) { explainError = describe(t) } finally { api.close(); explainLoading = false }
     }
 }
@@ -188,6 +265,7 @@ fun ModelRouterApp(store: SettingsStore?, dark: Boolean, onController: (AppContr
         val scope = rememberCoroutineScope()
         val ctl = remember { AppController(store, scope) }
         LaunchedEffect(Unit) { onController(ctl) }
+        LaunchedEffect(ctl.settings) { ctl.loadConnection() }
         val c = Ink.colors
         Column(Modifier.fillMaxSize().background(c.bg)) {
             TopBar(ctl)
@@ -197,6 +275,7 @@ fun ModelRouterApp(store: SettingsStore?, dark: Boolean, onController: (AppContr
                     Screen.Decisions -> DecisionsScreen(ctl)
                     Screen.Roster -> RosterScreen(ctl)
                     Screen.Explain -> ExplainScreen(ctl)
+                    Screen.SeatPlan -> SeatPlanScreen(ctl)
                     Screen.Setup -> SetupScreen(ctl)
                 }
             }
@@ -211,14 +290,16 @@ private fun TopBar(ctl: AppController) {
         Modifier.fillMaxWidth().background(c.surface).padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        T("modelrouter", Ink.type.heading, c.fg, maxLines = 1)
-        HGap(18.dp)
-        Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            RouterButton("Decisions", { ctl.screen = Screen.Decisions; if (ctl.decisions.isEmpty()) ctl.loadDecisions() }, selected = ctl.screen == Screen.Decisions)
-            RouterButton("Roster", { ctl.screen = Screen.Roster; if (ctl.roster == null) ctl.loadRoster() }, selected = ctl.screen == Screen.Roster)
-            RouterButton("Explain", { ctl.screen = Screen.Explain }, selected = ctl.screen == Screen.Explain)
-            RouterButton("Setup", { ctl.screen = Screen.Setup; if (ctl.setup == null) ctl.loadSetup() }, selected = ctl.screen == Screen.Setup)
+        T("ModelRouter", Ink.type.heading, c.fg, maxLines = 1)
+        HGap(28.dp)
+        Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally)) {
+            RouterButton("Route", { ctl.screen = Screen.Explain }, selected = ctl.screen == Screen.Explain || ctl.screen == Screen.SeatPlan)
+            RouterButton("History", { ctl.screen = Screen.Decisions; if (ctl.decisions.isEmpty()) ctl.loadDecisions() }, selected = ctl.screen == Screen.Decisions)
+            RouterButton("Models", { ctl.screen = Screen.Roster; if (ctl.roster == null) ctl.loadRoster() }, selected = ctl.screen == Screen.Roster)
+            RouterButton("Connection", { ctl.screen = Screen.Setup; if (ctl.setup == null) ctl.loadSetup() }, selected = ctl.screen == Screen.Setup)
         }
+        HGap(10.dp)
+        StatusChip(if (ctl.connection != null) "Router connected" else if (ctl.connectionError != null) "Disconnected" else "Connecting…", if (ctl.connection != null) ChipKind.Positive else ChipKind.Neutral)
     }
 }
 

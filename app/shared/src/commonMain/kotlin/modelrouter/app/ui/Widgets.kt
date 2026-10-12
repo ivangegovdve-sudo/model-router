@@ -3,6 +3,7 @@ package modelrouter.app.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
@@ -102,25 +103,26 @@ fun RouterButton(
     val hovered by src.collectIsHoveredAsState()
     val focused by src.collectIsFocusedAsState()
     val bg = when {
-        primary && enabled -> c.fg
-        selected -> c.surfaceSunk
+        primary && enabled -> c.accent
+        selected -> c.accentBg
         hovered && enabled -> c.surfaceSunk
         else -> c.surface
     }
     val fg = when {
         !enabled -> c.fgFaint
-        primary -> c.bg
+        primary -> c.onAccent
+        selected -> c.accent
         else -> c.fg
     }
     Box(
         modifier
             .background(bg, Shapes.corner)
             // Keyboard focus must be visible (WCAG 2.4.7): a 2dp outline, never colour alone.
-            .border(if (focused) 2.dp else 1.dp, if (focused || selected || primary) c.fg else c.ruleStrong, Shapes.corner)
+            .border(if (focused) 2.dp else 1.dp, if (focused || selected || primary) c.accent else c.ruleStrong, Shapes.corner)
             .hoverable(src)
             .clickable(enabled = enabled, interactionSource = src, indication = null, role = Role.Button, onClick = onClick)
             .defaultMinSize(minHeight = TouchMin)
-            .padding(horizontal = 12.dp, vertical = 7.dp),
+            .padding(horizontal = 12.dp, vertical = 9.dp),
         contentAlignment = Alignment.Center,
     ) { T(label, Ink.type.bodyStrong, fg, maxLines = 1) }
 }
@@ -184,12 +186,12 @@ fun RouterToggle(label: String, checked: Boolean, modifier: Modifier = Modifier,
     val c = Ink.colors
     Box(
         modifier
-            .background(if (checked) c.fg else c.surface, Shapes.corner)
-            .border(1.dp, if (checked) c.fg else c.ruleStrong, Shapes.corner)
-            .clickable(role = Role.Checkbox) { onCheckedChange(!checked) }
+            .background(if (checked) c.accent else c.surface, Shapes.corner)
+            .border(1.dp, if (checked) c.accent else c.ruleStrong, Shapes.corner)
+            .toggleable(value = checked, role = Role.Checkbox, onValueChange = onCheckedChange)
             .defaultMinSize(minHeight = TouchMin)
-            .padding(horizontal = 12.dp, vertical = 7.dp),
-    ) { T(label, Ink.type.bodyStrong, if (checked) c.bg else c.fg, maxLines = 1) }
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+    ) { T(label, Ink.type.bodyStrong, if (checked) c.onAccent else c.fg, maxLines = 1) }
 }
 
 /** Verdict / outcome chip: square corners, text-forward, colour used sparingly and with intent. */
@@ -197,8 +199,9 @@ fun RouterToggle(label: String, checked: Boolean, modifier: Modifier = Modifier,
 fun StatusChip(text: String, kind: ChipKind, modifier: Modifier = Modifier) {
     val c = Ink.colors
     val (fg, border, bg) = when (kind) {
-        ChipKind.Positive -> Triple(c.accent, c.accent, Color.Transparent)
-        ChipKind.Warning -> Triple(c.amberText, c.amber, Color.Transparent)
+        ChipKind.Positive -> Triple(c.success, c.success.copy(alpha = .25f), c.successBg)
+        ChipKind.Selected -> Triple(c.accent, c.accent.copy(alpha = .25f), c.accentBg)
+        ChipKind.Warning -> Triple(c.amberText, c.amber.copy(alpha = .3f), c.warningBg)
         ChipKind.Neutral -> Triple(c.fgMuted, c.ruleStrong, Color.Transparent)
         ChipKind.Excluded -> Triple(c.excluded, c.rule, Color.Transparent)
     }
@@ -208,4 +211,4 @@ fun StatusChip(text: String, kind: ChipKind, modifier: Modifier = Modifier) {
     ) { T(text, Ink.type.smallStrong, fg, maxLines = 1) }
 }
 
-enum class ChipKind { Positive, Warning, Neutral, Excluded }
+enum class ChipKind { Selected, Positive, Warning, Neutral, Excluded }

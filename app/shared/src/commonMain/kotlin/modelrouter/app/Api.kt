@@ -108,5 +108,18 @@ class RouterApi(private val settings: RouterSettings) {
         return RouterJson.decodeFromString(ExplainResponse.serializer(), resp.textOrThrow())
     }
 
+    suspend fun planTemplates(): SeatPlanTemplates = RouterJson.decodeFromString(
+        SeatPlanTemplates.serializer(), client.get("$base/v1/seat-plans/templates") { auth() }.textOrThrow(),
+    )
+
+    suspend fun resolvePlan(request: SeatPlanRequest): SeatPlanResponse {
+        val response = client.post("$base/v1/seat-plans/resolve") {
+            auth()
+            contentType(ContentType.Application.Json)
+            setBody(RouterJson.encodeToString(SeatPlanRequest.serializer(), request))
+        }
+        return RouterJson.decodeFromString(SeatPlanResponse.serializer(), response.textOrThrow())
+    }
+
     fun close() = client.close()
 }

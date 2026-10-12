@@ -6,6 +6,7 @@ on:
       - "app/**"
       - "docs/fixtures/**"
       - ".github/workflows/app.yml"
+      - "tools/verify_windows_install.ps1"
   workflow_dispatch:
 
 concurrency:
@@ -71,3 +72,20 @@ jobs:
           name: modelrouter-msi
           path: app/desktopApp/build/compose/binaries/main/msi/*.msi
           if-no-files-found: error
+      - name: Verify installed Windows app without system Java
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $msi = @(Get-ChildItem desktopApp/build/compose/binaries/main/msi/*.msi)
+          if ($msi.Count -ne 1) { throw "Expected one MSI; found $($msi.Count)." }
+          & ../tools/verify_windows_install.ps1 `
+            -MsiPath $msi[0].FullName `
+            -InstallDirectory (Join-Path $env:RUNNER_TEMP 'modelrouter-installed') `
+            -ReportDirectory (Join-Path $env:RUNNER_TEMP 'modelrouter-windows-smoke')
+      - name: Upload Windows install and launch report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: modelrouter-windows-smoke
+          path: ${{ runner.temp }}/modelrouter-windows-smoke/
+          if-no-files-found: ignore

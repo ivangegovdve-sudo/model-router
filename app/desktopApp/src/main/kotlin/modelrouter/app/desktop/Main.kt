@@ -10,6 +10,9 @@ import modelrouter.app.DesktopSettingsStore
 import modelrouter.app.ui.AppController
 import modelrouter.app.ui.ModelRouterApp
 import modelrouter.app.ui.Screen
+import modelrouter.app.SeatPlanDraft
+import modelrouter.app.SeatPlanRequest
+import modelrouter.app.RouterJson
 import java.awt.Rectangle
 import java.awt.Robot
 import java.io.File
@@ -32,6 +35,7 @@ fun main(args: Array<String>) {
     val size = arg("--size")?.split('x')?.mapNotNull { it.toIntOrNull() }?.takeIf { it.size == 2 } ?: listOf(1500, 950)
     val shot = arg("--shot")
     val explainPrompt = arg("--explain-prompt") ?: "What is the capital of France?"
+    val planRequestFile = arg("--plan-request")
     data class TourStep(val sec: Long, val screen: Screen, val selectFirstDecision: Boolean, val path: String)
     val tour = arg("--tour")?.split(';')?.mapNotNull { entry ->
         val (secScreen, path) = entry.split(':', limit = 2).takeIf { it.size == 2 } ?: return@mapNotNull null
@@ -42,6 +46,7 @@ fun main(args: Array<String>) {
             "decisions", "decision" -> Screen.Decisions
             "roster" -> Screen.Roster
             "explain" -> Screen.Explain
+            "seat-plan", "seatplan" -> Screen.SeatPlan
             "setup" -> Screen.Setup
             else -> return@mapNotNull null
         }
@@ -51,7 +56,7 @@ fun main(args: Array<String>) {
     application {
         val state = rememberWindowState(size = DpSize(size[0].dp, size[1].dp))
         Window(onCloseRequest = ::exitApplication, title = "ModelRouter", state = state) {
-            val dark = when (theme) { "dark" -> true; "light" -> false; else -> isSystemInDarkTheme() }
+            val dark = when (theme) { "dark" -> true; "light" -> false; else -> false }
             val controllerRef = androidx.compose.runtime.remember { arrayOfNulls<AppController>(1) }
             ModelRouterApp(store, dark = dark, onController = { controllerRef[0] = it })
             if (tour.isNotEmpty()) {
@@ -68,6 +73,11 @@ fun main(args: Array<String>) {
                             ctl.explainPrompt = explainPrompt
                             ctl.explainMaxTokens = "512" // show the budget actually sent, so the capture is honest
                             ctl.runExplain(explainPrompt, 512, false)
+                        }
+                        if (step.screen == Screen.SeatPlan && ctl != null && ctl.planResult == null && !ctl.planLoading && planRequestFile != null) {
+                            ctl.loadPlanTemplates().join()
+                            ctl.planDraft = SeatPlanDraft.fromRequest(RouterJson.decodeFromString(SeatPlanRequest.serializer(), File(planRequestFile).readText()))
+                            ctl.resolvePlan().join()
                         }
                         kotlinx.coroutines.delay(2500) // let data load and recompose settle
                         if (step.selectFirstDecision && ctl != null) {

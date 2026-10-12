@@ -48,6 +48,31 @@ support with unnamed levels; null means unknown.
 openDashboard 2.0. Its consumer policies, tier and family constraints, invocation
 shape and strict free-only refusal are described in [dashboard integration](OPENDASHBOARD.md).
 
+Multi-seat Council and Glass integrations use [seat-plan/1](SEAT_PLANS.md). The router
+resolves the entire requested constraint graph against a frozen roster, then pins
+each invocation to its assigned model. Exact `weights_id` and identity evidence are
+separate from broad `family`; aliases and quantizations can share a weight identity.
+Missing identities or head-bound author provenance cannot certify independence.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/seat-plans/templates` | Council and Glass defaults with explicit slots and groups. |
+| POST | `/v1/seat-plans/resolve` | Complete advisory assignment; no inference. |
+| GET | `/v1/seat-plans/{id}` | Durable assignments, version, participation and receipts. |
+| POST | `/v1/seat-plans/{id}/reselect` | Reassign pending seats while retaining participating identities. |
+| POST | `/v1/seat-plans/{id}/slots/{slot}/chat/completions` | Execute the pinned slot with `{version,context,request}`. |
+
+These routes require the operator token; capped caller keys do not gain access to
+uncapped plan execution. Resolution returns `RESOLVED`, `UNKNOWN`, `UNSATISFIABLE`
+or `SEARCH_LIMIT`, with no partial assignment on failure. Invocation rejects stale
+versions/PR heads, changed weight identities and attempts to weaken the plan's
+requirements. Buffered responses include `router.seat_plan`; streams carry
+`X-Router-Plan`, `X-Router-Plan-Version`, `X-Router-Slot` and `X-Router-Weights`.
+`X-Router-Execution` identifies the individual invocation. Slot and weight header
+values use URI percent encoding; decode them before comparing to the JSON IDs.
+Receipts establish the configured model used by the router invocation; they are not
+cryptographic attestations of a provider's physical checkpoint.
+
 Base URL: wherever the operator runs `modelrouter serve` (default `http://127.0.0.1:7480`).
 Auth: `Authorization: Bearer <router token>` on every route except `/health`. The token's
 value lives in the operator's secret store; with `no_auth = true` (loopback only) no header

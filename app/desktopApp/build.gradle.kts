@@ -21,8 +21,8 @@ compose.desktop {
         nativeDistributions {
             targetFormats(TargetFormat.Msi)
             packageName = "ModelRouter"
-            packageVersion = "1.0.0"
-            description = "modelrouter decision viewer"
+            packageVersion = "1.1.0"
+            description = "ModelRouter model and seat plan composer"
             vendor = "Ivan Gegov"
             modules("java.naming", "jdk.crypto.ec", "jdk.unsupported")
             windows {
