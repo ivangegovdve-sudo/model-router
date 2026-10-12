@@ -147,7 +147,12 @@ namespace ModelRouterSmoke {
         if ($app.Id -eq $launcher.Id) {
             $child = Get-CimInstance Win32_Process -Filter "ParentProcessId = $($launcher.Id)" |
                 Where-Object { $_.ExecutablePath -eq $executable } | Select-Object -First 1
-            if ($child) { $app = Get-Process -Id $child.ProcessId }
+            if ($child) {
+                $app = Get-Process -Id $child.ProcessId
+                # Retain its native handle before exit so an attached Process
+                # can still retrieve the exit code after Windows removes the PID.
+                $null = $app.Handle
+            }
         }
         $app.Refresh()
         if ($app.HasExited) { throw "Installed app exited during startup with code $($app.ExitCode)." }
@@ -176,9 +181,11 @@ namespace ModelRouterSmoke {
     if (-not $app.Responding) { throw 'The installed GUI is not responding.' }
     if (-not $app.CloseMainWindow()) { throw 'Could not request a normal GUI close.' }
     if (-not $app.WaitForExit(10000)) { throw 'The GUI did not exit within ten seconds of a normal close.' }
+    $result.guiExitCode = $app.ExitCode
     if ($app.ExitCode -ne 0) { throw "The GUI closed with exit code $($app.ExitCode)." }
     if ($launcher.Id -ne $app.Id) {
         if (-not $launcher.WaitForExit(10000)) { throw 'The jpackage launcher did not finish after its GUI closed.' }
+        $result.launcherExitCode = $launcher.ExitCode
         if ($launcher.ExitCode -ne 0) { throw "The jpackage launcher closed with exit code $($launcher.ExitCode)." }
     }
     $result.cleanExit = $true
