@@ -384,6 +384,10 @@ class Gatherer:
                             time.time() < st.free_quota_until:
                         state, detail = "QUOTA_EXHAUSTED", "free-model daily quota"
                     prof = profiles.get(seat)
+                    identity = self.cfg.seat_model_identities.get(seat)
+                    weights_id, identity_evidence_id = (identity["weights_id"],
+                        identity["identity_evidence_id"]) if identity else P.catalogue_identity(
+                            {"weights_id": li.weights_id, "identity_evidence_id": li.identity_evidence_id})
                     out.append(Candidate(
                         seat=seat, provider=provider, model=li.model,
                         provider_state=state, provider_detail=detail, available=available,
@@ -401,7 +405,8 @@ class Gatherer:
                         reasoning_efforts=li.reasoning_efforts if li.reasoning_efforts is not None
                             else evidence["reasoning_efforts"],
                         supports_editing=li.supports_editing,
-                        family=li.family,
+                        family=identity.get("family", li.family) if identity else li.family,
+                        weights_id=weights_id, identity_evidence_id=identity_evidence_id,
                         observation_count=prof.observations if prof else None,
                         list_prompt=pr, list_completion=co, list_cached=ca, price_age_s=age,
                         price_source=src, in_flight=st.in_flight,
@@ -539,8 +544,7 @@ class Gatherer:
             if li.model == model:
                 card = (self._win.get(provider, (0, {}))[1].get(model) or {}).get(window or "asap")
                 if card:
-                    return P.Listing(provider, model, card[0], card[1], card[2],
-                                     li.context_length, li.supports_tools, li.reasoning)
+                    return replace(li, prompt=card[0], completion=card[1], cached_prompt=card[2])
                 return li
         return None
 

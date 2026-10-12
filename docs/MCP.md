@@ -98,6 +98,17 @@ stdio or a local HTTP connection for this server.
 | `recent_decisions` | Read recent call outcomes and costs. |
 | `get_decision` | Read one call's decision evidence and attempts. |
 | `router_setup` | Read provider readiness and configuration problems. |
+| `seat_plan_templates` | Read Council and Glass role/group templates. |
+| `resolve_seat_plan` | Resolve and persist a complete weight-constrained plan without inference. |
+| `get_seat_plan` | Read assignments, versions and prompt-free execution metadata. |
+| `reselect_seat_plan` | Reassign pending slots while retaining participants and constraints. |
+
+Plan tools use the same [seat-plan/1 contract](SEAT_PLANS.md) as the Kotlin app,
+Council and Glass. `resolve_seat_plan` takes `plan`; `reselect_seat_plan` takes
+`plan_id` and `request` containing `version`, unchanged `context` and `failed_slots`.
+Execution uses each assignment's pinned HTTP path and is deliberately separate from
+advice. All nine tools are available over stdio, legacy SSE and Streamable HTTP with
+either supported SDK major.
 
 `explain_route` accepts `prompt`, `max_tokens`, `needs_tools`, `model`,
 `ceiling_usd_per_mtok`, `answer_tokens`, `lane` and an optional `requirements`

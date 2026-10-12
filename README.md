@@ -9,6 +9,12 @@ Every decision is recorded: which models were considered, their live and measure
 which were ruled out and on what fact. This does not claim compatibility with every OpenAI
 API, feature, or client.
 
+The Windows/JVM client includes goal templates and a configurable seat-plan editor
+for Council roundtables and Glass PR solver reviewer/fixer/rebase roles. Choose exact
+seat counts, fixed or automatic bindings, per-seat filters and overlapping groups
+that must use different model weights. Glass reviewers can also exclude the model
+that produced the current PR revision. See [setup and contract](docs/SEAT_PLANS.md).
+
 ## Why price tables are not enough
 
 Measured on one provider (AkashML), same one-word task:
@@ -66,8 +72,9 @@ DECIDE   a Choice over the live roster -- or ABSTAIN
 ACT      forward the call; an empty answer is a failure, never a success
 ```
 
-- **Nothing is pinned.** Candidates come from each provider's live catalogue per request. A
+- **Live eligibility.** Candidates come from each provider's live catalogue per request. A
   retired model drops out of the catalogue and so cannot be chosen.
+  Multi-seat plans pin model assignments and recheck eligibility before execution.
 - **Unknown is unknown.** A null price is UNKNOWN, never $0. A model never measured is UNKNOWN,
   never assumed to work.
 - **ABSTAIN is the feature.** If nothing qualifies, the client gets HTTP 422 `router_abstained`

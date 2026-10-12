@@ -224,7 +224,7 @@ class Router:
     # --- GATHER -> DECIDE -> ACT -------------------------------------------------------
     def route(self, req: dict, *, client: str = "", ceiling: float | None = None,
               lane: str = "interactive", session: str | None = None,
-              answer_tokens: int | None = None) -> Routed:
+              answer_tokens: int | None = None, expected_weights_id: str | None = None) -> Routed:
         t0 = time.time()
         ask = self._ask(req, ceiling, lane, session, answer_tokens)
         decide_ms: list[float] = []
@@ -239,6 +239,15 @@ class Router:
             decide_ms.append(round((time.perf_counter() - d0) * 1000, 2))
             decisions.append(choice.public())
             if choice.abstained:
+                break
+            selected = next(c for c in roster if c.seat == choice.seat)
+            if expected_weights_id is not None and selected.weights_id != expected_weights_id:
+                choice = replace(choice, outcome=Outcome.ABSTAIN, seat=None, expected_usd=None,
+                                 because="pinned model weight identity changed; resolve a new seat plan",
+                                 confidence={"level": "unknown", "basis": "pinned identity changed",
+                                             "sample_count": None, "probability": None,
+                                             "unknown_count": 1, "evidence": ["no qualifying pinned identity selected"]})
+                decisions[-1] = choice.public()
                 break
             provider, _, model = choice.seat.partition(":")
             window = self._window(roster, choice.seat)
@@ -310,7 +319,8 @@ class Router:
 
     def route_stream(self, req: dict, *, client: str = "", ceiling: float | None = None,
                      lane: str = "interactive", session: str | None = None,
-                     answer_tokens: int | None = None) -> tuple[Routed, Iterator[bytes] | None]:
+                     answer_tokens: int | None = None,
+                     expected_weights_id: str | None = None) -> tuple[Routed, Iterator[bytes] | None]:
         """Decide now; stream the chosen model. A stream cannot be retried once bytes
         have gone to the client, so it is one attempt, recorded when it ends."""
         t0 = time.time()
@@ -318,6 +328,14 @@ class Router:
         d0 = time.perf_counter()
         roster = self.gather.roster(lane)
         choice = decide(ask, roster)
+        if not choice.abstained and expected_weights_id is not None:
+            selected = next(c for c in roster if c.seat == choice.seat)
+            if selected.weights_id != expected_weights_id:
+                choice = replace(choice, outcome=Outcome.ABSTAIN, seat=None, expected_usd=None,
+                                 because="pinned model weight identity changed; resolve a new seat plan",
+                                 confidence={"level": "unknown", "basis": "pinned identity changed",
+                                             "sample_count": None, "probability": None,
+                                             "unknown_count": 1, "evidence": ["no qualifying pinned identity selected"]})
         decide_ms = round((time.perf_counter() - d0) * 1000, 2)
         window = self._window(roster, choice.seat)
         doc = {"requested": str(req.get("model") or "auto"), "client": client,

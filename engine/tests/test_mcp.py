@@ -77,6 +77,13 @@ def router_contract():
             requests.append((self.path, body, dict(self.headers)))
             if self.path == "/router/explain":
                 self.respond({"choice": CHOICE, "providers": [{"provider": "test"}]})
+            elif self.path == "/v1/seat-plans/resolve":
+                self.respond({"schema": "seat-plan/1", "outcome": "RESOLVED",
+                              "plan_id": "plan-test", "version": 1, "assignments": [],
+                              "constraint_evidence": [{"id": "reviewers", "satisfied": True}]})
+            elif self.path == "/v1/seat-plans/plan-test/reselect":
+                self.respond({"schema": "seat-plan/1", "outcome": "RESOLVED",
+                              "plan_id": "plan-test", "version": 2})
             else:
                 self.send_error(404, "model calls are forbidden in this test")
 
@@ -93,6 +100,10 @@ def router_contract():
             elif self.path == "/router/decisions/decision-test":
                 self.respond({"id": "decision-test", "choice": CHOICE,
                               "earlier_decisions": [], "attempts": []})
+            elif self.path == "/v1/seat-plans/templates":
+                self.respond({"schema": "seat-plan/1", "templates": [{"id": "council"}]})
+            elif self.path == "/v1/seat-plans/plan-test":
+                self.respond({"plan_id": "plan-test", "version": 1})
             else:
                 self.send_error(404)
 
@@ -157,7 +168,8 @@ async def exercise_tools(streams):
         tools = {tool.name: tool.model_dump(by_alias=True)
                  for tool in (await session.list_tools()).tools}
         assert set(tools) == {"explain_route", "recent_decisions", "get_decision",
-                              "router_setup", "router_roster"}
+                              "router_setup", "router_roster", "seat_plan_templates",
+                              "resolve_seat_plan", "get_seat_plan", "reselect_seat_plan"}
         assert "requirements" in tools["explain_route"]["inputSchema"]["properties"]
         result = tool_json(await session.call_tool("explain_route", {
             "prompt": "Describe this picture",
@@ -176,6 +188,17 @@ async def exercise_tools(streams):
         assert recent[0]["id"] == "decision-test"
         decision = tool_json(await session.call_tool("get_decision", {"decision_id": "decision-test"}))
         assert decision["choice"]["facts"] == CHOICE["facts"]
+        templates = tool_json(await session.call_tool("seat_plan_templates", {}))
+        assert templates["templates"][0]["id"] == "council"
+        plan = tool_json(await session.call_tool("resolve_seat_plan", {
+            "plan": {"schema": "seat-plan/1", "consumer": "private-council", "slots": []}}))
+        assert plan["outcome"] == "RESOLVED"
+        assert plan["constraint_evidence"][0]["satisfied"] is True
+        stored = tool_json(await session.call_tool("get_seat_plan", {"plan_id": "plan-test"}))
+        assert stored["version"] == 1
+        updated = tool_json(await session.call_tool("reselect_seat_plan", {
+            "plan_id": "plan-test", "request": {"version": 1, "context": {}, "failed_slots": []}}))
+        assert updated["version"] == 2
 
 
 @pytest.mark.parametrize("transport", ["stdio", "sse", "streamable-http"])
@@ -206,7 +229,7 @@ def test_mcp_transport_round_trip(transport, tmp_path):
         assert headers["X-Router-Lane"] == "background"
         assert headers["X-Router-Answer-Tokens"] == "16"
         assert headers["X-Router-Max-Usd-Per-M"] == "2.5"
-        assert len(requests) == 5
+        assert len(requests) == 9
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "192.0.2.10", "::", "example.com"])

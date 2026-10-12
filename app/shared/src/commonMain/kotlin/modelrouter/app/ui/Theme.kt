@@ -41,6 +41,10 @@ data class RouterColors(
     val amberHatch: Color,
     val excluded: Color,
     val dark: Boolean,
+    val success: Color = Color(0xFF177A43),
+    val successBg: Color = Color(0xFFE8F7EE),
+    val accentBg: Color = Color(0xFFE8F2FF),
+    val warningBg: Color = Color(0xFFFFF2D6),
 )
 
 val DarkColors = RouterColors(
@@ -59,18 +63,20 @@ val DarkColors = RouterColors(
     amberHatch = Color(0x33C98A1B),
     excluded = Color(0xFF8C9096), // >= 4.5:1 on bg/surface (audit 2026-09-26)
     dark = true,
+    success = Color(0xFF81D6A0), successBg = Color(0xFF173325),
+    accentBg = Color(0xFF173149), warningBg = Color(0xFF3E2D15),
 )
 
 val LightColors = RouterColors(
-    bg = Color(0xFFF2F2F0),
-    surface = Color(0xFFFBFBFA),
-    surfaceSunk = Color(0xFFE8E8E5),
-    rule = Color(0xFFD4D4D0),
-    ruleStrong = Color(0xFFB6B6B1),
-    fg = Color(0xFF17181A),
-    fgMuted = Color(0xFF54575B),
-    fgFaint = Color(0xFF64676B), // >= 4.5:1 on bg/surface
-    accent = Color(0xFF1F6E9C),  // >= 4.5:1 on light surfaces
+    bg = Color(0xFFF8F9FB),
+    surface = Color(0xFFFFFFFF),
+    surfaceSunk = Color(0xFFF0F3F8),
+    rule = Color(0xFFE0E5EC),
+    ruleStrong = Color(0xFFBDC8D8),
+    fg = Color(0xFF101B30),
+    fgMuted = Color(0xFF566780),
+    fgFaint = Color(0xFF64728A), // >= 4.5:1 on bg/surface
+    accent = Color(0xFF0067D9),  // >= 4.5:1 on light surfaces
     onAccent = Color(0xFFFFFFFF),
     amber = Color(0xFFC98A1B),
     amberText = Color(0xFF8F5D09),
@@ -84,11 +90,11 @@ data class RouterType(
     val sans: FontFamily,
     val mono: FontFamily,
 ) {
-    val title get() = TextStyle(fontFamily = sans, fontWeight = FontWeight.SemiBold, fontSize = 19.sp, lineHeight = 25.sp)
-    val heading get() = TextStyle(fontFamily = sans, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, lineHeight = 19.sp)
-    val body get() = TextStyle(fontFamily = sans, fontWeight = FontWeight.Normal, fontSize = 13.sp, lineHeight = 18.sp)
+    val title get() = TextStyle(fontFamily = sans, fontWeight = FontWeight.SemiBold, fontSize = 25.sp, lineHeight = 32.sp)
+    val heading get() = TextStyle(fontFamily = sans, fontWeight = FontWeight.SemiBold, fontSize = 17.sp, lineHeight = 23.sp)
+    val body get() = TextStyle(fontFamily = sans, fontWeight = FontWeight.Normal, fontSize = 14.sp, lineHeight = 20.sp)
     val bodyStrong get() = body.copy(fontWeight = FontWeight.SemiBold)
-    val small get() = TextStyle(fontFamily = sans, fontWeight = FontWeight.Normal, fontSize = 11.5.sp, lineHeight = 15.sp)
+    val small get() = TextStyle(fontFamily = sans, fontWeight = FontWeight.Normal, fontSize = 12.sp, lineHeight = 17.sp)
     val smallStrong get() = small.copy(fontWeight = FontWeight.SemiBold)
     /** Mono is for numbers only: prices, latency, counts, tokens, costs. Never a section label. */
     val num get() = TextStyle(fontFamily = mono, fontWeight = FontWeight.Normal, fontSize = 12.sp, lineHeight = 16.sp)
@@ -97,7 +103,7 @@ data class RouterType(
 }
 
 object Shapes {
-    val corner = RoundedCornerShape(2.dp)
+    val corner = RoundedCornerShape(6.dp)
 }
 
 val LocalColors = staticCompositionLocalOf { DarkColors }

@@ -158,6 +158,21 @@ class Listing:
     reasoning_efforts: tuple[str, ...] | None = None
     supports_editing: bool | None = None
     family: str | None = None  # explicit provider-declared base-weight family, never id namespace
+    weights_id: str | None = None
+    identity_evidence_id: str | None = None
+
+
+def catalogue_identity(row: dict) -> tuple[str | None, str | None]:
+    """Only explicit exact weights accompanied by identity evidence establish identity.
+
+    Model IDs, canonical slugs, families and quantization labels cannot supply this
+    fact. Upstream must publish the canonical weights ID and its evidence ID.
+    """
+    weights, evidence = row.get("weights_id"), row.get("identity_evidence_id")
+    if all(isinstance(value, str) and value and value.strip() == value
+           and not any(ord(c) < 32 for c in value) for value in (weights, evidence)):
+        return weights, evidence
+    return None, None
 
 
 def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
@@ -251,12 +266,14 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
         def known_strings(value):
             return tuple(value) if isinstance(value, list) and all(
                 isinstance(v, str) for v in value) else None
+        weights_id, identity_evidence_id = catalogue_identity(m)
         out.append(Listing(provider, mid, pr, co, ca, ctx, tools, reasoning, text_out,
                            blocked=blocked_why, supported_parameters=known_strings(params),
                            input_modalities=known_strings(ins), output_modalities=known_strings(outs),
                            reasoning_efforts=known_strings(efforts), supports_editing=editing,
                            family=(m.get("model_family") or m.get("family"))
-                               if isinstance(m.get("model_family") or m.get("family"), str) else None))
+                               if isinstance(m.get("model_family") or m.get("family"), str) else None,
+                           weights_id=weights_id, identity_evidence_id=identity_evidence_id))
     return out
 
 

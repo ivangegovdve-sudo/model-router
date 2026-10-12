@@ -15,6 +15,7 @@ import argparse
 import ipaddress
 import json
 import os
+from urllib.parse import quote
 
 import httpx
 from mcp.server.transport_security import TransportSecuritySettings
@@ -48,6 +49,14 @@ def _get(path: str, **params) -> dict | list:
         r = c.get(path, params=params)
         if r.status_code != 200:
             return {"error": "HTTP %d" % r.status_code, "detail": r.text[:300]}
+        return r.json()
+
+
+def _post(path: str, body: dict) -> dict:
+    with _client() as c:
+        r = c.post(path, json=body)
+        if r.status_code != 200:
+            return {"error": "HTTP %d" % r.status_code, "detail": r.text[:1000]}
         return r.json()
 
 
@@ -137,6 +146,39 @@ def router_setup() -> str:
     """Is the router ready? Which provider keys are readable (by name only), which
     providers are blocked or out of quota, and any configuration problem."""
     return json.dumps(_get("/router/setup"), indent=1)
+
+
+@mcp.tool()
+def seat_plan_templates() -> str:
+    """Council and Glass PR solver seat templates, with explicit roles and weight
+    diversity groups. Templates describe constraints; they do not call models."""
+    return json.dumps(_get("/v1/seat-plans/templates"), indent=1)
+
+
+@mcp.tool()
+def resolve_seat_plan(plan: dict) -> str:
+    """Resolve a complete seat-plan/1 request atomically without inference. Supply
+    consumer, slots, bindings, per-seat requirements, weight diversity groups and
+    head-bound references. Aliases sharing weights do not count as independent.
+    Returns RESOLVED, UNKNOWN, UNSATISFIABLE or SEARCH_LIMIT with evidence. A resolved
+    plan is persisted and can be executed through its pinned HTTP invocation paths."""
+    return json.dumps(_post("/v1/seat-plans/resolve", plan), indent=1)
+
+
+@mcp.tool()
+def get_seat_plan(plan_id: str) -> str:
+    """Read a persisted seat plan, its version, assignment evidence and execution
+    metadata. Question and completion bodies are never stored in this record."""
+    return json.dumps(_get("/v1/seat-plans/" + quote(plan_id, safe="")), indent=1)
+
+
+@mcp.tool()
+def reselect_seat_plan(plan_id: str, request: dict) -> str:
+    """Atomically reselect pending seats after a failure. Supply current version,
+    unchanged context and failed_slots. Retains fixed and participating identities
+    and original diversity constraints. No model call or automatic rule waiver."""
+    return json.dumps(_post("/v1/seat-plans/" + quote(plan_id, safe="") + "/reselect",
+                            request), indent=1)
 
 
 def main(argv: list[str] | None = None) -> None:
