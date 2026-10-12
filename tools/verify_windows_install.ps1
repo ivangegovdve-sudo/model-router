@@ -80,11 +80,11 @@ namespace ModelRouterSmoke {
     $installedSid = [Text.StringBuilder]::new(256)
     [uint32]$context = 0
     [uint32]$sidChars = $installedSid.Capacity
+    $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $queryCode = [ModelRouterSmoke.WindowsInstaller]::EnumProducts(
-        $productCode, $null, 7, 0, $installedProduct, [ref]$context, $installedSid, [ref]$sidChars
+        $productCode, $currentUserSid, 7, 0, $installedProduct, [ref]$context, $installedSid, [ref]$sidChars
     )
     if ($queryCode -ne 0) { throw "Windows Installer registration lookup failed with status $queryCode." }
-    $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     if ($context -notin @(1, 2) -or $installedSid.ToString() -ne $currentUserSid) {
         throw 'Windows Installer did not register the MSI for the current user.'
     }
