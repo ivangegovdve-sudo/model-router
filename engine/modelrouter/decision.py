@@ -34,6 +34,8 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any
 
+from .requirements import RoutingRequirements, capability_fact, check_requirements, lower_ceiling
+
 
 class Outcome(str, Enum):
     """The closed set of outcomes. The ROUTE target is one member of the roster."""
@@ -142,6 +144,14 @@ class Candidate:
     correlated_with: tuple[str, ...] = ()
     probe_age_s: float | None = None
     latency_s: float | None = None              # a SHORT call: connection + prefill + first token
+    supported_parameters: tuple[str, ...] | None = None
+    input_modalities: tuple[str, ...] | None = None
+    output_modalities: tuple[str, ...] | None = None
+    supports_editing: bool | None = None
+    supports_reasoning: bool | None = None
+    reasoning_efforts: tuple[str, ...] | None = None
+    observation_count: int | None = None
+    family: str | None = None                    # explicit base-weight family; never a name guess
 
 
 @dataclass(frozen=True)
@@ -182,6 +192,8 @@ class Ask:
     # burned answer is usually far below the cap: a one-word reply is 2 tokens under a cap
     # of 250. Unset, the cap is used -- an upper bound that over-weights output price.
     answer_tokens: int | None = None
+    requirements: RoutingRequirements = field(default_factory=RoutingRequirements)
+    request_features: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -208,6 +220,9 @@ class Choice:
     considered: tuple[Assessment, ...] = ()
     unknown: tuple[str, ...] = ()
     facts: dict[str, Any] = field(default_factory=dict)
+    confidence: dict[str, Any] = field(default_factory=lambda: {
+        "level": "unknown", "basis": "heuristic evidence completeness; not a success probability",
+        "evidence": [], "unknown_count": 0, "sample_count": None, "probability": None})
 
     @property
     def abstained(self) -> bool:
@@ -265,9 +280,12 @@ def _cost(ask: Ask, c: Candidate, completion: int) -> tuple[Decimal | None, Deci
                                                      c.billed_evidence or "solved")
     else:
         solved = ""
-    if measured is not None and "billed" in c.measured_basis and ratio is None and not solved:
+    if measured is not None and "billed" in c.measured_basis and not solved \
+            and (ratio is None or (p == 0 and co == 0)):
         # Billed, but no billed-vs-card ratio measured yet: the blended billed price is the
         # truest number available (calls recorded from now on carry the card cost too).
+        # A ratio from an earlier paid card cannot make a newly advertised zero card
+        # erase a known bill. Complete solved billed legs can establish genuine zero.
         return measured * tokens / _M, measured, "measured, billed"
     if p is not None and co is not None:
         warm = min(dict(ask.warm).get(c.seat, 0), ask.prompt_tokens)
@@ -314,10 +332,21 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
         return out(Verdict.EXCLUDED, "free tier: excluded by policy (free endpoints may "
                    "log prompts and run on a separate daily quota)")
 
+    requirements = check_requirements(ask.requirements, c)
+    exclusions = [r for r in requirements if r.supported is False]
+    if exclusions:
+        return out(Verdict.EXCLUDED, "; ".join(r.because for r in exclusions))
+    unknown_requirements = [r for r in requirements if r.supported is None]
+    if unknown_requirements:
+        return out(Verdict.UNKNOWN, "required facts unknown: " + ", ".join(
+            r.name for r in unknown_requirements), tuple(dict.fromkeys(
+                r.unknown_fact for r in unknown_requirements)))
+
     if ask.needs_tools:
-        if c.supports_tools is False:
+        support = capability_fact(c, "tools")
+        if support is False:
             return out(Verdict.EXCLUDED, "request uses tools; model does not support them")
-        if c.supports_tools is None:
+        if support is None:
             return out(Verdict.UNKNOWN, "request uses tools; tool support unknown",
                        ("supports_tools",))
 
@@ -386,7 +415,7 @@ def assess(ask: Ask, c: Candidate) -> Assessment:
     exp, usd, basis = _cost(ask, c, answer)
     if usd is None:
         return out(Verdict.UNKNOWN, "price unknown (null is not zero)", ("price",))
-    ceiling = money(ask.ceiling_usd_per_mtok)
+    ceiling = lower_ceiling(ask.ceiling_usd_per_mtok, ask.requirements.max_usd_per_mtok)
     if ceiling is not None and usd > ceiling:
         return out(Verdict.EXCLUDED, "$%.4g/M (%s) is above the $%.4g/M ceiling" % (
             usd, basis, ceiling), usd=usd, basis=basis)
@@ -405,17 +434,37 @@ def decide(ask: Ask, roster: list[Candidate]) -> Choice:
     """
     pool = [c for c in roster if ask.only_seat in (None, c.seat)]
     facts = {"prompt_tokens": ask.prompt_tokens, "max_tokens": ask.max_tokens,
-             "needs_tools": ask.needs_tools, "ceiling_usd_per_mtok": ask.ceiling_usd_per_mtok,
+             "needs_tools": ask.needs_tools, "ceiling_usd_per_mtok": lower_ceiling(
+                 ask.ceiling_usd_per_mtok, ask.requirements.max_usd_per_mtok),
              "only_seat": ask.only_seat, "roster_size": len(roster), "lane": ask.lane,
              "interactive_max_latency_s": ask.interactive_max_latency_s,
              "answer_tokens": ask.answer_tokens or ask.max_tokens or DEFAULT_COMPLETION_ESTIMATE,
              "answer_tokens_basis": "declared" if ask.answer_tokens else (
-                 "cap (max_tokens): an upper bound" if ask.max_tokens else "default estimate")}
+                 "cap (max_tokens): an upper bound" if ask.max_tokens else "default estimate"),
+             "router_requirements": ask.requirements.public(),
+             "request_features": {**ask.request_features,
+                                  "prompt_tokens_estimate": ask.prompt_tokens,
+                                  "requested_effort": ask.requirements.thinking_level,
+                                  "context_needed_tokens": max(ask.requirements.min_context_tokens or 0,
+                                      ask.prompt_tokens + (
+                                      ask.max_tokens if ask.max_tokens is not None
+                                      else DEFAULT_COMPLETION_ESTIMATE))}}
+    judged: list[Assessment] = []
+
+    def finish(*args, **kwargs) -> Choice:
+        choice = Choice(*args, **kwargs)
+        selected = next((c for c in pool if c.seat == choice.seat), None)
+        if selected is not None and choice.max_tokens is None:
+            choice.facts["request_features"]["context_needed_tokens"] = max(
+                ask.requirements.min_context_tokens or 0,
+                ask.prompt_tokens + max(DEFAULT_COMPLETION_ESTIMATE, selected.min_max_tokens or 0))
+        return replace(choice, confidence=_confidence(choice, pool, judged))
+
     if ask.only_seat and not pool:
-        return Choice(Outcome.ABSTAIN, "requested model %s is not in the live roster"
+        return finish(Outcome.ABSTAIN, "requested model %s is not in the live roster"
                       % ask.only_seat, facts=facts)
     if not pool:
-        return Choice(Outcome.ABSTAIN, "the live roster is empty: no provider with a key "
+        return finish(Outcome.ABSTAIN, "the live roster is empty: no provider with a key "
                       "returned a catalogue", facts=facts, unknown=("roster",))
 
     by_seat = {c.seat: c for c in pool}
@@ -433,6 +482,7 @@ def decide(ask: Ask, roster: list[Candidate]) -> Choice:
     unk.sort(key=lambda a: (_list_blend(by_seat[a.seat]), a.seat))
     kept = [a for a in unk if _list_blend(by_seat[a.seat]) < bar][:UNKNOWN_KEPT]
     facts["unknown_not_listed"] = len(unk) - len(kept)
+    facts["unknown_candidates"] = len(unk)
     considered = tuple(ok + excluded + kept)
 
     clampable = sorted((a for a in judged if a.clamp_to is not None and a.expected_usd is not None),
@@ -446,13 +496,15 @@ def decide(ask: Ask, roster: list[Candidate]) -> Choice:
                          "raised %d -> %d; %s" % (ask.max_tokens, win.clamp_to, win.because))
         considered = tuple([chosen] + [a for a in considered if a.seat != win.seat])
         facts["max_tokens_raised_from"] = ask.max_tokens
+        facts["request_features"]["context_needed_tokens"] = max(
+            ask.requirements.min_context_tokens or 0, ask.prompt_tokens + win.clamp_to)
         because = ("no model answers within max_tokens=%d; raised to %d for %s, the cheapest "
                    "that can: below its measured floor it bills tokens and returns nothing "
                    "(%s). $%.3g expected (%s)" % (
                        ask.max_tokens, win.clamp_to, win.seat,
                        by_seat[win.seat].floor_evidence or "measured",
                        win.expected_usd, win.price_basis))
-        return Choice(Outcome.ROUTE, because, seat=win.seat, max_tokens=win.clamp_to,
+        return finish(Outcome.ROUTE, because, seat=win.seat, max_tokens=win.clamp_to,
                       expected_usd=win.expected_usd, considered=considered, facts=facts)
 
     if not ok:
@@ -470,7 +522,7 @@ def decide(ask: Ask, roster: list[Candidate]) -> Choice:
                     and not a.because.startswith("free tier")][:3]
         if near:
             summary += "; " + "; ".join("%s: %s" % (a.seat, a.because) for a in near)
-        return Choice(Outcome.ABSTAIN, "no candidate qualifies (%s)" % summary,
+        return finish(Outcome.ABSTAIN, "no candidate qualifies (%s)" % summary,
                       considered=considered, unknown=unknown, facts=facts)
 
     win = ok[0]
@@ -487,8 +539,45 @@ def decide(ask: Ask, roster: list[Candidate]) -> Choice:
         because += "; next %s at %s" % (runner.seat, cost(runner))
     # The client's budget is forwarded untouched here: some model answers within it,
     # so no reasoning model is handed a budget it would spend on thinking alone.
-    return Choice(Outcome.ROUTE, because, seat=win.seat, max_tokens=ask.max_tokens,
+    return finish(Outcome.ROUTE, because, seat=win.seat, max_tokens=ask.max_tokens,
                   expected_usd=win.expected_usd, considered=considered, facts=facts)
+
+
+def _confidence(choice: Choice, pool: list[Candidate], judged: list[Assessment]) -> dict[str, Any]:
+    """Evidence completeness for the decision, never a calibrated success probability."""
+    unknown_count = sum(len(a.unknown) for a in judged) or len(choice.unknown)
+    doc = {"level": "unknown", "basis": "heuristic evidence completeness; not a success probability",
+           "evidence": [], "unknown_count": unknown_count,
+           "sample_count": None, "probability": None}
+    candidate = next((c for c in pool if c.seat == choice.seat), None)
+    if candidate is None or choice.abstained:
+        doc["evidence"] = ["no qualifying candidate selected"]
+        if judged:
+            doc["evidence"].append("%d candidates assessed against known and unknown facts" % len(judged))
+        return doc
+    doc["sample_count"] = candidate.observation_count
+    evidence = ["content emission measured", "context capacity established",
+                "request cost established", "all active routing requirements satisfied"]
+    if candidate.decode_tps is not None and candidate.latency_s is not None:
+        evidence.append("decode speed and latency measured")
+    if candidate.probe_age_s is not None:
+        evidence.append("measurement age known")
+    if candidate.price_age_s is not None:
+        evidence.append("price age known")
+    if candidate.observation_count is not None:
+        evidence.append("%d recorded measurement samples" % candidate.observation_count)
+    if unknown_count:
+        evidence.append("%d required facts remain unknown across other candidates" % unknown_count)
+    clamped = "max_tokens_raised_from" in choice.facts
+    if clamped:
+        evidence.append("completion budget extrapolated above the measured floor")
+    # Freshness and repetition strengthen measured behaviour. No thresholds pretend
+    # to predict task quality: every level describes the available evidence only.
+    complete = candidate.probe_age_s is not None and candidate.price_age_s is not None \
+        and candidate.observation_count is not None and candidate.observation_count >= 2
+    doc["level"] = "low" if clamped else "high" if complete and not unknown_count else "medium"
+    doc["evidence"] = evidence
+    return doc
 
 
 def decide_ensemble(ask: Ask, roster: list[Candidate], k: int = 3) -> list[Assessment]:

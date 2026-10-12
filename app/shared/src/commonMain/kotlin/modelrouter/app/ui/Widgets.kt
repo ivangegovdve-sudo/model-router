@@ -3,12 +3,15 @@ package modelrouter.app.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -18,6 +21,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -131,6 +135,7 @@ fun RouterField(
     singleLine: Boolean = true,
     minLines: Int = 1,
     numeric: Boolean = false,
+    decimal: Boolean = false,
     secret: Boolean = false,
 ) {
     val c = Ink.colors
@@ -152,12 +157,23 @@ fun RouterField(
                 textStyle = (if (numeric) Ink.type.num else Ink.type.body).copy(color = c.fg),
                 cursorBrush = SolidColor(c.fg),
                 keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                    keyboardType = if (numeric) KeyboardType.Number else KeyboardType.Text,
+                    keyboardType = when { decimal -> KeyboardType.Decimal; numeric -> KeyboardType.Number; else -> KeyboardType.Text },
                 ),
                 visualTransformation = if (secret) androidx.compose.ui.text.input.PasswordVisualTransformation()
                 else androidx.compose.ui.text.input.VisualTransformation.None,
                 modifier = Modifier.fillMaxWidth(),
             )
+        }
+    }
+}
+
+/** Tables preserve legible columns on narrow screens and scroll within their own pane. */
+@Composable
+fun RouterTable(minWidth: Dp = 720.dp, content: @Composable ColumnScope.() -> Unit) {
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val tableWidth = maxOf(maxWidth, minWidth)
+        Column(Modifier.horizontalScroll(rememberScrollState())) {
+            Column(Modifier.width(tableWidth).border(1.dp, Ink.colors.rule), content = content)
         }
     }
 }

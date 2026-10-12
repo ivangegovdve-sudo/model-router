@@ -18,6 +18,7 @@ from typing import Callable, Iterator
 from . import providers as P
 from .config import Config
 from .decision import Ask, Choice, Outcome, decide, is_free
+from .requirements import lower_ceiling, parse_requirements, provider_request
 from .gather import Gatherer, call_cost, card_cost
 from .secrets import Keyring
 from .store import Store
@@ -41,6 +42,8 @@ def estimate_tokens(req: dict) -> int:
     n = len(json.dumps(req.get("messages") or [], ensure_ascii=False))
     if req.get("tools"):
         n += len(json.dumps(req["tools"], ensure_ascii=False))
+    if req.get("functions"):
+        n += len(json.dumps(req["functions"], ensure_ascii=False))
     return max(1, n // 4)
 
 
@@ -50,6 +53,8 @@ LANES = ("interactive", "background", "batch")
 def lane_of(req: dict, header: str | None = None) -> str:
     """`auto` is interactive; `auto:background` / `auto:batch` (or X-Router-Lane) are not.
     An unknown lane is an error, not a silent default."""
+    if not isinstance(req, dict):
+        raise ValueError("body must be a JSON object")
     model = str(req.get("model") or "auto")
     lane = (header or (model.split(":", 1)[1] if model.startswith("auto:") else "")
             or "interactive").strip().lower()
@@ -61,16 +66,53 @@ def lane_of(req: dict, header: str | None = None) -> str:
 def ask_from(req: dict, ceiling: float | None, allow_free: bool = False, *,
              lane: str = "interactive", interactive_max_latency_s: float | None = None,
              allow_clamp: bool = False) -> Ask:
-    model = str(req.get("model") or "auto")
-    mt = req.get("max_completion_tokens", req.get("max_tokens"))
-    return Ask(prompt_tokens=estimate_tokens(req),
-               max_tokens=int(mt) if mt is not None else None,
-               needs_tools=bool(req.get("tools")),
-               ceiling_usd_per_mtok=ceiling,
+    if not isinstance(req, dict):
+        raise ValueError("body must be a JSON object")
+    model = req.get("model") or "auto"
+    if not isinstance(model, str):
+        raise ValueError("`model` must be a string")
+    messages = req.get("messages")
+    if messages is None:
+        messages = []
+    if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
+        raise ValueError("`messages` must be a list of message objects")
+    roles = {}
+    for message in messages:
+        role = message.get("role")
+        if not isinstance(role, str) or role not in ("system", "developer", "user", "assistant", "tool", "function"):
+            raise ValueError("message role must be system, developer, user, assistant, tool, or function")
+        roles[role] = roles.get(role, 0) + 1
+    for name in ("tools", "functions"):
+        if req.get(name) is not None and (not isinstance(req[name], list) or any(
+                not isinstance(tool, dict) for tool in req[name])):
+            raise ValueError("`%s` must be a list of tool objects" % name)
+    for name in ("max_tokens", "max_completion_tokens"):
+        value = req.get(name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise ValueError("`%s` must be an integer >= 1" % name)
+    mt = req.get("max_completion_tokens")
+    if mt is None:
+        mt = req.get("max_tokens")
+    requirements = parse_requirements(req)
+    prompt_tokens = estimate_tokens(req)
+    needs_tools = bool(req.get("tools") or req.get("functions")) or any(
+        m.get("role") in ("tool", "function") or m.get("tool_calls") or m.get("function_call")
+        for m in messages)
+    if requirements.tool_calls is False and needs_tools:
+        raise ValueError("router_requirements.tool_calls=false conflicts with supplied tool history")
+    return Ask(prompt_tokens=prompt_tokens,
+               max_tokens=mt,
+               needs_tools=needs_tools,
+               ceiling_usd_per_mtok=lower_ceiling(ceiling, requirements.max_usd_per_mtok),
                only_seat=None if model == "auto" or model.startswith("auto:") else model,
                allow_free=allow_free, lane=lane,
                interactive_max_latency_s=interactive_max_latency_s,
-               allow_clamp=allow_clamp)
+               allow_clamp=allow_clamp, requirements=requirements,
+               request_features={"prompt_tokens_estimate": prompt_tokens,
+                                 "prompt_tokens_basis": "serialized_messages_and_tools_chars_div_4",
+                                 "message_count": len(messages), "role_counts": roles,
+                                 "tool_count": len(req.get("tools") or []) + len(req.get("functions") or []),
+                                 "requested_effort": requirements.thinking_level})
 
 
 @dataclass
@@ -106,7 +148,7 @@ class Router:
     # --- helpers -------------------------------------------------------------------------
     def _ask(self, req: dict, ceiling: float | None, lane: str, session: str | None = None,
              answer_tokens: int | None = None) -> Ask:
-        a = ask_from(req, ceiling if ceiling is not None else self.cfg.ceiling_usd_per_mtok,
+        a = ask_from(req, lower_ceiling(ceiling, self.cfg.ceiling_usd_per_mtok),
                      self.cfg.allow_free, lane=lane,
                      interactive_max_latency_s=self.cfg.interactive_max_latency_s,
                      allow_clamp=self.cfg.clamp_max_tokens)
@@ -119,6 +161,13 @@ class Router:
             if c.seat == seat:
                 return c.window
         return None
+
+    @staticmethod
+    def _capacity_abstention(choice: Choice, because: str) -> Choice:
+        return replace(choice, outcome=Outcome.ABSTAIN, seat=None, expected_usd=None,
+                       because=because, confidence={
+                           **choice.confidence, "level": "unknown", "sample_count": None,
+                           "evidence": ["no qualifying candidate selected: provider slot unavailable"]})
 
     def _observe(self, seat: str, source: str, max_tokens: int | None, res: P.Result,
                  window: str | None = None) -> tuple:
@@ -198,12 +247,13 @@ class Router:
                 # again rather than exceed the concurrency it was measured to survive.
                 why = "provider AT_CAPACITY: slot taken between decision and call"
                 ask = replace(ask, failed=ask.failed + ((choice.seat, why),))
-                choice = replace(choice, outcome=Outcome.ABSTAIN, seat=None,
-                                 because="%s -- %s" % (choice.seat, why))
+                choice = self._capacity_abstention(choice, "%s -- %s" % (choice.seat, why))
                 decisions[-1] = choice.public()     # if no attempt follows, this stands
                 continue
             try:
-                res = P.call(provider, model, self.keys.get(provider), req,
+                selected = next(c for c in roster if c.seat == choice.seat)
+                upstream_req = provider_request(req, ask.requirements, selected)
+                res = P.call(provider, model, self.keys.get(provider), upstream_req,
                              max_tokens=choice.max_tokens, window=window)
             finally:
                 self.gather.release(provider)
@@ -238,8 +288,11 @@ class Router:
         doc = {
             "requested": str(req.get("model") or "auto"), "client": client,
             "ask": {"prompt_tokens": ask.prompt_tokens, "max_tokens": ask.max_tokens,
-                    "needs_tools": ask.needs_tools, "ceiling_usd_per_mtok": ask.ceiling_usd_per_mtok,
-                    "stream": False, "lane": lane},
+                    "needs_tools": ask.needs_tools, "ceiling_usd_per_mtok": None if
+                    ask.ceiling_usd_per_mtok is None else float(ask.ceiling_usd_per_mtok),
+                    "stream": False, "lane": lane,
+                    "router_requirements": ask.requirements.public(),
+                    "request_features": choice.facts.get("request_features", {})},
             "choice": decisions[-1], "earlier_decisions": decisions[:-1], "attempts": attempts,
             "providers": self.providers_public(), "dashboard": self.gather.dashboard_status,
             "status": status, "elapsed_s": round(time.time() - t0, 3),
@@ -270,8 +323,10 @@ class Router:
         doc = {"requested": str(req.get("model") or "auto"), "client": client,
                "ask": {"prompt_tokens": ask.prompt_tokens, "max_tokens": ask.max_tokens,
                        "needs_tools": ask.needs_tools,
-                       "ceiling_usd_per_mtok": ask.ceiling_usd_per_mtok, "stream": True,
-                       "lane": lane},
+                       "ceiling_usd_per_mtok": None if ask.ceiling_usd_per_mtok is None else
+                       float(ask.ceiling_usd_per_mtok), "stream": True,
+                       "lane": lane, "router_requirements": ask.requirements.public(),
+                       "request_features": choice.facts.get("request_features", {})},
                "choice": choice.public(), "earlier_decisions": [], "attempts": [],
                "providers": self.providers_public(), "dashboard": self.gather.dashboard_status,
                "status": "ABSTAINED" if choice.abstained else "STREAMING",
@@ -286,12 +341,11 @@ class Router:
 
         if not self.gather.try_acquire(provider):
             doc["status"] = "ABSTAINED"
-            doc["choice"] = replace(choice, outcome=Outcome.ABSTAIN, seat=None,
-                                    because="provider AT_CAPACITY: slot taken between decision "
-                                    "and call").public()
+            choice = self._capacity_abstention(choice,
+                        "provider AT_CAPACITY: slot taken between decision and call")
+            doc["choice"] = choice.public()
             self.store.record({**doc, "id": did})
-            return Routed(did, replace(choice, outcome=Outcome.ABSTAIN, because=doc["choice"]
-                                       ["because"]), None, "ABSTAINED", doc), None
+            return Routed(did, choice, None, "ABSTAINED", doc), None
 
         def done(res: P.Result) -> None:
             self.gather.release(provider)
@@ -309,7 +363,9 @@ class Router:
             doc["id"] = did
             self.store.record(doc)
 
-        return routed, P.stream(provider, model, self.keys.get(provider), req,
+        selected = next(c for c in roster if c.seat == choice.seat)
+        upstream_req = provider_request(req, ask.requirements, selected)
+        return routed, P.stream(provider, model, self.keys.get(provider), upstream_req,
                                 max_tokens=choice.max_tokens, on_done=done, window=window)
 
     # --- probing: buying facts -----------------------------------------------------------

@@ -98,9 +98,10 @@ class RouterApi(private val settings: RouterSettings) {
         RouterJson.decodeFromString(Decision.serializer(), client.get("$base/router/decisions/$id") { auth() }.textOrThrow())
 
     /** Costs nothing: the router judges the request without making a model call. */
-    suspend fun explain(req: ExplainRequest): ExplainResponse {
+    suspend fun explain(req: ExplainRequest, lane: String? = null): ExplainResponse {
         val resp = client.post("$base/router/explain") {
             auth()
+            lane?.let { header("X-Router-Lane", it) }
             contentType(ContentType.Application.Json)
             setBody(RouterJson.encodeToString(ExplainRequest.serializer(), req))
         }

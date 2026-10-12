@@ -32,6 +32,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import modelrouter.app.Ask
 import modelrouter.app.Attempt
 import modelrouter.app.Assessment
@@ -42,6 +43,7 @@ import modelrouter.app.Fmt
 import modelrouter.app.RouterApi
 import modelrouter.app.RouterSettings
 import modelrouter.app.SettingsStore
+import modelrouter.app.ExplainForm
 
 enum class Screen { Decisions, Roster, Explain, Setup }
 
@@ -54,6 +56,7 @@ class AppController(private val store: SettingsStore?, private val scope: Corout
     var decisions by mutableStateOf<List<DecisionRow>>(emptyList())
     var decisionsError by mutableStateOf<String?>(null)
     var decisionsLoading by mutableStateOf(false)
+    var liveDecisions by mutableStateOf(false)
 
     var selectedId by mutableStateOf<String?>(null)
     var selectedDecision by mutableStateOf<Decision?>(null)
@@ -75,6 +78,20 @@ class AppController(private val store: SettingsStore?, private val scope: Corout
     var explainPrompt by mutableStateOf("")
     var explainMaxTokens by mutableStateOf("")
     var explainNeedsTools by mutableStateOf(false)
+    var explainSeat by mutableStateOf<String?>(null)
+    var explainLane by mutableStateOf("interactive")
+    var explainFiltersEnabled by mutableStateOf(true)
+    var explainProviders by mutableStateOf<List<String>>(emptyList())
+    var explainModelTypes by mutableStateOf<List<String>>(emptyList())
+    var explainCapabilities by mutableStateOf<List<String>>(emptyList())
+    var explainThinkingLevel by mutableStateOf<String?>(null)
+    var explainEditable by mutableStateOf<Boolean?>(null)
+    var explainToolCalls by mutableStateOf<Boolean?>(null)
+    var explainMinContext by mutableStateOf("")
+    var explainMaxPrice by mutableStateOf("")
+    var explainRoster by mutableStateOf<modelrouter.app.RosterResponse?>(null)
+    var explainRosterError by mutableStateOf<String?>(null)
+    var explainRosterLoading by mutableStateOf(false)
 
     private fun api() = RouterApi(settings)
     private fun describe(t: Throwable): String = (t.message ?: t::class.simpleName ?: "error").take(400)
@@ -82,7 +99,10 @@ class AppController(private val store: SettingsStore?, private val scope: Corout
     fun saveSettings(s: RouterSettings) {
         settings = s
         store?.save(s)
-        decisions = emptyList(); roster = null; setup = null
+        decisions = emptyList(); roster = null; setup = null; explainRoster = null
+        explainResult = null; selectedDecision = null; selectedId = null
+        decisionsError = null; rosterError = null; setupError = null; explainRosterError = null
+        explainSeat = null; explainProviders = emptyList()
     }
 
     suspend fun testConnection(s: RouterSettings): String {
@@ -128,17 +148,36 @@ class AppController(private val store: SettingsStore?, private val scope: Corout
         finally { api.close(); setupLoading = false }
     }
 
-    fun runExplain(prompt: String, maxTokens: Int?, needsTools: Boolean) = scope.launch {
+    fun loadExplainRoster() = scope.launch {
+        explainRosterLoading = true; explainRosterError = null
+        val api = api()
+        try { explainRoster = api.roster(measuredOnly = false) }
+        catch (t: Throwable) { explainRosterError = describe(t) }
+        finally { api.close(); explainRosterLoading = false }
+    }
+
+    fun explainForm() = ExplainForm(
+        prompt = explainPrompt, seat = explainSeat, lane = explainLane,
+        maxTokens = explainMaxTokens, includeTool = explainNeedsTools,
+        filtersEnabled = explainFiltersEnabled, providers = explainProviders,
+        modelTypes = explainModelTypes, capabilities = explainCapabilities,
+        thinkingLevel = explainThinkingLevel, editable = explainEditable,
+        toolCalls = explainToolCalls, minContextTokens = explainMinContext,
+        maxUsdPerMtok = explainMaxPrice,
+    )
+
+    // Kept for the desktop screenshot tour; UI uses the complete form below.
+    fun runExplain(prompt: String, maxTokens: Int?, needsTools: Boolean) {
+        explainPrompt = prompt; explainMaxTokens = maxTokens?.toString() ?: ""; explainNeedsTools = needsTools
+        runExplain()
+    }
+
+    fun runExplain() = scope.launch {
         explainLoading = true; explainError = null; explainResult = null
         val api = api()
         try {
-            val req = modelrouter.app.ExplainRequest(
-                model = "auto",
-                messages = listOf(modelrouter.app.ExplainMessage("user", prompt)),
-                maxTokens = maxTokens,
-                tools = if (needsTools) listOf(kotlinx.serialization.json.JsonObject(mapOf("type" to kotlinx.serialization.json.JsonPrimitive("function")))) else null,
-            )
-            explainResult = api.explain(req)
+            val form = explainForm()
+            explainResult = api.explain(form.request(), lane = form.lane)
         } catch (t: Throwable) { explainError = describe(t) } finally { api.close(); explainLoading = false }
     }
 }
@@ -174,7 +213,7 @@ private fun TopBar(ctl: AppController) {
     ) {
         T("modelrouter", Ink.type.heading, c.fg, maxLines = 1)
         HGap(18.dp)
-        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             RouterButton("Decisions", { ctl.screen = Screen.Decisions; if (ctl.decisions.isEmpty()) ctl.loadDecisions() }, selected = ctl.screen == Screen.Decisions)
             RouterButton("Roster", { ctl.screen = Screen.Roster; if (ctl.roster == null) ctl.loadRoster() }, selected = ctl.screen == Screen.Roster)
             RouterButton("Explain", { ctl.screen = Screen.Explain }, selected = ctl.screen == Screen.Explain)
@@ -188,6 +227,12 @@ private fun TopBar(ctl: AppController) {
 @Composable
 private fun DecisionsScreen(ctl: AppController) {
     LaunchedEffect(ctl.settings) { if (ctl.decisions.isEmpty() && ctl.decisionsError == null) ctl.loadDecisions() }
+    LaunchedEffect(ctl.liveDecisions, ctl.settings) {
+        while (ctl.liveDecisions) {
+            delay(5_000)
+            if (!ctl.decisionsLoading) ctl.loadDecisions()
+        }
+    }
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val wide = maxWidth >= 900.dp
         if (wide) {
@@ -210,6 +255,8 @@ private fun DecisionsList(ctl: AppController, modifier: Modifier) {
     Column(modifier) {
         Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             T("Recent decisions", ty.heading, c.fg, Modifier.weight(1f))
+            RouterToggle("Live", ctl.liveDecisions) { ctl.liveDecisions = it }
+            HGap(6.dp)
             RouterButton("Refresh", { ctl.loadDecisions() })
         }
         HRule()
@@ -360,7 +407,7 @@ private fun AskCard(ask: Ask) {
     val ty = Ink.type
     T("The ask", ty.heading, c.fg)
     Gap(6.dp)
-    Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+    androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         LabeledNum("prompt tokens", Fmt.tokens(ask.promptTokens))
         LabeledNum("max tokens", ask.maxTokens?.toString() ?: "unset")
         LabeledNum("ceiling $/M", ask.ceilingUsdPerMtok?.let { Fmt.perMtok(it).text } ?: "none")
@@ -405,6 +452,8 @@ fun ChoiceCard(choice: Choice, title: String?) {
         Gap(10.dp)
         FactsRow(choice)
         Gap(10.dp)
+        ChoiceTelemetry(choice)
+        Gap(10.dp)
         if (choice.considered.isNotEmpty()) ConsideredTable(choice)
     }
 }
@@ -413,10 +462,10 @@ fun ChoiceCard(choice: Choice, title: String?) {
 private fun FactsRow(choice: Choice) {
     val c = Ink.colors
     val f = choice.facts
-    Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) {
+    androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         LabeledNum("roster size", f.rosterSize?.toString() ?: "?")
-        LabeledNum("unknown, not listed", f.unknownNotListed?.toString() ?: "0")
-        LabeledNum("free tier, not listed", f.freeTierNotListed?.toString() ?: "0")
+        LabeledNum("unknown, not listed", f.unknownNotListed?.toString() ?: "UNKNOWN")
+        LabeledNum("free tier, not listed", f.freeTierNotListed?.toString() ?: "UNKNOWN")
         if (choice.unknown.isNotEmpty()) LabeledText("missing facts", choice.unknown.joinToString(", "))
     }
 }
@@ -427,7 +476,7 @@ fun ConsideredTable(choice: Choice) {
     val c = Ink.colors
     val ty = Ink.type
     val winnerSeat = choice.seat
-    Column(Modifier.fillMaxWidth().border(1.dp, c.rule)) {
+    RouterTable {
         ConsideredHeaderRow()
         HRule()
         choice.considered.forEachIndexed { i, a ->
@@ -485,7 +534,7 @@ private fun ConsideredRow(a: Assessment, isWinner: Boolean) {
 fun AttemptsTable(attempts: List<Attempt>) {
     val c = Ink.colors
     val ty = Ink.type
-    Column(Modifier.fillMaxWidth().border(1.dp, c.rule)) {
+    RouterTable {
         Row(Modifier.fillMaxWidth().background(c.surfaceSunk).padding(horizontal = 10.dp, vertical = 6.dp)) {
             T("seat", ty.smallStrong, c.fgMuted, Modifier.weight(1.4f))
             T("http", ty.smallStrong, c.fgMuted, Modifier.weight(0.6f))

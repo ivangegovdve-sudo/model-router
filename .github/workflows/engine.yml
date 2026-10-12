@@ -13,6 +13,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
+        mcp-sdk: [mcp1, mcp2]
     defaults:
       run:
         working-directory: engine
@@ -21,8 +22,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[test,mcp]"
+      - run: pip install -e ".[test,${{ matrix.mcp-sdk }}]"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install published openDashboard 2.0 MCP for integration
+        shell: bash
+        run: npm install --ignore-scripts --prefix "$RUNNER_TEMP/router-dashboard-test" open-dashboard-mcp@2.0.0
       - run: python -m pytest -q
+        env:
+          OPENDASHBOARD_MCP_ENTRY: ${{ runner.temp }}/router-dashboard-test/node_modules/open-dashboard-mcp/build/index.js
       - name: CLI refuses honestly with no config
         shell: bash
         run: |

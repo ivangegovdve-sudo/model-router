@@ -5,6 +5,8 @@ import json
 import secrets as pysecrets
 import time
 
+from .requirements import reasoning_effort_of
+
 
 def _new_id(prefix: str) -> str:
     return prefix + "_" + pysecrets.token_hex(12)
@@ -135,6 +137,15 @@ def responses_to_chat(body: dict) -> dict:
         raise ValueError("`input` must contain at least one message or function item")
 
     chat = {"model": body.get("model") or "auto", "messages": messages}
+    if "router_requirements" in body:
+        chat["router_requirements"] = body["router_requirements"]
+    if "reasoning_effort" in body:
+        chat["reasoning_effort"] = body["reasoning_effort"]
+    effort = reasoning_effort_of(body.get("reasoning"))
+    if effort is not None:
+        if chat.get("reasoning_effort") is not None and chat["reasoning_effort"] != effort:
+            raise ValueError("reasoning.effort conflicts with reasoning_effort")
+        chat["reasoning_effort"] = effort
     # Only forward fields shared with the Chat Completions provider adapters. Responses-only
     # fields such as store, reasoning, include, and truncation must not leak upstream.
     shared = ("temperature", "top_p", "stop", "presence_penalty", "frequency_penalty",
@@ -144,9 +155,8 @@ def responses_to_chat(body: dict) -> dict:
         if key in body:
             chat[key] = body[key]
     if "max_output_tokens" in body:
-        try:
-            limit = int(body["max_output_tokens"])
-        except (TypeError, ValueError):
+        limit = body["max_output_tokens"]
+        if isinstance(limit, bool) or not isinstance(limit, int):
             raise ValueError("`max_output_tokens` must be an integer")
         if limit < 1:
             raise ValueError("`max_output_tokens` must be >= 1")
@@ -198,7 +208,9 @@ def _router_result(routed) -> dict:
     result = routed.doc.get("result") or {}
     return {"decision_id": routed.decision_id, "seat": routed.choice.seat,
             "because": routed.choice.because, "cost_usd": result.get("cost_usd"),
-            "cost_basis": result.get("cost_basis"), "attempts": len(routed.doc.get("attempts") or [])}
+            "cost_basis": result.get("cost_basis"), "attempts": len(routed.doc.get("attempts") or []),
+            "confidence": routed.choice.confidence,
+            "request_features": routed.choice.facts.get("request_features", {})}
 
 
 def chat_completion_to_response(completion: dict, request_body: dict) -> dict:

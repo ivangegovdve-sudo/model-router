@@ -24,6 +24,7 @@ from decimal import Decimal
 import httpx
 
 from . import providers as P
+from . import dashboard as D
 from .config import Config
 from dataclasses import replace
 
@@ -121,12 +122,13 @@ class Gatherer:
         self.cfg, self.keys, self.store = cfg, keys, store
         self._cat: dict[str, tuple[float, list[P.Listing]]] = {}
         self._dash: dict[str, tuple[float, dict[str, dict] | None]] = {}
+        self._dash_models: tuple[float, dict[str, dict]] | None = None
         self._win: dict[str, tuple[float, dict]] = {}
         self._ctx: dict[str, tuple[float, dict]] = {}
         self.states: dict[str, ProviderState] = {p: ProviderState(p) for p in cfg.secrets}
         # provider -> ok | not carried | unreachable (...) ; the whole map is shown as-is
-        self.dashboard_status: dict[str, str] | str = (
-            "not configured" if not cfg.dashboard_url else {})
+        self.dashboard_status: dict[str, str] = (
+            {"status": "not configured"} if not cfg.dashboard_url else {})
         self._lock = threading.Lock()
 
     # --- sources -----------------------------------------------------------------
@@ -146,36 +148,41 @@ class Gatherer:
         hit = self._dash.get(provider)
         if hit and time.time() - hit[0] < DASHBOARD_TTL_S:
             return hit[1]
-        rows: dict[str, dict] = {}
-        cursor = None
         try:
-            for _ in range(20):
-                params = {"provider": provider, "limit": 500}
-                if cursor:
-                    params["cursor"] = cursor
-                r = httpx.get(self.cfg.dashboard_url + "/api/public/v2/live-models",
-                              params=params, timeout=30, headers={"User-Agent": P.UA})
-                if r.status_code == 400 and not rows:
-                    # The dashboard validates `provider` against the set it collects:
-                    # 400 means it does not carry this provider (yet), not that it is down.
-                    self.dashboard_status[provider] = "not carried"
-                    self._dash[provider] = (time.time(), None)
-                    return None
-                r.raise_for_status()
-                d = r.json()
-                for row in d.get("data") or []:
-                    if row.get("provider") == provider:
-                        rows[str(row.get("id"))] = row
-                cursor = d.get("cursor")
-                if not cursor or not d.get("data"):
-                    break
+            with httpx.Client(timeout=30) as client:
+                data = D.fetch_rows(client, self.cfg.dashboard_url, "live-models",
+                                    {"provider": provider})
+            rows = {str(row["id"]): row for row in data
+                    if row.get("provider") == provider and row.get("id")}
             self.dashboard_status[provider] = "ok (%d rows)" % len(rows)
+        except httpx.HTTPStatusError as exc:
+            self.dashboard_status[provider] = "not carried" if exc.response.status_code == 400 \
+                else "unreachable (HTTP %d)" % exc.response.status_code
+            self._dash[provider] = (time.time(), None)
+            return None
         except Exception as exc:                                # noqa: BLE001
             self.dashboard_status[provider] = "unreachable (%s)" % type(exc).__name__
             self._dash[provider] = (time.time(), None)
             return None
         out = rows or None
         self._dash[provider] = (time.time(), out)
+        return out
+
+    def _dashboard_models(self) -> dict[str, dict]:
+        """The dashboard's OpenRouter-only native metadata, joined by exact model id."""
+        if not self.cfg.dashboard_url:
+            return {}
+        if self._dash_models and time.time() - self._dash_models[0] < DASHBOARD_TTL_S:
+            return self._dash_models[1]
+        try:
+            with httpx.Client(timeout=30) as client:
+                rows = D.fetch_rows(client, self.cfg.dashboard_url, "models", {})
+            out = {str(row["id"]): row for row in rows if row.get("id")}
+            self.dashboard_status["openrouter_capabilities"] = "ok (%d rows)" % len(out)
+        except Exception as exc:  # missing evidence never becomes a negative capability
+            out = {}
+            self.dashboard_status["openrouter_capabilities"] = "unreachable (%s)" % type(exc).__name__
+        self._dash_models = (time.time(), out)
         return out
 
     def _window_prices(self, provider: str) -> dict:
@@ -315,6 +322,9 @@ class Gatherer:
                     st.detail = "%d calls in flight; measured to survive %d (%s)" % (
                         st.in_flight, st.max_concurrency, st.concurrency_source)
                 dash = self._dashboard(provider)
+                metadata = self._dashboard_models() if provider == "openrouter" and any(
+                    li.supported_parameters is None or li.input_modalities is None
+                    or li.output_modalities is None for li in listings) else {}
                 windows = self._window_prices(provider)
                 contexts = self._context_lengths(provider)
                 st.models = len(listings)
@@ -342,15 +352,30 @@ class Gatherer:
                             blocked = "not sold in the %s lane's windows (offered: %s)" % (
                                 lane, ", ".join(sorted(cards)))
                     row = (dash or {}).get(li.model)
+                    evidence = D.capabilities(row or {}, metadata.get(li.model))
                     if row:
-                        pp = row.get("pricing") or {}
-                        dp, dc = P._per_m(pp.get("promptUsdPerToken")), \
-                            P._per_m(pp.get("completionUsdPerToken"))
+                        card = D.prices(row, window)
+                        if (card.prompt is None or card.completion is None) and not window \
+                                and P.PROVIDERS[provider].get("windows"):
+                            for offered in P.LANE_WINDOWS[lane]:
+                                proposed = D.prices(row, offered)
+                                if proposed.prompt is not None and proposed.completion is not None:
+                                    card = proposed
+                                    break
+                        dp, dc = card.prompt, card.completion
                         # The provider's own catalogue, read this run, beats the dashboard's
                         # daily copy; the dashboard fills a price the provider did not give.
-                        if (pr is None or co is None) and dp is not None and dc is not None:
-                            pr, co, src = dp, dc, "dashboard"
-                            age = _iso_age(row.get("lastConfirmedAt") or row.get("lastSeenAt"))
+                        if (pr is None or co is None) and (pr is not None or dp is not None) \
+                                and (co is not None or dc is not None):
+                            mixed = pr is not None or co is not None
+                            pr = pr if pr is not None else dp
+                            co = co if co is not None else dc
+                            src = "mixed (%s, dashboard)" % src if mixed else "dashboard"
+                            ca = ca if mixed else card.cached
+                            window = card.window or window
+                            dash_age = _iso_age(card.read_at)
+                            age = max(age, dash_age) if mixed and age is not None \
+                                and dash_age is not None else dash_age
                         if row.get("availability") == "disappeared":
                             available = False
                     sources.add(src)
@@ -362,8 +387,22 @@ class Gatherer:
                     out.append(Candidate(
                         seat=seat, provider=provider, model=li.model,
                         provider_state=state, provider_detail=detail, available=available,
-                        context_length=li.context_length or contexts.get(li.model),
-                        supports_tools=li.supports_tools,
+                        context_length=li.context_length or contexts.get(li.model) or evidence["context_length"],
+                        supports_tools=li.supports_tools if li.supports_tools is not None
+                            else evidence["supports_tools"],
+                        supports_reasoning=li.reasoning if li.reasoning is not None
+                            else evidence["supports_reasoning"],
+                        supported_parameters=li.supported_parameters if li.supported_parameters is not None
+                            else evidence["supported_parameters"],
+                        input_modalities=li.input_modalities if li.input_modalities is not None
+                            else evidence["input_modalities"],
+                        output_modalities=li.output_modalities if li.output_modalities is not None
+                            else evidence["output_modalities"],
+                        reasoning_efforts=li.reasoning_efforts if li.reasoning_efforts is not None
+                            else evidence["reasoning_efforts"],
+                        supports_editing=li.supports_editing,
+                        family=li.family,
+                        observation_count=prof.observations if prof else None,
                         list_prompt=pr, list_completion=co, list_cached=ca, price_age_s=age,
                         price_source=src, in_flight=st.in_flight,
                         load_factor=self._load_factor(facts.get(provider, {}), st.in_flight),

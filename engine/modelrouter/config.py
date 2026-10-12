@@ -95,6 +95,8 @@ class Config:
     max_price_age_s: float | None = 172800
     allow_mirrors: bool = False
     dashboard_url: str = ""
+    seat_consumer_policies: dict[str, str] = field(default_factory=lambda: {
+        "glass-solver": "cheapest", "private-council": "cheapest", "public-council": "free-only"})
     state_dir: Path = field(default_factory=lambda: Path.home() / ".modelrouter")
     problems: list[str] = field(default_factory=list)
 
@@ -141,6 +143,15 @@ def load(path: Path | None = None) -> Config:
     cfg.max_price_age_s = float(age) if age not in (None, "", 0) else None
     cfg.allow_mirrors = bool(pol.get("allow_mirrors", False))
     cfg.dashboard_url = (pol.get("dashboard_url", "") or "").rstrip("/")
+    consumers = d.get("seat_consumers", {})
+    if not isinstance(consumers, dict):
+        cfg.problems.append("seat_consumers must be a table of consumer names and policies")
+    else:
+        for name, policy in consumers.items():
+            if not isinstance(name, str) or not name or policy not in ("cheapest", "free-only"):
+                cfg.problems.append("seat_consumers.%s must be cheapest or free-only" % name)
+                continue
+            cfg.seat_consumer_policies[name] = policy
     if cfg.source not in ("gcp", "env"):
         cfg.problems.append('secrets.source must be "gcp" or "env"')
     if cfg.source == "gcp" and not cfg.gcp_project:

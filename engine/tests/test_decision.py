@@ -1,7 +1,22 @@
 """The decision layer, on the facts measured on AkashML on 2026-09-25."""
 from dataclasses import replace
+from decimal import Decimal
 
 from modelrouter.decision import Ask, Candidate, Emits, Outcome, Verdict, assess, decide
+
+
+def test_zero_card_cannot_erase_positive_billed_price_via_an_old_ratio():
+    candidate = Candidate(seat="p:free", provider="p", model="free", emits=Emits.CONTENT,
+                          context_length=8192, list_prompt=Decimal(0), list_completion=Decimal(0),
+                          measured_usd_per_mtok=Decimal("0.1"), measured_basis="billed",
+                          billing_ratio=Decimal(1))
+    choice = decide(Ask(prompt_tokens=10, max_tokens=10, allow_free=True,
+                        ceiling_usd_per_mtok=Decimal(0)), [candidate])
+    assert choice.outcome is Outcome.ABSTAIN
+    assert choice.considered[0].usd_per_mtok == Decimal("0.1")
+    solved = replace(candidate, billed_prompt=Decimal(0), billed_completion=Decimal(0))
+    assert decide(Ask(prompt_tokens=10, max_tokens=10, allow_free=True,
+                      ceiling_usd_per_mtok=Decimal(0)), [solved]).outcome is Outcome.ROUTE
 
 
 def akash(**over):

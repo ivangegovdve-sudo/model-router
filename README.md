@@ -200,6 +200,55 @@ for one call.
   tool. An MCP server cannot switch a client's model — the client chose it before any tool runs —
   so it advises; the proxy routes.
 
+### openDashboard 2.0, model requirements and telemetry
+
+The dashboard source is [`openrouter-dashboard-mcp`](https://github.com/ivangegovdve-sudo/openrouter-dashboard-mcp),
+which publishes [`open-dashboard-mcp@2.0.0`](https://www.npmjs.com/package/open-dashboard-mcp/v/2.0.0).
+The router reads its public REST evidence directly, accepting both sourced `pricePoints`
+and the deployed legacy prices. Conditional scheduling prices retain their conditions;
+unknown prices and capabilities remain unknown. The new `/v1/seats/resolve` advisory
+endpoint supports the published dashboard's `dashboard_resolve_seat` tool.
+
+Use optional `router_requirements` in Chat Completions, Responses or `/router/explain`:
+
+```json
+{
+  "model": "auto:background",
+  "messages": [{"role": "user", "content": "Review this change."}],
+  "max_tokens": 1024,
+  "router_requirements": {
+    "providers": ["openrouter", "sail"],
+    "required_capabilities": ["tools"],
+    "thinking_level": "high",
+    "min_context_tokens": 32000,
+    "max_usd_per_mtok": 2
+  }
+}
+```
+
+The Kotlin app provides an actual roster model picker, routing lanes and optional
+filters for provider, model type, capability, thinking level, code/content editing,
+tool calls, context and price. The explanation and decision screens show the inputs,
+candidate verdicts and evidence behind confidence. Confidence describes evidence
+completeness; it is not a probability of a correct answer. Prompt text is not saved
+in decision telemetry. Missing editing evidence can make an editing-filtered request
+abstain.
+
+Both Python MCP SDK majors 1 and 2 are supported with stdio, legacy SSE and Streamable
+HTTP. See [MCP setup](docs/MCP.md), [dashboard integration](docs/OPENDASHBOARD.md),
+and the [requirements contract](docs/CONTRACT.md#requirements-and-confidence).
+
+Build the small Kotlin clients with JDK 17 and Android SDK 36:
+
+```sh
+cd app
+./gradlew :shared:desktopTest :desktopApp:packageUberJarForCurrentOS :androidApp:assembleDebug
+java -jar desktopApp/build/compose/jars/ModelRouter-linux-x64-1.0.0.jar
+```
+
+The JAR filename follows the build platform. Android uses the generated APK; Windows
+packaging remains available through `:desktopApp:packageMsi`.
+
 Full contract: [`docs/CONTRACT.md`](docs/CONTRACT.md).
 
 ## Policy (`[policy]` in the config)

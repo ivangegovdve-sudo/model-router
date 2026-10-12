@@ -3,6 +3,10 @@ package modelrouter.app
 import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.roundToLong
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 
 /**
  * Number formatting without platform String.format, so common code and tests agree.
@@ -13,6 +17,13 @@ import kotlin.math.roundToLong
  *  - an attempt with content_chars == 0 is EMPTY, even when http is 200.
  */
 object Fmt {
+    /** Source telemetry can carry structured dashboard status as well as older strings. */
+    fun jsonValue(value: JsonElement?): String = when (value) {
+        null -> "UNKNOWN"
+        is JsonPrimitive -> value.contentOrNull ?: "UNKNOWN"
+        is JsonObject -> value.entries.joinToString(" · ") { (key, item) -> "$key: ${jsonValue(item)}" }
+        else -> value.toString()
+    }
     fun fixed(v: Double, decimals: Int): String {
         val neg = v < 0
         val factor = 10.0.pow(decimals)
