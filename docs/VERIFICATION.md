@@ -8,13 +8,26 @@ Verified on 2026-10-12 using local synthetic providers and PR fixtures.
 |---|---|
 | Full engine, MCP SDK 1 and 2, published dashboard bridge | 466 passed on each; no skips |
 | New plan tools across SDK majors | Nine-tool exchanges passed both directions over stdio, SSE and Streamable HTTP |
-| Council offline suite | 68 passed on each SDK; 3 explicitly live tests skipped |
+| Council offline suite | 70 passed on each SDK; 3 explicitly live tests skipped |
+| Glass final plan/gateway tests | 43 passed |
+| Glass full Linux suite | 641 passed, 29 failed, 1 skipped; all 29 failures reproduced on unchanged `20830b4` |
+| Glass Windows CI | Engine test check passed on `f203fe8` |
 | Actual consumer HTTP integration | Four-member Council completed all 10 stage calls; two Glass gateways executed distinct reviewer weights and excluded the author |
 | Kotlin desktop tests | 33 passed |
 | Native desktop and Android | Desktop executable JAR and debug APK built |
 | Native seat editor | Real HTTP response resolved B/C/A/B; overlapping pair/triple groups preserved; All seats sent the additional full group |
 | Independent review | Identity, costs, complete-search proofs, receipts, stale heads, retries, upstream controls and draft preservation reviewed; material findings fixed |
-| Windows installer | Version 1.1.0 MSI workflow includes per-user installation and GUI launch without system Java; CI result pending |
+| Windows installer | Version 1.1.0 MSI passed current-user installation, visible responsive GUI with bundled JVM and no system Java, and clean exit |
+
+Router CI passed all four Ubuntu/Windows × SDK 1/2 jobs. The Android release/debug
+packaging and [Windows installer smoke workflow](https://github.com/ivangegovdve-sudo/model-router/actions/runs/38259474822)
+passed on `705498bd1d42547254d7ed6991fd1c1aee06815e`. Windows Installer registered
+version 1.1.0 in the current user's context. With system Java absent, the visible
+GUI loaded `runtime/bin/server/jvm.dll`, remained responsive for ten seconds,
+and both its GUI and launcher exited with code 0 after normal window close.
+
+The verified MSI is available in that run's `modelrouter-msi` artifact. Its SHA-256 is
+`243cc534e77cf5c4aa5c049b5205f4b72d3c2d9d9343a4509fe2488e5fec3780`.
 
 Run the optional cross-repository integration with local consumer checkouts:
 

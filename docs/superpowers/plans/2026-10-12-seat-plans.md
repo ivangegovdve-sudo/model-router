@@ -20,39 +20,44 @@ review completion must have behavior-level regression coverage.
 
 ## Task 1 — Router identity and complete assignment
 
-- [ ] Add failing tests for weight aliases, arbitrary groups/references, fixed seats,
+- [x] Add failing tests for weight aliases, arbitrary groups/references, fixed seats,
   unknown identity, policy floors, exact counts, greedy dead ends and search limits.
-- [ ] Extend candidate/catalogue/config identity fields and implement `SeatPlanManager`
+- [x] Extend candidate/catalogue/config identity fields and implement `SeatPlanManager`
   in focused new modules with durable plans, templates and pinned preparation.
-- [ ] Wire authenticated HTTP/MCP plan endpoints and execution lifecycle; add tests
+- [x] Wire authenticated HTTP/MCP plan endpoints and execution lifecycle; add tests
   for head/version changes, attempts to weaken requirements and re-selection pins.
-- [ ] Run the full engine suite with both MCP SDK majors and published bridge.
+- [x] Run the full engine suite with both MCP SDK majors and published bridge.
 
 ## Task 2 — Council adapter
 
-- [ ] Add failing tests for per-run plans, real pinned calls, slot-ID results, concurrent
+- [x] Add failing tests for per-run plans, real pinned calls, slot-ID results, concurrent
   isolation, counts above ten and legacy behavior/MCP schemas.
-- [ ] Add opt-in adapter and immutable execution roster through every council stage.
-- [ ] Run offline regression suite; document setup and identity requirements.
+- [x] Add opt-in adapter and immutable execution roster through every council stage.
+- [x] Run offline regression suite; document setup and identity requirements.
 
 ## Task 3 — Glass adapter and reviewer cohort
 
-- [ ] Add failing tests for two required reviewers, per-slot retries, exact head,
+- [x] Add failing tests for two required reviewers, per-slot retries, exact head,
   unknown provenance, gateway pinning and write/merge gates.
-- [ ] Implement opt-in plan adapter and head-bound origin records; preserve legacy
+- [x] Implement opt-in plan adapter and head-bound origin records; preserve legacy
   selector, action safety and trusted upstream credentials.
-- [ ] Run the full Glass regression suite and document the consumer contract.
+- [x] Run the full Glass regression suite and document the consumer contract.
 
 ## Task 4 — Kotlin and Windows
 
-- [ ] Add typed plan/template models and tests for request editing, preservation and
+- [x] Add typed plan/template models and tests for request editing, preservation and
   response evidence; implement both approved visual screens and goal templates.
-- [ ] Verify native controls and actual backend-selected evidence with local fixtures.
-- [ ] Build/test desktop and Android, fix CI setup, bump MSI version and verify Windows
+- [x] Verify native controls and actual backend-selected evidence with local fixtures.
+- [x] Build/test desktop and Android, fix CI setup, bump MSI version and verify Windows
   package generation and installation/launch where tooling permits.
 
 ## Task 5 — Integration and handoff
 
-- [ ] Run cross-repo HTTP integration and independent review; fix material findings.
-- [ ] Commit/push reviewable changes in all repos, create/update draft PRs, check CI.
-- [ ] Deliver Windows installer link and verification evidence with explicit limits.
+- [x] Run cross-repo HTTP integration and independent review; fix material findings.
+- [x] Commit/push reviewable changes in all repos, create/update draft PRs, check CI.
+- [x] Deliver Windows installer link and verification evidence with explicit limits.
+
+Final evidence is recorded in [verification](../../VERIFICATION.md). Windows installer
+execution and Glass Windows engine CI passed. All 29 Glass Linux failures reproduced
+on the unchanged baseline; no isolation policy was weakened. All three draft PRs
+are pushed, and the verified Windows MSI is included in the handoff.
