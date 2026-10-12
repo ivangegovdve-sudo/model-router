@@ -20,6 +20,8 @@ $result = [ordered]@{
     expectedVersion = $ExpectedVersion
     installerExitCode = $null
     installDirectory = $null
+    installerContext = $null
+    installedVersion = $null
     perUserRegistration = $false
     systemJavaUnavailable = $false
     loadedJvm = $null
@@ -37,9 +39,7 @@ try {
     $installerArgs = @(
         '/i', ('"{0}"' -f $msi), '/qn', '/norestart',
         '/l*v', ('"{0}"' -f $installLog),
-        ('INSTALLDIR="{0}"' -f $requestedDirectory),
-        ('APPLICATIONFOLDER="{0}"' -f $requestedDirectory),
-        'ALLUSERS=2', 'MSIINSTALLPERUSER=1'
+        ('INSTALLDIR="{0}"' -f $requestedDirectory)
     )
     $installer = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\msiexec.exe') `
         -ArgumentList $installerArgs -PassThru
@@ -51,28 +51,61 @@ try {
         throw "MSI installation failed with exit code $($installer.ExitCode). See msi-install.log."
     }
 
-    # jpackage versions use different directory properties. Confirm the actual
-    # current-user registration, then locate the installed executable.
-    $registration = @(
-        foreach ($root in @(
-            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
-            'HKCU:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-        )) {
-            if (Test-Path -LiteralPath $root) {
-                Get-ChildItem -LiteralPath $root | Get-ItemProperty |
-                    Where-Object { $_.PSObject.Properties['DisplayName'] -and $_.DisplayName -eq 'ModelRouter' }
-            }
-        }
-    ) | Where-Object { $_.PSObject.Properties['DisplayVersion'] -and $_.DisplayVersion -eq $ExpectedVersion }
-    if (@($registration).Count -ne 1) {
-        throw "Expected one current-user ModelRouter $ExpectedVersion registration; found $(@($registration).Count)."
+    # Per-user MSI products need not have an HKCU Uninstall entry. jpackage
+    # writes its ProductCode in HKCU; ask Windows Installer for that product's
+    # actual registration context, version and install location.
+    $productKey = "HKCU:\Software\Ivan Gegov\ModelRouter\$ExpectedVersion"
+    if (-not (Test-Path -LiteralPath $productKey)) {
+        throw "No current-user jpackage product key for ModelRouter $ExpectedVersion."
     }
-    $registeredApp = @($registration)[0]
+    $productCode = Get-ItemPropertyValue -LiteralPath $productKey -Name 'ProductCode'
+    if (-not ('ModelRouterSmoke.WindowsInstaller' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+using System.Text;
+namespace ModelRouterSmoke {
+    public static class WindowsInstaller {
+        [DllImport("msi.dll", EntryPoint = "MsiEnumProductsExW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        public static extern uint EnumProducts(string productCode, string userSid,
+            uint context, uint index, StringBuilder installedProduct, out uint installedContext,
+            StringBuilder installedSid, ref uint sidChars);
+        [DllImport("msi.dll", EntryPoint = "MsiGetProductInfoExW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        public static extern uint GetProductInfo(string productCode, string userSid,
+            uint context, string property, StringBuilder value, ref uint valueChars);
+    }
+}
+'@
+    }
+    $installedProduct = [Text.StringBuilder]::new(39)
+    $installedSid = [Text.StringBuilder]::new(256)
+    [uint32]$context = 0
+    [uint32]$sidChars = $installedSid.Capacity
+    $queryCode = [ModelRouterSmoke.WindowsInstaller]::EnumProducts(
+        $productCode, $null, 7, 0, $installedProduct, [ref]$context, $installedSid, [ref]$sidChars
+    )
+    if ($queryCode -ne 0) { throw "Windows Installer registration lookup failed with status $queryCode." }
+    $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($context -notin @(1, 2) -or $installedSid.ToString() -ne $currentUserSid) {
+        throw 'Windows Installer did not register the MSI for the current user.'
+    }
+    $result.installerContext = $context
+    $registration = @{}
+    foreach ($property in @('InstalledProductName', 'VersionString', 'InstallLocation')) {
+        $value = [Text.StringBuilder]::new(4096)
+        [uint32]$valueChars = $value.Capacity
+        $queryCode = [ModelRouterSmoke.WindowsInstaller]::GetProductInfo(
+            $productCode, $currentUserSid, $context, $property, $value, [ref]$valueChars
+        )
+        if ($queryCode -ne 0) { throw "Windows Installer property $property lookup failed with status $queryCode." }
+        $registration[$property] = $value.ToString()
+    }
+    if ($registration.InstalledProductName -ne 'ModelRouter' -or $registration.VersionString -ne $ExpectedVersion) {
+        throw 'Windows Installer registered an unexpected product name or version.'
+    }
+    $result.installedVersion = $registration.VersionString
     $result.perUserRegistration = $true
     $candidates = @($requestedDirectory)
-    if ($registeredApp.PSObject.Properties['InstallLocation'] -and $registeredApp.InstallLocation) {
-        $candidates += $registeredApp.InstallLocation.Trim('"')
-    }
+    if ($registration.InstallLocation) { $candidates += $registration.InstallLocation.Trim('"') }
     $candidates += Join-Path $env:LOCALAPPDATA 'ModelRouter'
     $candidates += Join-Path $env:LOCALAPPDATA 'Programs\ModelRouter'
     $executable = $candidates | ForEach-Object { Join-Path $_ 'ModelRouter.exe' } |
