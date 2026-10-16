@@ -6,6 +6,7 @@
     GET  /health                   no auth; what is configured, what is missing
     GET  /router/setup             the setup surface: keys by NAME, sources, problems
     GET  /router/roster            every candidate with the facts the decision reads
+    POST /v1/seats/resolve         which seat fills a ROLE under a policy + family constraint
     POST /router/explain           the decision for a request, without making the call
     POST /router/probe             buy behavioural facts (spends money, capped)
     GET  /router/decisions         recent decisions
@@ -22,6 +23,8 @@ import json
 import logging
 import secrets as pysecrets
 import shutil
+import uuid
+from decimal import Decimal
 from pathlib import Path
 
 import uvicorn
@@ -29,7 +32,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__
+from . import __version__, jev, seats
 from .config import Config, load
 from decimal import Decimal
 
@@ -179,6 +182,57 @@ def build(cfg: Config) -> FastAPI:
             rows.append(d)
         return {"providers": router.providers_public(),
                 "dashboard": router.gather.dashboard_status, "seats": rows}
+
+    jev_keys = Keyring(cfg.source, {"typesafe": cfg.jev_secret}, cfg.gcp_project)
+    advisor = (jev.make_advisor(lambda: jev_keys.get("typesafe"),
+                                min_prob=cfg.jev_min_probability)
+               if cfg.jev_enabled else None)
+
+    def pool_seats() -> list[seats.Seat]:
+        out = [s for s in (seats.from_candidate(c) for c in router.gather.roster()) if s]
+        out += seats.discover_local(cfg.ollama_url)
+        out += seats.adapter_placeholders(cfg.declared_seats)
+        out += [seats.from_declared(d) for d in cfg.declared_seats]
+        return out
+
+    @app.post("/v1/seats/resolve", dependencies=[Depends(auth)])
+    async def seats_resolve(request: Request):
+        """Which seat fills ROLE under POLICY and a cross-family constraint. Advisory: no
+        inference on the chosen seat, no spend there (Jev's own call is the only cost)."""
+        b = await request.json()
+        consumer = b.get("consumer")
+        if not isinstance(consumer, str) or consumer not in cfg.consumers:
+            raise HTTPException(400, "unknown consumer %r; configured: %s -- add it under "
+                                     "[consumers.<name>] with a policy" % (consumer, ", ".join(cfg.consumers)))
+        configured = cfg.consumers[consumer]
+        for field_ in ("exclude_families", "exclude_seats"):
+            v = b.get(field_) or []
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise HTTPException(400, "%s must be a list of strings" % field_)
+        try:
+            # the request may lower the configured price ceiling, never raise it
+            ceilings = [Decimal(str(x)) for x in (b.get("max_usd_per_m"), cfg.ceiling_usd_per_mtok)
+                        if x is not None]
+            req = seats.SeatRequest(
+                role=str(b.get("role") or "general"), consumer=consumer,
+                policy=b.get("policy"),
+                exclude_families=tuple(b.get("exclude_families") or ()),
+                exclude_seats=tuple(b.get("exclude_seats") or ()),
+                min_context=(b.get("need") or {}).get("min_context"),
+                needs_tools=bool((b.get("need") or {}).get("tools")),
+                ceiling_usd_per_mtok=min(ceilings) if ceilings else None,
+                task=str(b.get("task") or ""))
+            res = await run_in_threadpool(
+                lambda: seats.resolve(req, pool_seats(), configured_policy=configured,
+                                      allow_subscription_free=cfg.free_only_allows_subscription,
+                                      advisor=advisor))
+        except (ValueError, ArithmeticError) as exc:
+            raise HTTPException(400, str(exc))
+        body = res.public()
+        body["decision_id"] = uuid.uuid4().hex[:16]
+        if res.outcome is seats.Outcome.UNAVAILABLE:
+            raise HTTPException(422, detail={"type": "seat_unavailable", **body})
+        return body
 
     @app.post("/router/explain", dependencies=[Depends(auth)])
     async def explain(request: Request,

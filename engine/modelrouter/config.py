@@ -49,6 +49,28 @@ port = 7480
 token_secret = ""
 no_auth = false
 
+[consumers.glass-solver]
+policy = "cheapest"          # pool order, cheapest live price within a tier
+[consumers.private-council]
+policy = "cheapest"
+[consumers.public-council]
+policy = "free-only"         # only free seats; UNAVAILABLE rather than a paid fallback
+
+[local]
+ollama_url = "http://127.0.0.1:11434"    # local-GPU seats are read live from /api/tags
+
+# Codex / Antigravity seats: declare one once its call path is verified live.
+# [[seats]]
+# provider = "codex"
+# model = "gpt-5.6-sol"
+# available = true
+# invoke = { kind = "cli", ... }
+
+[jev]
+enabled = true
+secret = "typesafe-api-key"  # GCP SM name; the switching layer, fail-open
+min_probability = 0.6
+
 [policy]
 # Refuse any model whose price (measured, else list) is above this, in USD per million tokens.
 ceiling_usd_per_mtok = 5.0
@@ -95,6 +117,15 @@ class Config:
     max_price_age_s: float | None = 172800
     allow_mirrors: bool = False
     dashboard_url: str = ""
+    # Seat selection (seats.py). consumer -> policy; declared codex/antigravity/local seats.
+    consumers: dict[str, str] = field(default_factory=lambda: {
+        "glass-solver": "cheapest", "private-council": "cheapest", "public-council": "free-only"})
+    declared_seats: list[dict] = field(default_factory=list)
+    free_only_allows_subscription: bool = False
+    ollama_url: str = "http://127.0.0.1:11434"
+    jev_enabled: bool = True
+    jev_secret: str = "typesafe-api-key"
+    jev_min_probability: float = 0.6
     state_dir: Path = field(default_factory=lambda: Path.home() / ".modelrouter")
     problems: list[str] = field(default_factory=list)
 
@@ -141,6 +172,24 @@ def load(path: Path | None = None) -> Config:
     cfg.max_price_age_s = float(age) if age not in (None, "", 0) else None
     cfg.allow_mirrors = bool(pol.get("allow_mirrors", False))
     cfg.dashboard_url = (pol.get("dashboard_url", "") or "").rstrip("/")
+    for name, spec in (d.get("consumers") or {}).items():
+        pol = (spec or {}).get("policy")
+        if pol not in ("cheapest", "free-only"):
+            cfg.problems.append('[consumers.%s] policy must be "cheapest" or "free-only"' % name)
+        else:
+            cfg.consumers[name] = pol
+    for sd in d.get("seats") or []:
+        if not sd.get("provider") or not sd.get("model"):
+            cfg.problems.append("[[seats]] entry needs provider and model")
+        else:
+            cfg.declared_seats.append(dict(sd))
+    sp = d.get("seat_policy") or {}
+    cfg.free_only_allows_subscription = bool(sp.get("free_only_allows_subscription", False))
+    cfg.ollama_url = (d.get("local") or {}).get("ollama_url", cfg.ollama_url)
+    jv = d.get("jev") or {}
+    cfg.jev_enabled = bool(jv.get("enabled", True))
+    cfg.jev_secret = jv.get("secret", cfg.jev_secret)
+    cfg.jev_min_probability = float(jv.get("min_probability", cfg.jev_min_probability))
     if cfg.source not in ("gcp", "env"):
         cfg.problems.append('secrets.source must be "gcp" or "env"')
     if cfg.source == "gcp" and not cfg.gcp_project:
