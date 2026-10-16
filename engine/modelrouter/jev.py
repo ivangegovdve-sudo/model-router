@@ -81,7 +81,11 @@ def make_advisor(get_key: Callable[[], str], *, min_prob: float = 0.6, timeout: 
         except Exception as exc:                       # fail open
             return None, {"used": False, "why": "jev call failed: %s" % type(exc).__name__}
         by = {s.seat: s for s in eligible[:MAX_SEATS]}      # only seats Jev was shown
-        info = {"used": False, "choice": pick, "probability": prob}
+        # JSONResponse uses this diagnostic object directly. Keep malformed
+        # non-finite provider values out of it: strict JSON encoding rejects
+        # NaN and infinity even though Python's default encoder accepts them.
+        info = {"used": False, "choice": pick,
+                "probability": prob if math.isfinite(prob) else None}
         if not (isinstance(prob, float) and math.isfinite(prob) and 0.0 <= prob <= 1.0):
             info["why"] = "probability is not a finite number in [0,1]; ignored"
             return None, info

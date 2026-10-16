@@ -1,4 +1,5 @@
 """Seat selection: pool order, exclusions, cross-family, free-only, Jev fail-open."""
+import json
 from decimal import Decimal as D
 
 import pytest
@@ -184,11 +185,29 @@ def test_jev_failures_fail_open():
 
 
 def test_jev_not_called_without_task_or_single_candidate():
-    def never(key, body, t):
-        raise AssertionError("called")
-    adv = jev.make_advisor(lambda: "k", post=never)
+    calls = 0
+
+    def post(key, body, t):
+        nonlocal calls
+        calls += 1
+        return {"answers": {"seat": {"choice": POOL[0].seat,
+                                       "probabilities": {POOL[0].seat: 0.99}}}}
+
+    adv = jev.make_advisor(lambda: "k", post=post)
     resolve(SeatRequest(), POOL, configured_policy="cheapest", advisor=adv)
     resolve(SeatRequest(task="t"), POOL[:1], configured_policy="cheapest", advisor=adv)
+    assert calls == 0
+
+
+def test_jev_nonfinite_probability_is_safe_for_strict_json():
+    def post(key, body, t):
+        return {"answers": {"seat": {"choice": POOL[0].seat,
+                                       "probabilities": {POOL[0].seat: float("nan")}}}}
+
+    r = resolve(SeatRequest(task="t"), POOL, configured_policy="cheapest",
+                advisor=jev.make_advisor(lambda: "k", post=post))
+    assert r.jev["probability"] is None
+    json.dumps(r.public(), allow_nan=False)
 
 
 def test_task_is_bounded_and_goes_in_state_not_instructions():
