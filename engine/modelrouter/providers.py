@@ -37,6 +37,12 @@ PROVIDERS: dict[str, dict[str, Any]] = {
     "ionet": {"base": "https://api.intelligence.io.solutions/api/v1", "catalogue": "/models",
               "parse": "ionet"},
     "groq": {"base": "https://api.groq.com/openai/v1", "catalogue": "/models", "parse": "groq"},
+    # Clef is the operator's loopback llama.cpp decision model. It has no secret,
+    # and its zero cost is a property of the local transport, not an unknown price.
+    # It is deliberately decision-only: the live endpoint is /v1/systemone, not
+    # an executable text chat-completions seat.
+    "clef": {"base": "http://127.0.0.1:8800/v1", "catalogue": "/models",
+             "parse": "clef", "local": True, "decision_only": True},
     # Cerebras is deliberately absent: its /models carries no prices, and Ivan's Cerebras
     # credit is ring-fenced for Chloe's conversational front end (2026-09-23).
 }
@@ -252,12 +258,26 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
             outs = ["text"] if text_out else None
             params = m.get("supported_parameters")
             efforts = m.get("reasoning_efforts")
+        elif shape == "clef":
+            arch = m.get("architecture") or {}
+            meta = m.get("meta") or {}
+            pr = co = Decimal("0")
+            ca = None
+            ctx = m.get("context_length") or meta.get("n_ctx")
+            tools = m.get("supports_tools") if isinstance(m.get("supports_tools"), bool) else False
+            reasoning = True
+            ins = arch.get("input_modalities") or ["text"]
+            outs = arch.get("output_modalities") or ["decisions"]
+            params = m.get("supported_parameters")
+            efforts = m.get("reasoning_efforts")
+            blocked_why = "decision-only endpoint: use /v1/systemone; no chat-completions executor"
+            text_out = False
         else:
             pr = co = ca = None
             ctx = m.get("context_length")
             tools = reasoning = None
             text_out = None
-        if _NOT_TEXT.search(mid) or text_out is False:
+        if _NOT_TEXT.search(mid) or (text_out is False and not PROVIDERS[provider].get("decision_only")):
             continue
         try:
             ctx = int(ctx) if ctx is not None else None
@@ -272,7 +292,8 @@ def parse_catalogue(provider: str, rows: list[dict]) -> list[Listing]:
                            input_modalities=known_strings(ins), output_modalities=known_strings(outs),
                            reasoning_efforts=known_strings(efforts), supports_editing=editing,
                            family=(m.get("model_family") or m.get("family"))
-                               if isinstance(m.get("model_family") or m.get("family"), str) else None,
+                               if isinstance(m.get("model_family") or m.get("family"), str)
+                               else ("clef" if shape == "clef" else None),
                            weights_id=weights_id, identity_evidence_id=identity_evidence_id))
     return out
 
@@ -286,7 +307,7 @@ class CatalogueError(Exception):
 def fetch_catalogue(provider: str, key: str, timeout: float = 30) -> list[Listing]:
     spec = PROVIDERS[provider]
     r = httpx.get(spec["base"] + spec["catalogue"], timeout=timeout,
-                  headers={"Authorization": "Bearer " + key, "User-Agent": UA})
+                  headers=_headers(key))
     if r.status_code != 200:
         msg, raw = _error(r, key)
         raise CatalogueError(r.status_code, classify_failure(r.status_code, msg, raw, r.headers),
@@ -410,9 +431,12 @@ def _body(provider: str, model: str, req: dict, max_tokens: int | None,
 
 
 def _headers(key: str) -> dict:
-    return {"Authorization": "Bearer " + key, "User-Agent": UA,
-            "HTTP-Referer": "https://github.com/ivangegovdve-sudo/model-router",
-            "X-Title": "modelrouter"}
+    headers = {"User-Agent": UA,
+               "HTTP-Referer": "https://github.com/ivangegovdve-sudo/model-router",
+               "X-Title": "modelrouter"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    return headers
 
 
 def _error(r: httpx.Response, key: str) -> tuple[str, str]:
@@ -450,7 +474,9 @@ def call(provider: str, model: str, key: str, req: dict, *, max_tokens: int | No
     spec = PROVIDERS.get(provider)
     if not spec:
         return fail(0, "unknown provider", "provider")
-    if not key:
+    if spec.get("decision_only"):
+        return fail(422, "decision-only endpoint; use /v1/systemone", "model")
+    if not key and not spec.get("local"):
         return fail(0, "no key", "provider")
     body = _body(provider, model, req, max_tokens, window)
     body.pop("stream", None)
