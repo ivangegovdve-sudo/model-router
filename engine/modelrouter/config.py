@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .providers import PROVIDERS
+from .secrets import LOCAL_SECRET
 
 TEMPLATE = """\
 # modelrouter configuration. This file holds secret NAMES, never secret values.
@@ -44,6 +45,10 @@ secret = ""
 secret = ""
 [providers.groq]
 secret = ""
+# Operator-local Clef llama.cpp decision seat. It never reads a secret and is
+# enabled only when this flag is true. External app executors remain separate.
+[providers.clef]
+enabled = false
 # Not supported: Nous (its /models is an OpenRouter mirror -- same ids, same prices to the
 # digit; detected and excluded as MIRROR if configured) and Cerebras (no prices in its API).
 
@@ -332,6 +337,10 @@ def load(path: Path | None = None) -> Config:
         if name not in PROVIDERS:
             cfg.problems.append("unknown provider [providers.%s] -- known: %s"
                                 % (name, ", ".join(PROVIDERS)))
+            continue
+        if PROVIDERS[name].get("local"):
+            if isinstance(spec, dict) and spec.get("enabled") is True:
+                cfg.secrets[name] = LOCAL_SECRET
             continue
         if (spec or {}).get("secret"):
             cfg.secrets[name] = spec["secret"]

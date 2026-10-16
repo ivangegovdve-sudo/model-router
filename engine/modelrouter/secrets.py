@@ -16,6 +16,8 @@ import subprocess
 import threading
 from dataclasses import dataclass
 
+LOCAL_SECRET = "__local__"
+
 
 @dataclass(frozen=True)
 class KeyStatus:
@@ -73,7 +75,9 @@ class Keyring:
             if not force and provider in self._status:
                 return self._status[provider]
             name = self.names.get(provider, "")
-            if not name:
+            if name == LOCAL_SECRET:
+                st = KeyStatus(provider, self.source, name, True, "local")
+            elif not name:
                 st = KeyStatus(provider, self.source, "", False, "not configured")
             elif self.source == "env":
                 v = os.environ.get(name, "").strip()
