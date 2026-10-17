@@ -192,11 +192,18 @@ def test_config_is_validated_and_env_overrides_it(tmp_path, monkeypatch):
 
 
 def test_the_alert_is_written_to_the_alerts_file(tmp_path):
+    import time
     cfg = GuardConfig(cap_usd="0", ledger=tmp_path / "jev_spend.sqlite3", fallback="defer")
     g = Guard(cfg, lambda: "k", post=Paid(), fallback=None, now=Clock())
     with pytest.raises(CapReached):
         g.call(BODY, caller="kalo-canon")
-    ev = json.loads((tmp_path / "jev_guard_alerts.jsonl").read_text("utf-8").splitlines()[0])
+    alerts = tmp_path / "jev_guard_alerts.jsonl"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if alerts.exists() and alerts.read_text("utf-8").strip():
+            break
+        time.sleep(0.02)
+    ev = json.loads(alerts.read_text("utf-8").splitlines()[0])
     assert ev["event"] == "jev_daily_cap_tripped" and ev["caller"] == "kalo-canon" and ev["cap_usd"] == "0"
 
 
@@ -467,7 +474,7 @@ def test_the_guard_caps_the_timeout_so_no_call_outlives_its_hold(tmp_path):
         seen.append(t)
         return {"answers": {}, "usage": {"input_tokens": 1, "output_tokens": 0}}
     guard(tmp_path, post).call(BODY, timeout=86_400)
-    assert seen == [jevguard.MAX_TIMEOUT_S]
+    assert len(seen) == 1 and 0 < seen[0] <= jevguard.MAX_TIMEOUT_S
 
 
 def test_a_ledger_from_before_the_ts_column_keeps_its_in_flight_holds(tmp_path):

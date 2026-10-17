@@ -59,6 +59,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -255,10 +256,10 @@ class Ledger:
     def _conn(self, timeout: float | None = None) -> sqlite3.Connection:
         c = getattr(self._local, "c", None)
         if c is None:
-            to = int((timeout or 30) * 1000) if timeout is not None else 30000
-            c = sqlite3.connect(self.path, timeout=timeout or 30, isolation_level=None)
-            c.execute("PRAGMA busy_timeout = %d" % to)
+            c = sqlite3.connect(self.path, timeout=30, isolation_level=None)
             self._local.c = c
+        if timeout is not None:
+            c.execute("PRAGMA busy_timeout = %d" % int(timeout * 1000))
         return c
 
     class _Tx:
@@ -556,20 +557,19 @@ class Guard:
         threading.Thread(target=_do, daemon=True).start()
 
     def call(self, body: dict, *, caller: str = "unknown", timeout: float = 20.0) -> Served:
+        timeout = min(float(timeout), MAX_TIMEOUT_S)
+        deadline = time.monotonic() + timeout                      # the full call's wall-clock budget
+
+        def get_remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
         body = json.loads(json.dumps(body))                            # snapshot request before reserving
         nbytes = request_bytes(body)                                  # refuses an unboundable request
-        timeout = min(float(timeout), MAX_TIMEOUT_S)
-        start_time = datetime.now(self.ledger._tz) if self.ledger._tz else datetime.now().astimezone()
-        
-        def get_remaining() -> float:
-            now = datetime.now(self.ledger._tz) if self.ledger._tz else datetime.now().astimezone()
-            elapsed = (now - start_time).total_seconds()
-            return max(0.0, timeout - elapsed)
 
         call_id, worst, spent = self.ledger.reserve(caller, self.cfg.worst_case_nano(body),
                                                       self.cfg.cap_nano, nbytes, get_remaining())
         if call_id is None:
-            return self._blocked(body, caller, worst, nbytes, spent, timeout, get_remaining())
+            return self._blocked(body, caller, worst, nbytes, spent, timeout, get_remaining)
         
         box: dict = {}
         def work():
@@ -635,10 +635,10 @@ class Guard:
                                "reservations_now_scaled_by": factor / 1000})
         return Served(resp, "jev", usd(cost), False, self.ledger.status(self.cfg.cap_nano))
 
-    def _blocked(self, body, caller, worst, nbytes, spent, timeout, remaining_timeout) -> Served:
+    def _blocked(self, body, caller, worst, nbytes, spent, timeout, get_remaining) -> Served:
         # Recheck admission in case midnight passed between reserve() and _blocked()
         call_id, worst, spent = self.ledger.reserve(caller, self.cfg.worst_case_nano(body),
-                                                      self.cfg.cap_nano, nbytes, remaining_timeout)
+                                                      self.cfg.cap_nano, nbytes, get_remaining())
         if call_id is not None:
             # We are no longer blocked; let the call proceed to the paid path.
             # Since we're already in _blocked(), we can't easily jump back to call(),
@@ -656,7 +656,7 @@ class Guard:
                 box: dict = {}
                 def work():
                     try:
-                        box["served"] = self._paid(call_id, body, caller, worst, nbytes, remaining_timeout)
+                        box["served"] = self._paid(call_id, body, caller, worst, nbytes, get_remaining())
                     except BaseException as exc:
                         box["err"] = exc
                     finally:
@@ -667,9 +667,9 @@ class Guard:
                     t.start()
                 except RuntimeError as exc:
                     self.ledger.alive(call_id, False)
-                    self.ledger.settle(call_id, "NOT_BILLED", 0, None, None, "worker startup failed: %s" % exc, remaining_timeout)
+                    self.ledger.settle(call_id, "NOT_BILLED", 0, None, None, "worker startup failed: %s" % exc, get_remaining())
                     raise
-                t.join(remaining_timeout)
+                t.join(get_remaining())
                 if t.is_alive():
                     raise TimeoutError("Paid call (after midnight re-check) passed its %.0fs deadline" % timeout)
                 if "err" in box:
@@ -684,7 +684,7 @@ class Guard:
         why = ("daily Jev cap $%s reached: $%s committed today, this call could cost up to $%s"
                % (self.cfg.cap_usd, usd(spent), usd(worst)))
         served_by = self.fallback_name if self.fallback else "deferred"
-        if self.ledger.blocked(caller, worst, nbytes, served_by, why, remaining_timeout):
+        if self.ledger.blocked(caller, worst, nbytes, served_by, why, get_remaining()):
             self._alert({"event": "jev_daily_cap_tripped", "at": self.ledger.now().isoformat(timespec="seconds"),
                            "caller": caller, "detail": why, "action": served_by,
                            **self.ledger.status(self.cfg.cap_nano)})
@@ -696,12 +696,12 @@ class Guard:
             box: dict = {}
             def work():
                 try:
-                    box["resp"] = self.fallback(body, remaining_timeout)
+                    box["resp"] = self.fallback(body, get_remaining())
                 except Exception as exc:
                     box["err"] = exc
             t = threading.Thread(target=work, daemon=True)
             t.start()
-            t.join(remaining_timeout)
+            t.join(get_remaining())
             if t.is_alive():
                 raise TimeoutError("Fallback call passed its %.0fs wall-clock deadline" % timeout)
             if "err" in box:
