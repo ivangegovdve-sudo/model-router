@@ -60,7 +60,6 @@ _FAMILY_RULES: tuple[tuple[str, re.Pattern], ...] = tuple(
         ("nvidia", r"nemotron|nvidia"),
         ("cohere", r"command-r|cohere"),
         ("ai21", r"jamba|ai21"),
-        ("typesafe", r"jev|typesafe"),
     ))
 
 

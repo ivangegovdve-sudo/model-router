@@ -74,6 +74,15 @@ def test_base_weight_lineage():
     assert seats.family_of("totally-new-thing") is None
 
 
+def test_virtual_selectors_have_no_base_weight_family():
+    assert seats.family_of("typesafe/jev-router") is None
+    assert seats.family_of("jev-latest") is None
+    virt = S("openrouter", "typesafe/jev-router", "0.1", family="auto")
+    r = resolve(SeatRequest(exclude_families=("openai",)), [virt], configured_policy="cheapest")
+    assert r.outcome is Outcome.UNAVAILABLE           # unknown lineage is a cross-family conflict
+    assert "family unknown" in r.considered[0].because
+
+
 def test_free_only_selects_only_free_and_never_falls_back_to_paid():
     r = resolve(SeatRequest(consumer="public-council"), POOL, configured_policy="free-only")
     assert r.seat.seat == "local:llama3.1:8b"         # subscriptions are paid plans
@@ -343,6 +352,22 @@ def test_endpoint_public_council_gets_unavailable_not_a_paid_seat(client):
     assert d["type"] == "seat_unavailable" and d["policy"] == "free-only" and d["seat"] is None
     r = client.post("/v1/seats/resolve", json={"consumer": "public-council", "policy": "cheapest"})
     assert r.status_code == 422                        # cannot loosen
+
+
+def test_endpoint_malformed_need_and_min_context_are_client_errors(client):
+    for bad in ("bad", "tools", 7, ["min_context"]):
+        r = client.post("/v1/seats/resolve", json={"consumer": "glass-solver", "need": bad})
+        assert r.status_code == 400, bad
+    for bad_ctx in ("32000", 1.5, -1, True):
+        r = client.post("/v1/seats/resolve", json={"consumer": "glass-solver",
+                                                    "need": {"min_context": bad_ctx}})
+        assert r.status_code == 400, bad_ctx
+    r = client.post("/v1/seats/resolve", json={"consumer": "glass-solver",
+                                                "need": {"tools": "yes"}})
+    assert r.status_code == 400
+    r = client.post("/v1/seats/resolve", json={"consumer": "glass-solver",
+                                                "need": {"min_context": 32000, "tools": True}})
+    assert r.status_code in (200, 422)                # valid shape is accepted
 
 
 def test_pool_matches_the_fixture_shared_with_open_dashboard_mcp():

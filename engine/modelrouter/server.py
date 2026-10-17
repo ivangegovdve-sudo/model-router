@@ -209,6 +209,16 @@ def build(cfg: Config) -> FastAPI:
             v = b.get(field_) or []
             if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
                 raise HTTPException(400, "%s must be a list of strings" % field_)
+        need = b.get("need")
+        if need is not None and not isinstance(need, dict):
+            raise HTTPException(400, "`need` must be a JSON object")
+        min_context = (need or {}).get("min_context")
+        if min_context is not None:
+            if not isinstance(min_context, int) or isinstance(min_context, bool) or min_context < 0:
+                raise HTTPException(400, "`need.min_context` must be a non-negative integer")
+        tools = (need or {}).get("tools")
+        if tools is not None and not isinstance(tools, bool):
+            raise HTTPException(400, "`need.tools` must be a boolean")
         try:
             # the request may lower the configured price ceiling, never raise it
             ceilings = [Decimal(str(x)) for x in (b.get("max_usd_per_m"), cfg.ceiling_usd_per_mtok)
@@ -218,8 +228,8 @@ def build(cfg: Config) -> FastAPI:
                 policy=b.get("policy"),
                 exclude_families=tuple(b.get("exclude_families") or ()),
                 exclude_seats=tuple(b.get("exclude_seats") or ()),
-                min_context=(b.get("need") or {}).get("min_context"),
-                needs_tools=bool((b.get("need") or {}).get("tools")),
+                min_context=min_context,
+                needs_tools=bool(tools),
                 ceiling_usd_per_mtok=min(ceilings) if ceilings else None,
                 task=str(b.get("task") or ""))
             res = await run_in_threadpool(
