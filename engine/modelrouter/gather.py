@@ -515,7 +515,10 @@ class Gatherer:
                                                                       self.keys.get(provider)))
             except Exception:                                   # noqa: BLE001
                 pass                    # the next roster() records why, on the request path
-            self._dash.pop(provider, None)
+            # Provider catalogues refresh more often than the dashboard's
+            # published read model. Keep the dashboard cache warm so the
+            # short refresher interval does not turn into repeated requests
+            # to the dashboard for the same evidence.
             self._win.pop(provider, None)
             self._ctx.pop(provider, None)
             for fn in (self._dashboard, self._window_prices, self._context_lengths):
