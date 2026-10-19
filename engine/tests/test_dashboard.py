@@ -1,5 +1,6 @@
 from dataclasses import replace
 from decimal import Decimal
+import time
 
 import httpx
 import pytest
@@ -189,3 +190,22 @@ def test_gather_preserves_native_price_and_fills_dashboard_capability_evidence(t
     assert partial.list_prompt == Decimal(1)
     assert partial.list_completion == Decimal(9)
     assert "mixed" in partial.price_source
+
+
+def test_refresh_keeps_dashboard_cache_warm_between_short_provider_refreshes(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_TEST_KEY", "test")
+    cfg = Config(path=tmp_path / "config.toml", source="env",
+                 secrets={"openrouter": "DASHBOARD_TEST_KEY"}, state_dir=tmp_path,
+                 dashboard_url="https://dashboard.test")
+    gather = Gatherer(cfg, Keyring(cfg.source, cfg.secrets), Store(tmp_path / "state.sqlite3"))
+    cached = {"vendor/model": {"id": "vendor/model", "provider": "openrouter"}}
+    gather._dash["openrouter"] = (time.time(), cached)
+
+    monkeypatch.setattr(P, "fetch_catalogue", lambda *args, **kwargs: [])
+    monkeypatch.setattr(gather, "_window_prices", lambda provider: {})
+    monkeypatch.setattr(gather, "_context_lengths", lambda provider: {})
+    monkeypatch.setattr(D, "fetch_rows", lambda *args, **kwargs: pytest.fail("dashboard cache was evicted"))
+
+    gather.refresh()
+
+    assert gather._dash["openrouter"][1] is cached
