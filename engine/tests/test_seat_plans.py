@@ -329,8 +329,8 @@ def test_global_ranking_matches_exhaustive_small_graphs(router):
                                for i, edge in enumerate(edges)]
         valid = [combo for combo in itertools.product(routes, repeat=3)
                  if all(combo[int(a[1])] != combo[int(b[1])] for a, b in edges)]
-        expected = min(valid, key=lambda combo: (sum(routes[s].provider == "openrouter" for s in combo),
-            sum(routes[s].list_prompt for s in combo), combo))
+        # Sail and OpenRouter share the paid tier, so price alone ranks them.
+        expected = min(valid, key=lambda combo: (sum(routes[s].list_prompt for s in combo), combo))
         result = call(m.resolve(body, "alice"))
         assert result["outcome"] == "RESOLVED"
         assert tuple(a["seat"] for a in result["assignments"]) == expected

@@ -131,6 +131,8 @@ class Config:
     dashboard_url: str = ""
     seat_consumer_policies: dict[str, str] = field(default_factory=lambda: {
         "glass-solver": "cheapest", "private-council": "cheapest", "public-council": "free-only"})
+    seat_consumer_excluded: dict[str, tuple[str, ...]] = field(default_factory=lambda: {
+        "glass-solver": ("cerebras",)})
     seat_model_identities: dict[str, dict[str, Any]] = field(default_factory=dict)
     seat_reference_models: dict[str, dict[str, Any]] = field(default_factory=dict)
     seat_app_executors: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -372,6 +374,19 @@ def load(path: Path | None = None) -> Config:
                 cfg.problems.append("seat_consumers.%s must be cheapest or free-only" % name)
                 continue
             cfg.seat_consumer_policies[name] = policy
+    excluded = d.get("seat_consumer_excluded", {})
+    if not isinstance(excluded, dict):
+        cfg.problems.append("seat_consumer_excluded must be a table of consumer -> excluded providers/families")
+    else:
+        for name, items in excluded.items():
+            if (not isinstance(name, str) or not name or not isinstance(items, list)
+                    or not all(isinstance(x, str) and x for x in items)):
+                cfg.problems.append("seat_consumer_excluded.%s must be a list of names" % name)
+                continue
+            if "cerebras" not in {x.casefold() for x in items}:
+                cfg.problems.append("seat_consumer_excluded.%s must keep cerebras (reserved for Chloe)" % name)
+                continue
+            cfg.seat_consumer_excluded[name] = tuple(x.casefold() for x in items)
     _load_seat_configuration(cfg, d)
     if cfg.source not in ("gcp", "env"):
         cfg.problems.append('secrets.source must be "gcp" or "env"')

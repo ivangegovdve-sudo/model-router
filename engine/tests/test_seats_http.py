@@ -25,7 +25,7 @@ def test_dashboard_seat_route_preserves_auth_and_advisory_contract(tmp_path, mon
         response = client.post("/v1/seats/resolve", json=request)
         assert response.status_code == 200
         body = response.json()
-        assert body["seat"] == "openrouter:test" and body["tier"] == 4
+        assert body["seat"] == "openrouter:test" and body["tier"] == 2
         record = client.get("/router/decisions/" + body["decision_id"]).json()
         assert record["status"] == "ADVISED" and record["result"]["calls"] == 0
         refusal = client.post("/v1/seats/resolve", json={"consumer": "public-council"})
