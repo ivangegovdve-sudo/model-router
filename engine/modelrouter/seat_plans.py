@@ -22,7 +22,7 @@ from urllib.parse import quote
 from .decision import Ask, Candidate, Emits, Verdict, assess, money
 from .requirements import check_requirements, lower_ceiling, parse_requirements
 from .router import LANES
-from .seats import DEFAULT_CONSUMER_POLICIES, SEAT_POOL, _known_free, _restriction, _tier
+from .seats import DEFAULT_CONSUMER_POLICIES, SEAT_POOL, _excluded_for, _known_free, _restriction, _tier
 
 SCHEMA = "seat-plan/1"
 MAX_SLOTS = 32
@@ -505,7 +505,8 @@ class SeatPlanManager:
                 for c in roster[slot["lane"]]:
                     if slot["binding"]["kind"] == "router-fixed" and c.seat != slot["binding"]["seat"]:
                         continue
-                    reason = _restriction(c, {"exclude_seats": [], "exclude_families": [], "policy": request["policy"]},
+                    reason = _restriction(c, {"exclude_seats": [], "exclude_families": [], "policy": request["policy"],
+                                              "excluded": _excluded_for(request["consumer"], self.router.cfg)},
                                           self.router.cfg.allow_free)
                     checked = replace(c, blocked=reason) if reason else c
                     assessment = assess(ask, checked)
@@ -751,7 +752,9 @@ class SeatPlanManager:
             if conflict or weights != a["weights_id"]:
                 _fail("pinned model weight identity changed or became unknown", 409)
             policy = doc["request"]["policy"]
-            reason = _restriction(live, {"exclude_seats": [], "exclude_families": [], "policy": policy}, self.router.cfg.allow_free)
+            reason = _restriction(live, {"exclude_seats": [], "exclude_families": [], "policy": policy,
+                                         "excluded": _excluded_for(doc["request"]["consumer"], self.router.cfg)},
+                                  self.router.cfg.allow_free)
             checked = assess(replace(ask, allow_clamp=False), replace(live, blocked=reason) if reason else live)
             if checked.verdict is not Verdict.QUALIFIES:
                 _fail("pinned model no longer qualifies: " + checked.because, 409)

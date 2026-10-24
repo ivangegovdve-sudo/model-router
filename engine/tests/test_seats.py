@@ -41,30 +41,32 @@ def router(tmp_path, monkeypatch):
     return router
 
 
-def test_seat_prefers_first_eligible_tier_and_cheapest_within_it(router):
+def test_the_paid_tier_is_one_tier_where_the_cheapest_capable_seat_wins(router):
+    """Sail, AkashML, OpenRouter and Anthropic share the paid tier: price decides, not a
+    provider order (Ivan, 2026-10-24)."""
     router.test_roster = [candidate("openrouter", "cheap", "0.01"),
                           candidate("sail", "dear", "1"), candidate("sail", "cheap", "0.2")]
     result = resolve_seat(router, {"consumer": "glass-solver", "role": "review"})
-    assert result["seat"] == "sail:cheap"
-    assert result["tier"] == 0 and result["provider"] == "sail"
+    assert result["seat"] == "openrouter:cheap"
+    assert result["tier"] == 2 and result["provider"] == "openrouter"
     assert isinstance(result["usd_per_mtok"], str)
-    assert Decimal(result["usd_per_mtok"]) == Decimal("0.2")
+    assert Decimal(result["usd_per_mtok"]) == Decimal("0.01")
     assert {key: result["invoke"][key] for key in ("api", "model", "base_url")} == {
-        "api": "chat.completions", "model": "sail:cheap", "base_url": "/v1"}
+        "api": "chat.completions", "model": "openrouter:cheap", "base_url": "/v1"}
     assert result["invoke"]["headers"] == {"X-Router-Lane": "background", "X-Router-Max-Usd-Per-M": "5.0"}
     assert result["invoke"]["router_requirements"]["required_capabilities"] == []
     assert result["jev"]["scope"] == "measured-text-api-seats"
     assert result["jev"]["confidence"]["probability"] is None
     assert "tier" in result["because"]
-    late = next(c for c in result["considered"] if c["seat"] == "openrouter:cheap")
-    assert late["tier"] == 4 and late["verdict"] == "EXCLUDED"
-    assert set(late) >= {"seat", "verdict", "because", "tier", "family", "usd_per_mtok"}
+    sail = next(c for c in result["considered"] if c["seat"] == "sail:cheap")
+    assert sail["tier"] == 2 and sail["verdict"] == "QUALIFIES"
+    assert set(sail) >= {"seat", "verdict", "because", "tier", "family", "usd_per_mtok"}
 
 
 def test_seat_falls_back_only_when_earlier_tier_cannot_qualify(router):
     router.test_roster = [candidate("sail", emits=None), candidate("openrouter", "fallback")]
     result = resolve_seat(router, {"consumer": "glass-solver"})
-    assert result["seat"] == "openrouter:fallback" and result["tier"] == 4
+    assert result["seat"] == "openrouter:fallback" and result["tier"] == 2
     assert next(c for c in result["considered"] if c["seat"] == "sail:one")["verdict"] == "UNKNOWN"
 
 
@@ -189,9 +191,30 @@ def test_explicit_seat_exclusion_and_unsupported_executors_are_never_selected(ro
 
 @pytest.mark.parametrize("family", ["claude", "anthropic", "cerebras"])
 def test_excluded_known_families_cannot_be_selected_through_openrouter(router, family):
+    """Every consumer keeps the default exclusion unless the operator scopes it down."""
     router.test_roster = [candidate("openrouter", "model", family=family)]
     with pytest.raises(SeatUnavailable):
-        resolve_seat(router, {"consumer": "glass-solver"})
+        resolve_seat(router, {"consumer": "private-council"})
+
+
+@pytest.mark.parametrize("family,allowed", [("anthropic", True), ("claude", True), ("cerebras", False)])
+def test_the_solver_may_seat_claude_but_never_cerebras(router, family, allowed):
+    """Ivan lifted the solver's Claude ban (2026-10-24); Cerebras stays reserved for Chloe."""
+    router.test_roster = [candidate("openrouter", "model", family=family)]
+    if allowed:
+        assert resolve_seat(router, {"consumer": "glass-solver"})["seat"] == "openrouter:model"
+    else:
+        with pytest.raises(SeatUnavailable):
+            resolve_seat(router, {"consumer": "glass-solver"})
+
+
+def test_cerebras_cannot_be_unexcluded_by_config(tmp_path):
+    from modelrouter.config import load
+    path = tmp_path / "c.toml"
+    path.write_text('[seat_consumer_excluded]\nglass-solver = ["claude"]\n', encoding="utf-8")
+    cfg = load(path)
+    assert any("cerebras" in p for p in cfg.problems)
+    assert "cerebras" in cfg.seat_consumer_excluded["glass-solver"]
 
 
 def test_role_is_metadata_and_task_text_is_never_persisted(router):

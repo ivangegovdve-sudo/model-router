@@ -13,11 +13,21 @@ from .decision import Candidate, Verdict, assess, decide, money
 from .requirements import finite_price
 
 
-SEAT_POOL = ("sail", "codex", "antigravity", "local", "openrouter")
+# The seat chain (Ivan, 2026-10-24): subscriptions first, then ONE paid tier in which price
+# and capability decide among Sail, AkashML, OpenRouter and the Anthropic API -- no fixed
+# provider order inside it. A tier number, not a pool position, is what ranks a seat.
+SEAT_POOL = ("antigravity", "codex", "local", "sail", "akashml", "openrouter", "anthropic")
+SEAT_TIER = {"antigravity": 0, "codex": 0, "local": 1,
+             "sail": 2, "akashml": 2, "openrouter": 2, "anthropic": 2}
+SEAT_TIER_NAMES = {0: "subscription", 1: "local", 2: "paid"}
+# Excluded for every consumer unless the operator scopes it down per consumer. The Glass
+# solver's Claude ban was lifted (2026-10-24): price + capability keep Claude to the cases
+# where it is the cheapest capable seat. Cerebras stays reserved for Chloe everywhere.
 SEAT_EXCLUDED = ("claude", "anthropic", "cerebras")
+DEFAULT_CONSUMER_EXCLUDED = {"glass-solver": ("cerebras",)}
 SEAT_ROLES = ("review", "fix", "rebase", "council", "general")
 SEAT_POLICIES = ("cheapest", "free-only")
-IMPLEMENTED_PROVIDERS = ("sail", "openrouter")
+IMPLEMENTED_PROVIDERS = ("sail", "akashml", "openrouter")
 DEFAULT_CONSUMER_POLICIES = {"glass-solver": "cheapest", "private-council": "cheapest",
                              "public-council": "free-only"}
 
@@ -80,7 +90,12 @@ def _validate(raw: dict, policies: dict) -> dict:
 
 
 def _tier(candidate: Candidate) -> int:
-    return SEAT_POOL.index(candidate.provider) if candidate.provider in SEAT_POOL else -1
+    return SEAT_TIER.get(candidate.provider, -1)
+
+
+def _excluded_for(consumer: str, cfg=None) -> tuple[str, ...]:
+    table = getattr(cfg, "seat_consumer_excluded", None) or DEFAULT_CONSUMER_EXCLUDED
+    return tuple(table.get(consumer, SEAT_EXCLUDED))
 
 
 def _known_free(candidate: Candidate) -> bool:
@@ -98,7 +113,8 @@ def _known_free(candidate: Candidate) -> bool:
 
 def _restriction(candidate: Candidate, request: dict, allow_free: bool) -> str | None:
     family = candidate.family.casefold() if candidate.family else None
-    if candidate.provider in SEAT_EXCLUDED or family in SEAT_EXCLUDED:
+    excluded = request.get("excluded", SEAT_EXCLUDED)
+    if candidate.provider in excluded or family in excluded:
         return "provider or explicitly known family is excluded from the seat pool"
     if candidate.provider not in IMPLEMENTED_PROVIDERS:
         return "no implemented text API seat executor for provider %s" % candidate.provider
@@ -125,6 +141,7 @@ def resolve_seat(router, raw: dict) -> dict:
     """
     policies = getattr(router.cfg, "seat_consumer_policies", DEFAULT_CONSUMER_POLICIES)
     request = _validate(raw, policies)
+    request["excluded"] = _excluded_for(request["consumer"], router.cfg)
     requirements = {}
     if request["tools"]:
         requirements["tool_calls"] = True
@@ -154,11 +171,12 @@ def resolve_seat(router, raw: dict) -> dict:
     assessments = [assess(ask, candidate) for candidate in restricted]
     facts = {**choice.facts, "seat_consumer": request["consumer"], "seat_role": request["role"],
              "seat_policy": request["policy"], "seat_pool": list(SEAT_POOL),
+             "seat_tiers": dict(SEAT_TIER), "seat_excluded": list(request["excluded"]),
              "implemented_seat_providers": list(IMPLEMENTED_PROVIDERS),
              "exclude_families": request["exclude_families"], "exclude_seats": request["exclude_seats"]}
     because = choice.because
     if not choice.abstained:
-        because = "first eligible tier %d (%s); %s" % (selected_tier, SEAT_POOL[selected_tier], because)
+        because = "first eligible tier %d (%s); %s" % (selected_tier, SEAT_TIER_NAMES.get(selected_tier, "?"), because)
     # Seat advice keeps every assessment, including policy-blocked and unknown seats.
     choice = replace(choice, considered=tuple(assessments), facts=facts, because=because)
     public = choice.public()
