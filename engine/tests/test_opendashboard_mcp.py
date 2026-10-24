@@ -70,7 +70,7 @@ def test_published_opendashboard_2_seat_tool_calls_router(tmp_path, monkeypatch)
                 seat = await call({"consumer": "glass-solver", "role": "review",
                                    "needsTools": True, "minContext": 8192})
                 assert seat["status"] == "seat" and seat["seat"] == "openrouter:fixture-model"
-                assert seat["tier"] == 4 and seat["policy"] == "cheapest"
+                assert seat["tier"] == 2 and seat["policy"] == "cheapest"
                 assert seat["pool"]["order"] == ["sail", "codex", "antigravity", "local", "openrouter"]
                 assert seat["jev"]["confidence"]["probability"] is None
                 assert router.store.get(seat["decisionId"])["result"]["calls"] == 0
